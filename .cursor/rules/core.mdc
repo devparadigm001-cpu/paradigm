@@ -1,0 +1,40 @@
+---
+description: Paradigm frontend — core project context
+globs:
+alwaysApply: true
+---
+
+# Project Context
+
+Paradigm is a Windows desktop app built with Tauri v2. This worktree (`src/`)
+is the frontend: React + TypeScript, built with Vite. The Rust backend lives
+in a separate worktree, not visible here.
+
+## Frontend stack
+- UI components: shadcn/ui
+- Styling: Tailwind CSS (core utility classes)
+- Data fetching / state: TanStack Query
+- The app uses multiple native Tauri windows, not a single-window SPA
+
+## Talking to the backend
+- All backend calls go through Tauri's `invoke()` from `@tauri-apps/api/core`
+- Never invent a command name or signature — backend commands are built and
+  communicated as they're ready (contract-triggered merge cadence, not a
+  fixed schedule). If a command you need doesn't exist yet, flag it rather
+  than guessing its shape.
+- Two data tables the frontend reads/displays: `contacts_cache` (Chat Mode's
+  email/contact resolution) and `profile_fields` / `form_field_mappings`
+  (Form Memory's dropdown fuzzy-matching)
+
+## AI model stack (context only — frontend never calls these directly)
+- Local: Qwen2.5-0.5B (Ghost Mode labeling), Qwen3.5-0.8B-Vision (fallback)
+- Cloud via Fireworks AI: Qwen3-7B-Instruct (intent/form Q&A), Qwen2-VL-7B
+  (heavy vision/OCR)
+Useful for building appropriate loading states — cloud calls are slower and
+cost real money; local calls are near-instant and free.
+
+## Shared components
+Automation Preview is a single shared confirmation component used across
+Ghost Mode, Chat Mode, and Form Memory, with feature-specific variants
+(first-run, failure-state/drift-repair, vision-fallback, kill-switch-disabled).
+Build it once as a reusable component — don't duplicate per feature.
