@@ -31,20 +31,27 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 fn mock_app() -> (App<MockRuntime>, TempDir) {
     let dir = TempDir::new().expect("temp dir");
 
-    let mut app = {
+    let app = {
+        // The lock MUST span set_var through run_iteration, not just through
+        // build(). `build()` does not run the setup hook -- Tauri runs it from
+        // the event loop -- so PARADIGM_DATA_DIR is read inside run_iteration,
+        // not inside build. Releasing the lock in between let a second test
+        // overwrite the variable before this test's setup consumed it, pointing
+        // both apps at one database. That raced intermittently.
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PARADIGM_DATA_DIR", dir.path());
-        paradigm_lib::configure(mock_builder())
-            .build(mock_context(noop_assets()))
-            .expect("build mock app")
-    };
 
-    // `build()` does NOT run the setup hook -- Tauri runs it from the event
-    // loop. Without this the app has no managed `Db` state, and every command
-    // taking `State<Db>` fails at argument injection. `run_iteration` runs
-    // setup first and is a no-op on `MockRuntime`, so it returns immediately.
-    #[allow(deprecated)]
-    app.run_iteration(|_, _| {});
+        let mut app = paradigm_lib::configure(mock_builder())
+            .build(mock_context(noop_assets()))
+            .expect("build mock app");
+
+        // Runs setup (which opens the database and calls `.manage()`).
+        // `MockRuntime::run_iteration` is a no-op, so this returns immediately.
+        #[allow(deprecated)]
+        app.run_iteration(|_, _| {});
+
+        app
+    };
 
     (app, dir)
 }
@@ -124,6 +131,54 @@ fn greet_is_still_reachable_over_ipc() {
         greeting.contains("paradigm"),
         "unexpected greeting: {greeting}"
     );
+}
+
+/// Every command the app registers. If a command is added to
+/// `generate_handler!` it must be added here too -- that is the point.
+const REGISTERED_COMMANDS: &[(&str, &str)] = &[
+    ("greet", r#"{"name":"x"}"#),
+    ("db_health_check", "{}"),
+    ("start_record_session", "{}"),
+    ("stop_record_session", "{}"),
+    ("compile_and_store_playbook", r#"{"nameHint":"x"}"#),
+    ("list_playbooks", "{}"),
+    ("replay_playbook", r#"{"playbookId":"does-not-exist"}"#),
+    ("get_run_history", r#"{"playbookId":"does-not-exist"}"#),
+];
+
+/// The Step 1 regression test, extended to all eight commands.
+///
+/// A command can compile, be listed in `generate_handler!`, and still be
+/// unreachable if a second `.invoke_handler()` call discards the registration.
+/// This asserts only that each command is FOUND -- several legitimately return
+/// errors here (no session active, no such playbook), and that is fine. What
+/// must never happen is "Command X not found".
+#[test]
+fn every_registered_command_is_reachable_over_ipc() {
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+
+    let mut unreachable = Vec::new();
+    for (cmd, args) in REGISTERED_COMMANDS {
+        let body: serde_json::Value = serde_json::from_str(args).expect("valid test args");
+        let result = invoke(&webview, cmd, InvokeBody::Json(body));
+
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                unreachable.push(format!("{cmd}: {msg}"));
+            }
+        }
+    }
+
+    assert!(
+        unreachable.is_empty(),
+        "commands registered but unreachable over IPC: {unreachable:#?}"
+    );
+
+    // Recording actually starts a real recorder above; make sure it is stopped
+    // so it does not outlive the test.
+    let _ = invoke(&webview, "stop_record_session", InvokeBody::default());
 }
 
 #[test]

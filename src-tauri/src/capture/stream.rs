@@ -14,20 +14,28 @@
 
 use super::exclusion::ExclusionList;
 
+/// Matches the `action_type` enum in migration 20260803000001.
+///
+/// `Read` is part of the locked schema enum but is never produced by the Step 3
+/// recorder mapping -- reading a value is not an input event, so low-level
+/// hooks cannot observe it. It exists here so the variant set matches the
+/// schema and so downstream policy can handle it, rather than being bolted on
+/// when a later phase starts emitting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
     Click,
     Type,
     Navigate,
+    Read,
 }
 
 impl ActionKind {
-    /// Matches the `action_type` enum in migration 20260803000001.
     pub fn as_str(self) -> &'static str {
         match self {
             ActionKind::Click => "click",
             ActionKind::Type => "type",
             ActionKind::Navigate => "navigate",
+            ActionKind::Read => "read",
         }
     }
 }
