@@ -17,14 +17,30 @@ in a separate worktree, not visible here.
 - The app uses multiple native Tauri windows, not a single-window SPA
 
 ## Talking to the backend
-- All backend calls go through Tauri's `invoke()` from `@tauri-apps/api/core`
-- Never invent a command name or signature — backend commands are built and
-  communicated as they're ready (contract-triggered merge cadence, not a
-  fixed schedule). If a command you need doesn't exist yet, flag it rather
-  than guessing its shape.
-- Two data tables the frontend reads/displays: `contacts_cache` (Chat Mode's
-  email/contact resolution) and `profile_fields` / `form_field_mappings`
-  (Form Memory's dropdown fuzzy-matching)
+
+Commands (all via `invoke()` from `@tauri-apps/api/core`):
+
+- `start_record_session()` -> `Result<String, String>`
+  Returns the session name. Fails if a session is already active.
+
+- `stop_record_session()` -> `Result<CaptureSummary, String>`
+  - `CaptureSummary`: `{ session_name, action_count, excluded_count, unmapped_events, actions: CapturedActionView[] }`
+  - `CapturedActionView`: `{ step_order, action_type, source_app, element_role, element_name, payload_preview (null if redacted) }`
+  Does NOT compile/store — this is for review only.
+
+- `compile_and_store_playbook(name_hint?: string)` -> `Result<StoredPlaybookInfo, String>`
+  - `StoredPlaybookInfo`: `{ playbook_id, label, step_count, irreversible_count, redacted_count, label_generated }`
+  Uses the last stopped session — consumes it, so this can only be called once per recording.
+
+- `list_playbooks()` -> `Result<PlaybookSummaryView[], String>`
+  - `PlaybookSummaryView`: `{ id, name, source, created_at, updated_at, step_count }`
+
+- `replay_playbook(playbookId: string)` -> `Result<ReplayReportView, String>`
+  - `ReplayReportView`: `{ run_id, playbook_id, playbook_name, status ("completed"|"failed"|"aborted"), steps_total, steps_attempted, outcomes: StepOutcomeView[] }`
+  - `StepOutcomeView`: `{ step_order, action_type, selector, result, detail, is_failure }`
+
+- `get_run_history(playbookId: string)` -> `Result<RunHistoryEntry[], String>`
+  - `RunHistoryEntry`: `{ run_id, feature, status, billable, started_at, completed_at, steps: StepLogView[] }`
 
 ## AI model stack (context only — frontend never calls these directly)
 - Local: Qwen2.5-0.5B (Ghost Mode labeling), Qwen3.5-0.8B-Vision (fallback)
