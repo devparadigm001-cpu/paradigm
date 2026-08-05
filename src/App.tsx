@@ -2,6 +2,12 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import {
+  MOCK_PLAYBOOK_IRREVERSIBLE,
+  MOCK_PLAYBOOK_SAFE,
+  useAutomationPreview,
+  type PlaybookPreviewSummary,
+} from "@/components/automation-preview";
+import {
   isProofWindow,
   isTauriRuntime,
   openProofWindow,
@@ -26,6 +32,30 @@ function MainWindowView() {
   });
   const [windowError, setWindowError] = useState<string | null>(null);
   const [isOpeningWindow, setIsOpeningWindow] = useState(false);
+  const [demoLog, setDemoLog] = useState<string | null>(null);
+
+  const { requestConfirmation, previewElement } = useAutomationPreview({
+    onDeny: (data) => {
+      setDemoLog(`Denied: "${data.playbook.name}" was not run.`);
+    },
+    onConfirmError: (error, data) => {
+      setDemoLog(
+        `Confirm handler for "${data.playbook.name}" threw: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    },
+  });
+
+  function runFirstRunDemo(playbook: PlaybookPreviewSummary) {
+    setDemoLog(null);
+    requestConfirmation({ variant: "first-run", playbook }, () => {
+      setDemoLog(
+        `Confirmed: "${playbook.name}" would now call replay_playbook() ` +
+          "(demo only — no real invoke() call is made here).",
+      );
+    });
+  }
 
   async function handleOpenProofWindow() {
     if (!isTauriRuntime()) {
@@ -75,6 +105,35 @@ function MainWindowView() {
           {windowError}
         </p>
       ) : null}
+
+      <div className="mt-4 flex w-full max-w-md flex-col items-center gap-2 rounded-md border border-dashed p-4">
+        <p className="text-muted-foreground text-center text-xs font-medium tracking-wide uppercase">
+          Dev-only demo — Automation Preview (Step 9), not real product UI
+        </p>
+        <div className="flex flex-wrap justify-center gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => runFirstRunDemo(MOCK_PLAYBOOK_SAFE)}
+          >
+            Demo: safe playbook
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => runFirstRunDemo(MOCK_PLAYBOOK_IRREVERSIBLE)}
+          >
+            Demo: irreversible playbook
+          </Button>
+        </div>
+        {demoLog ? (
+          <p className="text-muted-foreground text-center text-xs">
+            {demoLog}
+          </p>
+        ) : null}
+      </div>
+
+      {previewElement}
     </main>
   );
 }
