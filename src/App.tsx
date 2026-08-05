@@ -1,51 +1,92 @@
 import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { useQuery } from "@tanstack/react-query";
+import { Button } from "@/components/ui/button";
+import {
+  isProofWindow,
+  isTauriRuntime,
+  openProofWindow,
+} from "@/lib/windows";
+import { useWindowLabel } from "@/hooks/useWindowLabel";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+function ProofWindowView() {
+  return (
+    <main className="flex min-h-svh flex-col items-center justify-center gap-2 p-8">
+      <h1 className="text-lg font-semibold tracking-tight">Proof Window</h1>
+      <p className="text-muted-foreground text-sm">
+        Native secondary window — multi-window capability confirmed.
+      </p>
+    </main>
+  );
+}
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+function MainWindowView() {
+  const { isSuccess, isError } = useQuery({
+    queryKey: ["foundation-health"],
+    queryFn: async () => true,
+  });
+  const [windowError, setWindowError] = useState<string | null>(null);
+  const [isOpeningWindow, setIsOpeningWindow] = useState(false);
+
+  async function handleOpenProofWindow() {
+    if (!isTauriRuntime()) {
+      setWindowError("Multi-window proof requires the Tauri desktop runtime.");
+      return;
+    }
+
+    setWindowError(null);
+    setIsOpeningWindow(true);
+
+    try {
+      await openProofWindow();
+    } catch (error) {
+      setWindowError(
+        error instanceof Error ? error.message : "Failed to open proof window.",
+      );
+    } finally {
+      setIsOpeningWindow(false);
+    }
   }
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
+    <main className="flex min-h-svh flex-col items-center justify-center gap-4 p-8">
+      <h1 className="text-2xl font-semibold tracking-tight">Paradigm</h1>
+      <p className="text-muted-foreground max-w-md text-center text-sm">
+        Foundation stack: shadcn/ui, Tailwind CSS, TanStack Query, and
+        multi-window Tauri.
+      </p>
+      <div className="flex flex-col items-center gap-2">
+        <Button disabled={!isSuccess} variant={isError ? "destructive" : "default"}>
+          {isSuccess
+            ? "Query client ready"
+            : isError
+              ? "Connection failed"
+              : "Initializing..."}
+        </Button>
+        <Button
+          variant="outline"
+          disabled={isOpeningWindow}
+          onClick={() => void handleOpenProofWindow()}
+        >
+          {isOpeningWindow ? "Opening..." : "Open proof window"}
+        </Button>
       </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
+      {windowError ? (
+        <p className="text-destructive max-w-md text-center text-sm">
+          {windowError}
+        </p>
+      ) : null}
     </main>
   );
+}
+
+function App() {
+  const windowLabel = useWindowLabel();
+
+  if (isProofWindow(windowLabel)) {
+    return <ProofWindowView />;
+  }
+
+  return <MainWindowView />;
 }
 
 export default App;

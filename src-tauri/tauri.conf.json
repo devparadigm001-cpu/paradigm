@@ -12,7 +12,8 @@
   "app": {
     "windows": [
       {
-        "title": "paradigm",
+        "label": "main",
+        "title": "Paradigm",
         "width": 800,
         "height": 600
       }

@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "proof-window",
+  "description": "Capability for runtime-created proof and auxiliary windows",
+  "windows": ["proof-*"],
+  "permissions": ["core:default"]
+}
