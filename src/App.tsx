@@ -7,6 +7,7 @@ import {
   useAutomationPreview,
   type PlaybookPreviewSummary,
 } from "@/components/automation-preview";
+import { useAccessibilityPermissionGate } from "@/components/permission-gate";
 import {
   isProofWindow,
   isTauriRuntime,
@@ -52,6 +53,24 @@ function MainWindowView() {
     requestConfirmation({ variant: "first-run", playbook }, () => {
       setDemoLog(
         `Confirmed: "${playbook.name}" would now call replay_playbook() ` +
+          "(demo only — no real invoke() call is made here).",
+      );
+    });
+  }
+
+  const [permissionDemoLog, setPermissionDemoLog] = useState<string | null>(
+    null,
+  );
+  const {
+    requestAction: requestPermissionGatedAction,
+    gateElement: permissionGateElement,
+    isGranted: hasAccessibilityPermission,
+  } = useAccessibilityPermissionGate();
+
+  function runStartRecordingDemo() {
+    requestPermissionGatedAction(() => {
+      setPermissionDemoLog(
+        "Action ran: would now call start_record_session() " +
           "(demo only — no real invoke() call is made here).",
       );
     });
@@ -133,7 +152,29 @@ function MainWindowView() {
         ) : null}
       </div>
 
+      <div className="mt-4 flex w-full max-w-md flex-col items-center gap-2 rounded-md border border-dashed p-4">
+        <p className="text-muted-foreground text-center text-xs font-medium tracking-wide uppercase">
+          Dev-only demo — Accessibility Permission Gate (Step 10), not real
+          product UI
+        </p>
+        <p className="text-muted-foreground text-xs">
+          Mock permission state:{" "}
+          <span className="font-medium">
+            {hasAccessibilityPermission ? "granted" : "not granted"}
+          </span>
+        </p>
+        <Button variant="secondary" size="sm" onClick={runStartRecordingDemo}>
+          Demo: start recording
+        </Button>
+        {permissionDemoLog ? (
+          <p className="text-muted-foreground text-center text-xs">
+            {permissionDemoLog}
+          </p>
+        ) : null}
+      </div>
+
       {previewElement}
+      {permissionGateElement}
     </main>
   );
 }
