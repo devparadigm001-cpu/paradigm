@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Application manifest for integration-test binaries only.
+
+  tauri's default features include `common-controls-v6`, so anything linking the
+  Tauri runtime imports Common Controls v6 exports (TaskDialogIndirect,
+  SetWindowSubclass, RemoveWindowSubclass, DefSubclassProc). Those live in the
+  side-by-side comctl32 v6 assembly, not the v5 comctl32.dll in System32.
+
+  `tauri_build::build()` embeds a manifest into the app binary, but cargo builds
+  test binaries without one. The loader then binds them to v5, the imports fail
+  to resolve, and the process dies at startup with STATUS_ENTRYPOINT_NOT_FOUND
+  before a single test runs. build.rs embeds this into test targets to fix that.
+
+  Note for future edits: XML comments may not contain a double hyphen.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>
