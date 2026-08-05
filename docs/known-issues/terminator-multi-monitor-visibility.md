@@ -4,6 +4,9 @@
 **Affected version:** `terminator-rs` 0.23.35 (crate lib name `terminator`).
 **Platform:** Windows, multi-monitor only.
 **Found:** 2026-08-03, during the Phase 1 Step 2 Terminator capability probe.
+**Severity: HIGH.** Raised from "annoying in test tooling" on 2026-08-04, when
+Step 6's live replay run confirmed it affects the real product path. See
+"Confirmed impact on replay" below.
 
 ## Summary
 
@@ -96,6 +99,40 @@ Note these figures are in physical pixels, taken with the process running as
 per-monitor DPI aware (see the separate note below). The defect does **not**
 depend on DPI: with fully correct physical metrics, `2888 >= 1920` still holds.
 
+## Confirmed impact on replay (2026-08-04)
+
+This is no longer confined to probes. Step 6's replay module executes stored
+playbooks through the same `element.click()` path, and a live run against a
+window on the secondary monitor produced:
+
+```
+step 3 [click] executed (coordinate-click fallback)
+  element.click() refused (Element not visible); clicked real coordinates
+  (2254, 218) instead -- known multi-monitor defect
+
+step 4 [click] executed (coordinate-click fallback)
+  element.click() refused (Element not visible); clicked real coordinates
+  (2254, 292) instead -- known multi-monitor defect
+```
+
+Every click step on a non-primary display takes the workaround, and that fact is
+now written permanently into `run_steps_log.target_ui_context_json` for each
+affected step. Practical consequences:
+
+* **Replay depends on the workaround, not on the library.** If the coordinate
+  fallback is ever removed or the element has unusable bounds, those steps fail
+  outright rather than degrading.
+* **The workaround requires per-monitor DPI awareness.** `replay::ensure_dpi_aware()`
+  exists solely because of this; without it the fallback clicks the wrong place
+  silently. That coupling is invisible to callers and easy to break.
+* **Run history is polluted.** Diagnosing a real replay problem later means
+  reading past this message on most click steps.
+
+It also affected recording indirectly: the Step 6 probe's own driven clicks used
+bare `element.click()`, all of them were refused, focus never moved, and a
+password-field completion event was never captured -- so the first live run
+recorded a playbook missing the very step it was meant to demonstrate.
+
 ## Correct fix (upstream)
 
 Resolve the work area of the monitor **containing the element**, rather than the
@@ -174,7 +211,8 @@ before assuming multi-monitor support is complete.
 
 ## Next steps
 
-- [ ] Decide whether to report upstream, patch a vendored copy, or carry the
-      workaround.
+- [ ] **Raised priority:** decide whether to report upstream, patch a vendored
+      copy, or carry the workaround. Now blocking clean replay on multi-monitor
+      setups rather than merely inconveniencing probes.
 - [ ] Test a monitor positioned left of / above the primary.
 - [ ] Confirm the Tauri app binary's DPI awareness before Phase 2 automation.
