@@ -14,11 +14,16 @@
 
 use std::sync::Mutex;
 
+use paradigm_lib::capture::{
+    ActionCandidate, ActionKind, CapturedAction, CapturedStream, ExclusionList,
+};
+use paradigm_lib::compile::store;
+use paradigm_lib::AppState;
 use tauri::ipc::{CallbackFn, InvokeBody};
 use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, MockRuntime,
                   INVOKE_KEY};
 use tauri::webview::InvokeRequest;
-use tauri::{App, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{App, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tempfile::TempDir;
 
 /// `PARADIGM_DATA_DIR` is process-global, so setting it and building the app
@@ -179,6 +184,228 @@ fn every_registered_command_is_reachable_over_ipc() {
     // Recording actually starts a real recorder above; make sure it is stopped
     // so it does not outlive the test.
     let _ = invoke(&webview, "stop_record_session", InvokeBody::default());
+}
+
+// ------------------------------------------- compile_and_store_playbook ----
+//
+// These drive the real command over the real IPC boundary, but seed the
+// pending capture directly instead of recording one: the reorder/subset
+// behaviour is independent of where the actions came from, and `ipc_pipeline`
+// already covers the recorded path end to end.
+
+/// Build gated actions the only way they can be built -- by putting candidates
+/// through the real exclusion gate.
+///
+/// A test cannot construct a `CapturedAction` itself, and deliberately so
+/// (`capture::stream`). Going through `admit` means these are the same kind of
+/// actions a recording produces, so seeding them is not a way to sidestep the
+/// gate.
+fn gated_actions(names: &[&str]) -> Vec<CapturedAction> {
+    let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
+    for (i, name) in names.iter().enumerate() {
+        stream.admit(ActionCandidate {
+            kind: ActionKind::Click,
+            identifiers: vec!["paradigm-ipc-test.exe".into()],
+            element_role: Some("Button".into()),
+            element_name: Some((*name).to_string()),
+            payload: None,
+            detail: None,
+            timestamp_ms: i as u64,
+        });
+    }
+
+    let actions = stream.actions().to_vec();
+    assert_eq!(
+        actions.len(),
+        names.len(),
+        "the exclusion gate refused a test action; the fixture is wrong, not the code"
+    );
+    actions
+}
+
+fn seed_pending(app: &App<MockRuntime>, names: &[&str]) {
+    let state = app.state::<AppState>();
+    let mut pending = state.pending_actions.lock().expect("pending_actions lock");
+    *pending = Some(gated_actions(names));
+}
+
+/// How many actions are still awaiting a compile decision, if any.
+fn pending_count(app: &App<MockRuntime>) -> Option<usize> {
+    let state = app.state::<AppState>();
+    let pending = state.pending_actions.lock().expect("pending_actions lock");
+    pending.as_ref().map(Vec::len)
+}
+
+/// Invoke the command the way the frontend would. `indices` of `None` omits the
+/// argument entirely rather than sending null, which is what an existing caller
+/// that predates `stepIndices` actually does.
+fn compile(
+    webview: &WebviewWindow<MockRuntime>,
+    name_hint: &str,
+    indices: Option<&[i64]>,
+) -> Result<serde_json::Value, String> {
+    let mut body = serde_json::json!({ "nameHint": name_hint });
+    if let Some(indices) = indices {
+        body["stepIndices"] = serde_json::json!(indices);
+    }
+
+    invoke(webview, "compile_and_store_playbook", InvokeBody::Json(body))
+        .map(|r| r.deserialize::<serde_json::Value>().expect("deserialize info"))
+        .map_err(|e| e.to_string())
+}
+
+/// The target names of a stored playbook's steps, in stored order.
+///
+/// Reads the database back rather than trusting the command's return value:
+/// `step_count` alone cannot tell a reorder from a no-op.
+fn stored_step_names(app: &App<MockRuntime>, playbook_id: &str) -> Vec<String> {
+    let state = app.state::<AppState>();
+    let conn = state.db.blocking_lock();
+    let playbook = store::load(&conn, playbook_id).expect("load stored playbook");
+
+    // Whatever was selected, the stored order must still be dense and 1-based --
+    // a subset that left holes would replay in the wrong shape.
+    let orders: Vec<i64> = playbook.steps.iter().map(|s| s.step_order).collect();
+    assert_eq!(
+        orders,
+        (1..=playbook.steps.len() as i64).collect::<Vec<_>>(),
+        "stored step_order is not dense and 1-based"
+    );
+
+    playbook
+        .steps
+        .iter()
+        .map(|s| {
+            let payload: serde_json::Value =
+                serde_json::from_str(&s.action_payload_json).expect("payload json");
+            payload["target"]["name"]
+                .as_str()
+                .expect("target name")
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn omitting_step_indices_compiles_every_action_in_captured_order() {
+    // The pre-existing behaviour. It must not change for a caller that has
+    // never heard of stepIndices.
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+    seed_pending(&app, &["alpha", "bravo", "charlie", "delta"]);
+
+    let info = compile(&webview, "Unchanged", None).expect("compile with no selection");
+
+    assert_eq!(info["step_count"].as_u64(), Some(4));
+    assert_eq!(info["label"], "Unchanged");
+    assert_eq!(info["label_generated"], false);
+
+    let id = info["playbook_id"].as_str().expect("playbook_id");
+    assert_eq!(
+        stored_step_names(&app, id),
+        vec!["alpha", "bravo", "charlie", "delta"]
+    );
+    assert_eq!(pending_count(&app), None, "the capture should be consumed");
+}
+
+#[test]
+fn step_indices_reorder_the_stored_playbook() {
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+    seed_pending(&app, &["alpha", "bravo", "charlie", "delta"]);
+
+    let info = compile(&webview, "Reordered", Some(&[3, 1, 0, 2])).expect("compile a reorder");
+
+    assert_eq!(info["step_count"].as_u64(), Some(4), "a reorder drops nothing");
+
+    let id = info["playbook_id"].as_str().expect("playbook_id");
+    assert_eq!(
+        stored_step_names(&app, id),
+        vec!["delta", "bravo", "alpha", "charlie"],
+        "steps were not stored in the requested order"
+    );
+}
+
+#[test]
+fn step_indices_can_drop_actions() {
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+    seed_pending(&app, &["alpha", "bravo", "charlie", "delta"]);
+
+    // Keep two of the four, and not in captured order either.
+    let info = compile(&webview, "Subset", Some(&[2, 0])).expect("compile a subset");
+
+    assert_eq!(info["step_count"].as_u64(), Some(2));
+
+    let id = info["playbook_id"].as_str().expect("playbook_id");
+    assert_eq!(stored_step_names(&app, id), vec!["charlie", "alpha"]);
+
+    // The dropped actions are gone, not merely hidden.
+    let names = stored_step_names(&app, id).join(",");
+    assert!(!names.contains("bravo"), "a deselected action was stored: {names}");
+    assert!(!names.contains("delta"), "a deselected action was stored: {names}");
+}
+
+#[test]
+fn an_out_of_range_step_index_is_rejected_and_the_capture_survives() {
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+    seed_pending(&app, &["alpha", "bravo", "charlie"]);
+
+    let err = compile(&webview, "Bad", Some(&[0, 3]))
+        .expect_err("an out-of-range index must be rejected");
+    assert!(err.contains("out of range"), "unhelpful error: {err}");
+
+    // Rejected before any work, so the user can correct the selection rather
+    // than having to record the session again.
+    assert_eq!(
+        pending_count(&app),
+        Some(3),
+        "a rejected selection consumed the pending capture"
+    );
+
+    let list = invoke(&webview, "list_playbooks", InvokeBody::default())
+        .expect("list_playbooks")
+        .deserialize::<serde_json::Value>()
+        .expect("deserialize list");
+    assert!(
+        list.as_array().expect("array").is_empty(),
+        "a rejected selection stored a playbook anyway: {list}"
+    );
+
+    // And the corrected call still works.
+    let info = compile(&webview, "Corrected", Some(&[0, 2])).expect("retry with valid indices");
+    let id = info["playbook_id"].as_str().expect("playbook_id");
+    assert_eq!(stored_step_names(&app, id), vec!["alpha", "charlie"]);
+}
+
+#[test]
+fn an_empty_step_indices_list_is_rejected() {
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+    seed_pending(&app, &["alpha", "bravo"]);
+
+    let err = compile(&webview, "Empty", Some(&[]))
+        .expect_err("selecting nothing must not store an empty playbook");
+    assert!(
+        err.contains("no actions to compile"),
+        "should reuse the existing nothing-to-compile error: {err}"
+    );
+    assert_eq!(pending_count(&app), Some(2));
+}
+
+#[test]
+fn a_negative_step_index_is_rejected() {
+    // usize deserialisation refuses this at the IPC boundary. Asserted so a
+    // future change to a signed index type cannot silently start wrapping.
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+    seed_pending(&app, &["alpha", "bravo"]);
+
+    let err = compile(&webview, "Negative", Some(&[-1]))
+        .expect_err("a negative index must be rejected");
+    println!("negative index rejected with: {err}");
+    assert_eq!(pending_count(&app), Some(2));
 }
 
 #[test]

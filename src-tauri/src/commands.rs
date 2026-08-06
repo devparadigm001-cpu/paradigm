@@ -19,7 +19,14 @@
 //! Instead `stop_record_session` returns a read-only *view* of what was
 //! captured (for the user to review, which is the brief's stated purpose) and
 //! keeps the real actions in app state. `compile_and_store_playbook` then takes
-//! only `name_hint`. The round trip through the frontend is display-only.
+//! only `name_hint` and, optionally, `step_indices`. The round trip through the
+//! frontend is display-only.
+//!
+//! `step_indices` lets the user drop and reorder steps during that review
+//! without weakening the above: only plain numbers cross the IPC boundary, and
+//! each one indexes the actions already sitting in app state. Every action a
+//! compiled playbook can contain therefore still came out of `admit`, so the
+//! frontend gains no way to introduce one that never passed the exclusion gate.
 
 use std::path::PathBuf;
 
@@ -159,6 +166,53 @@ fn model_path(state: &AppState) -> PathBuf {
     state.model_path.clone()
 }
 
+/// The one message for "there is nothing to compile", used by both the
+/// nothing-was-captured and the nothing-was-selected paths so a caller can
+/// match on it without caring which produced it.
+const NO_ACTIONS: &str = "the captured session contains no actions to compile";
+
+/// Resolve the caller's step selection into positions in `pending_actions`.
+///
+/// `None` means every captured action in its original order -- the behaviour
+/// before `step_indices` existed, and the one existing callers rely on.
+/// `Some(indices)` is the subset and/or reordering the user chose while
+/// reviewing the capture, given as positions in the desired final order.
+///
+/// Duplicates are deliberately *not* rejected: repeating a step is a coherent
+/// thing to ask for, it produces a playbook that still validates (each step is
+/// compiled with its own id and a dense step_order), and refusing it would be a
+/// restriction nothing asked for. Out-of-range indices are a different matter --
+/// there is no sensible action to compile for one, so it is an error rather
+/// than something to silently skip.
+fn resolve_selection(total: usize, requested: Option<&[usize]>) -> Result<Vec<usize>, String> {
+    // Checked here as well as by the caller so this function is correct on its
+    // own terms: every path below assumes there is at least one action, and
+    // `total - 1` in the range message would underflow without it.
+    if total == 0 {
+        return Err(NO_ACTIONS.to_string());
+    }
+
+    let Some(indices) = requested else {
+        return Ok((0..total).collect());
+    };
+
+    // Selecting nothing is not a zero-step playbook; it is the same "nothing to
+    // compile" condition as an empty capture, and takes the same error.
+    if indices.is_empty() {
+        return Err(NO_ACTIONS.to_string());
+    }
+
+    if let Some(&bad) = indices.iter().find(|&&i| i >= total) {
+        return Err(format!(
+            "step index {bad} is out of range: the captured session has {total} action(s), \
+             so the valid indices are 0..={}",
+            total - 1
+        ));
+    }
+
+    Ok(indices.to_vec())
+}
+
 // ------------------------------------------------------------- commands ----
 
 /// Begin a Record Mode capture session.
@@ -224,20 +278,32 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
 }
 
 /// Clean, label, compile, validate and store the last captured session.
+///
+/// `step_indices` is the user's edit of the capture, made while reviewing it:
+/// positions in the captured action list, in the order they should replay.
+/// Omit it to compile everything as captured. See the module docs for why this
+/// takes indices rather than actions.
 #[tauri::command]
 pub async fn compile_and_store_playbook(
     state: State<'_, AppState>,
     name_hint: Option<String>,
+    step_indices: Option<Vec<usize>>,
 ) -> Result<StoredPlaybookInfo, String> {
-    let actions = {
+    let captured = {
         let pending = state.pending_actions.lock().map_err(|e| e.to_string())?;
         pending
             .clone()
             .ok_or_else(|| "no captured session to compile; record one first".to_string())?
     };
-    if actions.is_empty() {
-        return Err("the captured session contains no actions to compile".to_string());
+    if captured.is_empty() {
+        return Err(NO_ACTIONS.to_string());
     }
+
+    // Resolved before any work is done, so a bad selection costs nothing and --
+    // more importantly -- leaves the pending capture intact for the caller to
+    // retry with a corrected one.
+    let selection = resolve_selection(captured.len(), step_indices.as_deref())?;
+    let actions: Vec<CapturedAction> = selection.iter().map(|&i| captured[i].clone()).collect();
 
     let redaction = RedactionPolicy::placeholder();
 
@@ -394,4 +460,55 @@ pub async fn get_run_history(
 #[allow(dead_code)]
 fn carries_payload(kind: ActionKind) -> bool {
     kind == ActionKind::Type
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_selection_means_every_action_in_captured_order() {
+        assert_eq!(resolve_selection(4, None).unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn a_selection_is_taken_in_the_order_given() {
+        // The point of the parameter: this is a reorder, not a filter that
+        // happens to preserve capture order.
+        assert_eq!(
+            resolve_selection(4, Some(&[3, 1, 0, 2])).unwrap(),
+            vec![3, 1, 0, 2]
+        );
+    }
+
+    #[test]
+    fn a_selection_can_drop_actions() {
+        assert_eq!(resolve_selection(4, Some(&[2, 0])).unwrap(), vec![2, 0]);
+    }
+
+    #[test]
+    fn an_out_of_range_index_is_refused() {
+        let err = resolve_selection(3, Some(&[0, 3])).unwrap_err();
+        assert!(err.contains("out of range"), "unhelpful error: {err}");
+        assert!(err.contains("0..=2"), "error should name the valid range: {err}");
+    }
+
+    #[test]
+    fn an_empty_selection_is_the_nothing_to_compile_case() {
+        // Not a zero-step playbook, which would validate as EmptyPlaybook only
+        // after doing all the labeling and compiling work first.
+        assert_eq!(resolve_selection(3, Some(&[])).unwrap_err(), NO_ACTIONS);
+    }
+
+    #[test]
+    fn no_captured_actions_is_refused_whatever_was_selected() {
+        assert_eq!(resolve_selection(0, None).unwrap_err(), NO_ACTIONS);
+        assert_eq!(resolve_selection(0, Some(&[0])).unwrap_err(), NO_ACTIONS);
+    }
+
+    #[test]
+    fn a_repeated_index_is_allowed() {
+        // Documented behaviour, not an oversight -- see `resolve_selection`.
+        assert_eq!(resolve_selection(2, Some(&[1, 1, 0])).unwrap(), vec![1, 1, 0]);
+    }
 }
