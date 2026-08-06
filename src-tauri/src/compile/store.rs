@@ -127,13 +127,21 @@ pub struct PlaybookSummary {
     pub created_at: String,
     pub updated_at: String,
     pub step_count: i64,
+    /// Count of steps stored with `reversible = 0` -- i.e. NOT reversible.
+    /// A step whose `reversible` is NULL (not yet assigned by compile) counts
+    /// toward neither this nor `step_count`'s complement; it is simply absent
+    /// from this total, same as `step_count` treats every row equally
+    /// regardless of `reversible`.
+    pub irreversible_count: i64,
 }
 
 /// Every stored playbook, newest first. No pagination in Phase 1.
 pub fn list(conn: &Connection) -> Result<Vec<PlaybookSummary>, DbError> {
     let mut stmt = conn.prepare(
         "SELECT p.id, p.name, p.source, p.created_at, p.updated_at,
-                (SELECT COUNT(*) FROM playbook_steps s WHERE s.playbook_id = p.id)
+                (SELECT COUNT(*) FROM playbook_steps s WHERE s.playbook_id = p.id),
+                (SELECT COUNT(*) FROM playbook_steps s
+                  WHERE s.playbook_id = p.id AND s.reversible = 0)
            FROM playbooks p
           ORDER BY p.created_at DESC, p.id",
     )?;
@@ -145,6 +153,7 @@ pub fn list(conn: &Connection) -> Result<Vec<PlaybookSummary>, DbError> {
             created_at: r.get(3)?,
             updated_at: r.get(4)?,
             step_count: r.get(5)?,
+            irreversible_count: r.get(6)?,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -161,5 +170,86 @@ pub fn parse_control_role(raw: &str) -> ControlRole {
         "radio" => ControlRole::Radio,
         "link" => ControlRole::Link,
         _ => ControlRole::Other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::compile::reversibility::ReversibilityReason;
+    use crate::compile::{CompiledStep, SOURCE_RECORD_MODE};
+    use crate::db::migrations;
+
+    /// A fresh in-memory database with the real schema applied -- no
+    /// SQLCipher key needed for this, `apply_all` is pure DDL.
+    fn test_conn() -> Connection {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        migrations::apply_all(&mut conn).expect("apply migrations");
+        conn
+    }
+
+    /// Build a playbook with one step per entry in `reversible_flags`, in
+    /// order. Only the fields `store()`/`list()` actually touch are given
+    /// meaningful values; the rest are provenance `store()` never persists.
+    fn playbook_with_steps(id: &str, reversible_flags: &[bool]) -> CompiledPlaybook {
+        let steps = reversible_flags
+            .iter()
+            .enumerate()
+            .map(|(i, &reversible)| CompiledStep {
+                id: Uuid::new_v4().to_string(),
+                step_order: (i + 1) as i64,
+                action_type: "click".to_string(),
+                control_role: ControlRole::Button,
+                reversible,
+                action_payload_json: "{}".to_string(),
+                raw_role: None,
+                target_name: None,
+                reversibility_reason: ReversibilityReason::UnidentifiableTarget,
+                payload_redacted: false,
+            })
+            .collect();
+
+        CompiledPlaybook {
+            id: id.to_string(),
+            name: format!("Test playbook {id}"),
+            source: SOURCE_RECORD_MODE.to_string(),
+            steps,
+        }
+    }
+
+    fn summary_for<'a>(rows: &'a [PlaybookSummary], id: &str) -> &'a PlaybookSummary {
+        rows.iter()
+            .find(|p| p.id == id)
+            .unwrap_or_else(|| panic!("no summary row for playbook {id}"))
+    }
+
+    #[test]
+    fn list_reports_correct_irreversible_count_for_mixed_playbook() {
+        let mut conn = test_conn();
+        // 3 reversible, 2 irreversible -- 5 steps total.
+        let pb = playbook_with_steps("mixed-pb", &[true, false, true, false, true]);
+        store(&mut conn, &pb).expect("store");
+
+        let rows = list(&conn).expect("list");
+        let summary = summary_for(&rows, "mixed-pb");
+
+        assert_eq!(summary.step_count, 5);
+        assert_eq!(summary.irreversible_count, 2);
+    }
+
+    #[test]
+    fn list_reports_zero_irreversible_count_when_none_are_irreversible() {
+        let mut conn = test_conn();
+        let pb = playbook_with_steps("all-reversible-pb", &[true, true, true]);
+        store(&mut conn, &pb).expect("store");
+
+        let rows = list(&conn).expect("list");
+        let summary = summary_for(&rows, "all-reversible-pb");
+
+        assert_eq!(summary.step_count, 3);
+        assert_eq!(summary.irreversible_count, 0);
     }
 }
