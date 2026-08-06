@@ -85,6 +85,9 @@ pub struct PlaybookSummaryView {
     pub created_at: String,
     pub updated_at: String,
     pub step_count: i64,
+    /// How many of those steps are irreversible, so the list can warn before
+    /// the user replays one. Purely additive: existing fields are untouched.
+    pub irreversible_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -377,6 +380,7 @@ pub async fn list_playbooks(
             created_at: p.created_at,
             updated_at: p.updated_at,
             step_count: p.step_count,
+            irreversible_count: p.irreversible_count,
         })
         .collect())
 }
