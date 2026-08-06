@@ -127,11 +127,14 @@ pub struct PlaybookSummary {
     pub created_at: String,
     pub updated_at: String,
     pub step_count: i64,
-    /// Count of steps stored with `reversible = 0` -- i.e. NOT reversible.
-    /// A step whose `reversible` is NULL (not yet assigned by compile) counts
-    /// toward neither this nor `step_count`'s complement; it is simply absent
-    /// from this total, same as `step_count` treats every row equally
-    /// regardless of `reversible`.
+    /// Steps stored with `reversible = 0`, matching
+    /// [`CompiledPlaybook::irreversible_count`](super::CompiledPlaybook::irreversible_count).
+    ///
+    /// `reversible` is nullable in the schema, and a NULL is neither 0 nor 1,
+    /// so it counts towards neither total. That is the intended reading: NULL
+    /// means no classification was recorded, which is not the same claim as
+    /// "irreversible". Record Mode always assigns the column, so a NULL here
+    /// would mean a step arrived by some other route.
     pub irreversible_count: i64,
 }
 
@@ -175,81 +178,120 @@ pub fn parse_control_role(raw: &str) -> ControlRole {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
-    use uuid::Uuid;
-
     use super::*;
-    use crate::compile::reversibility::ReversibilityReason;
-    use crate::compile::{CompiledStep, SOURCE_RECORD_MODE};
-    use crate::db::migrations;
+    use crate::capture::{ActionCandidate, ActionKind, CapturedAction, CapturedStream, ExclusionList};
+    use crate::compile::{compile, ReversibilityPolicy};
+    use crate::labeling::RedactionPolicy;
+    use tempfile::TempDir;
 
-    /// A fresh in-memory database with the real schema applied -- no
-    /// SQLCipher key needed for this, `apply_all` is pure DDL.
-    fn test_conn() -> Connection {
-        let mut conn = Connection::open_in_memory().expect("open in-memory db");
-        migrations::apply_all(&mut conn).expect("apply migrations");
-        conn
-    }
-
-    /// Build a playbook with one step per entry in `reversible_flags`, in
-    /// order. Only the fields `store()`/`list()` actually touch are given
-    /// meaningful values; the rest are provenance `store()` never persists.
-    fn playbook_with_steps(id: &str, reversible_flags: &[bool]) -> CompiledPlaybook {
-        let steps = reversible_flags
-            .iter()
-            .enumerate()
-            .map(|(i, &reversible)| CompiledStep {
-                id: Uuid::new_v4().to_string(),
-                step_order: (i + 1) as i64,
-                action_type: "click".to_string(),
-                control_role: ControlRole::Button,
-                reversible,
-                action_payload_json: "{}".to_string(),
-                raw_role: None,
-                target_name: None,
-                reversibility_reason: ReversibilityReason::UnidentifiableTarget,
-                payload_redacted: false,
-            })
-            .collect();
-
-        CompiledPlaybook {
-            id: id.to_string(),
-            name: format!("Test playbook {id}"),
-            source: SOURCE_RECORD_MODE.to_string(),
-            steps,
+    /// Clicks on the named buttons, gated the only way actions can be.
+    ///
+    /// Button names drive reversibility here: the placeholder policy treats
+    /// "Send"/"Delete" as irreversible keywords and has no keyword matching
+    /// "Cancel"/"Back"/"Next", so the fixture controls the split without
+    /// touching the stored rows by hand.
+    fn clicks(names: &[&str]) -> Vec<CapturedAction> {
+        let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
+        for (i, name) in names.iter().enumerate() {
+            stream.admit(ActionCandidate {
+                kind: ActionKind::Click,
+                identifiers: vec!["app.exe".into()],
+                element_role: Some("Button".into()),
+                element_name: Some((*name).to_string()),
+                payload: None,
+                detail: None,
+                timestamp_ms: i as u64,
+            });
         }
+        stream.actions().to_vec()
     }
 
-    fn summary_for<'a>(rows: &'a [PlaybookSummary], id: &str) -> &'a PlaybookSummary {
-        rows.iter()
-            .find(|p| p.id == id)
-            .unwrap_or_else(|| panic!("no summary row for playbook {id}"))
+    /// Store one playbook in a fresh encrypted database and list it back.
+    ///
+    /// Goes through the real `store`/`list` pair rather than asserting on the
+    /// `CompiledPlaybook`: the point is that the SQL counts correctly, which an
+    /// in-memory check would not exercise at all.
+    fn stored_summary(names: &[&str], label: &str) -> (PlaybookSummary, CompiledPlaybook) {
+        let dir = TempDir::new().expect("temp dir");
+        let (db_path, key_path) = crate::db::paths_in(dir.path());
+        let mut conn = crate::db::open(&db_path, &key_path).expect("open encrypted db");
+
+        let playbook = compile(
+            &clicks(names),
+            label,
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        store(&mut conn, &playbook).expect("store playbook");
+
+        let mut rows = list(&conn).expect("list playbooks");
+        assert_eq!(rows.len(), 1, "expected exactly one stored playbook");
+        (rows.remove(0), playbook)
     }
 
     #[test]
-    fn list_reports_correct_irreversible_count_for_mixed_playbook() {
-        let mut conn = test_conn();
-        // 3 reversible, 2 irreversible -- 5 steps total.
-        let pb = playbook_with_steps("mixed-pb", &[true, false, true, false, true]);
-        store(&mut conn, &pb).expect("store");
+    fn a_mixed_playbook_reports_only_the_irreversible_steps() {
+        let (summary, playbook) =
+            stored_summary(&["Send", "Cancel", "Delete", "Back"], "Mixed");
 
-        let rows = list(&conn).expect("list");
-        let summary = summary_for(&rows, "mixed-pb");
+        assert_eq!(summary.step_count, 4);
+        assert_eq!(
+            summary.irreversible_count, 2,
+            "should count Send and Delete, not the reversible steps"
+        );
 
-        assert_eq!(summary.step_count, 5);
-        assert_eq!(summary.irreversible_count, 2);
+        // The SQL and the in-memory definition must not drift apart.
+        assert_eq!(
+            summary.irreversible_count as usize,
+            playbook.irreversible_count(),
+            "list() disagrees with CompiledPlaybook::irreversible_count"
+        );
     }
 
     #[test]
-    fn list_reports_zero_irreversible_count_when_none_are_irreversible() {
-        let mut conn = test_conn();
-        let pb = playbook_with_steps("all-reversible-pb", &[true, true, true]);
-        store(&mut conn, &pb).expect("store");
-
-        let rows = list(&conn).expect("list");
-        let summary = summary_for(&rows, "all-reversible-pb");
+    fn a_fully_reversible_playbook_reports_zero() {
+        let (summary, playbook) = stored_summary(&["Cancel", "Back", "Next"], "All Reversible");
 
         assert_eq!(summary.step_count, 3);
-        assert_eq!(summary.irreversible_count, 0);
+        assert_eq!(
+            summary.irreversible_count, 0,
+            "no step here matches an irreversible keyword"
+        );
+        assert_eq!(playbook.irreversible_count(), 0, "fixture is wrong, not the SQL");
+    }
+
+    #[test]
+    fn the_count_is_per_playbook_not_across_the_table() {
+        // A correlated subquery missing its WHERE would still pass both tests
+        // above when only one playbook exists. Two playbooks catch that.
+        let dir = TempDir::new().expect("temp dir");
+        let (db_path, key_path) = crate::db::paths_in(dir.path());
+        let mut conn = crate::db::open(&db_path, &key_path).expect("open encrypted db");
+
+        let risky = compile(
+            &clicks(&["Send", "Delete"]),
+            "Risky",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        let safe = compile(
+            &clicks(&["Cancel", "Back"]),
+            "Safe",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        store(&mut conn, &risky).expect("store risky");
+        store(&mut conn, &safe).expect("store safe");
+
+        let rows = list(&conn).expect("list playbooks");
+        let by_id = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("playbook {id} missing from list"))
+                .clone()
+        };
+
+        assert_eq!(by_id(&risky.id).irreversible_count, 2);
+        assert_eq!(by_id(&safe.id).irreversible_count, 0);
     }
 }
