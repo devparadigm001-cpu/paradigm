@@ -6,5 +6,7 @@ export type {
   CapturedActionView,
   CaptureSummary,
   PlaybookSummaryView,
+  ReplayReportView,
+  StepOutcomeView,
   StoredPlaybookInfo,
 } from "./types";

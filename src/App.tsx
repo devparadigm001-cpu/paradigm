@@ -14,7 +14,9 @@ import {
   RecordingReviewScreen,
   useRecordMode,
   type PlaybookSummaryView,
+  type ReplayReportView,
 } from "@/components/record-mode";
+import { ReplayProgressScreen, ReplayResultScreen } from "@/components/replay";
 import {
   isProofWindow,
   isRecordingBadgeWindow,
@@ -42,7 +44,26 @@ const RECORD_PHASE_LABEL: Record<string, string> = {
   stopping: "Stopping...",
 };
 
-function StoredPlaybooksSection() {
+function playbookToPreviewSummary(
+  playbook: PlaybookSummaryView,
+): PlaybookPreviewSummary {
+  return {
+    playbook_id: playbook.id,
+    name: playbook.name,
+    step_count: playbook.step_count,
+    irreversible_count: playbook.irreversible_count,
+  };
+}
+
+type StoredPlaybooksSectionProps = {
+  onReplay: (playbook: PlaybookSummaryView) => void;
+  replayBusyPlaybookId: string | null;
+};
+
+function StoredPlaybooksSection({
+  onReplay,
+  replayBusyPlaybookId,
+}: StoredPlaybooksSectionProps) {
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ["playbooks"],
     queryFn: () => invoke<PlaybookSummaryView[]>("list_playbooks"),
@@ -70,17 +91,30 @@ function StoredPlaybooksSection() {
           No playbooks saved yet — record and save one below.
         </p>
       ) : (
-        <ul className="flex flex-col gap-1">
+        <ul className="flex flex-col gap-2">
           {data.map((playbook) => (
             <li
               key={playbook.id}
               className="flex items-center justify-between gap-2 text-sm"
             >
-              <span className="truncate">{playbook.name}</span>
-              <span className="text-muted-foreground shrink-0 text-xs">
-                {playbook.step_count} step{playbook.step_count === 1 ? "" : "s"}{" "}
-                · {playbook.source}
-              </span>
+              <div className="min-w-0 flex-1">
+                <p className="truncate">{playbook.name}</p>
+                <p className="text-muted-foreground text-xs">
+                  {playbook.step_count} step{playbook.step_count === 1 ? "" : "s"}{" "}
+                  · {playbook.source}
+                  {playbook.irreversible_count > 0
+                    ? ` · ${playbook.irreversible_count} irreversible`
+                    : ""}
+                </p>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={replayBusyPlaybookId !== null}
+                onClick={() => onReplay(playbook)}
+              >
+                Replay
+              </Button>
             </li>
           ))}
         </ul>
@@ -97,19 +131,52 @@ function MainWindowView() {
   const [windowError, setWindowError] = useState<string | null>(null);
   const [isOpeningWindow, setIsOpeningWindow] = useState(false);
   const [demoLog, setDemoLog] = useState<string | null>(null);
+  const [replayBusyPlaybookId, setReplayBusyPlaybookId] = useState<string | null>(
+    null,
+  );
+  const [replayProgressName, setReplayProgressName] = useState<string | null>(
+    null,
+  );
+  const [replayReport, setReplayReport] = useState<ReplayReportView | null>(null);
+  const [replayError, setReplayError] = useState<string | null>(null);
 
   const { requestConfirmation, previewElement } = useAutomationPreview({
     onDeny: (data) => {
       setDemoLog(`Denied: "${data.playbook.name}" was not run.`);
     },
     onConfirmError: (error, data) => {
-      setDemoLog(
-        `Confirm handler for "${data.playbook.name}" threw: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+      setReplayError(
+        `Replay for "${data.playbook.name}" failed: ${describeError(error)}`,
       );
+      setReplayBusyPlaybookId(null);
+      setReplayProgressName(null);
     },
   });
+
+  function clearReplayState() {
+    setReplayBusyPlaybookId(null);
+    setReplayProgressName(null);
+    setReplayReport(null);
+    setReplayError(null);
+  }
+
+  function runStoredPlaybookReplay(playbook: PlaybookSummaryView) {
+    setReplayError(null);
+    setReplayReport(null);
+    requestConfirmation(
+      { variant: "first-run", playbook: playbookToPreviewSummary(playbook) },
+      async () => {
+        setReplayBusyPlaybookId(playbook.id);
+        setReplayProgressName(playbook.name);
+        const report = await invoke<ReplayReportView>("replay_playbook", {
+          playbookId: playbook.id,
+        });
+        setReplayReport(report);
+        setReplayBusyPlaybookId(null);
+        setReplayProgressName(null);
+      },
+    );
+  }
 
   function runFirstRunDemo(playbook: PlaybookPreviewSummary) {
     setDemoLog(null);
@@ -170,6 +237,26 @@ function MainWindowView() {
     );
   }
 
+  if (replayProgressName) {
+    return <ReplayProgressScreen playbookName={replayProgressName} />;
+  }
+
+  if (replayReport) {
+    return (
+      <ReplayResultScreen report={replayReport} onDone={clearReplayState} />
+    );
+  }
+
+  if (replayError) {
+    return (
+      <main className="flex min-h-svh flex-col items-center justify-center gap-4 p-8">
+        <h1 className="text-xl font-semibold tracking-tight">Replay failed</h1>
+        <p className="text-destructive max-w-md text-center text-sm">{replayError}</p>
+        <Button onClick={clearReplayState}>Done</Button>
+      </main>
+    );
+  }
+
   const recordButtonDisabled =
     recordMode.phase === "starting" || recordMode.phase === "stopping";
 
@@ -225,7 +312,10 @@ function MainWindowView() {
         ) : null}
       </div>
 
-      <StoredPlaybooksSection />
+      <StoredPlaybooksSection
+        onReplay={runStoredPlaybookReplay}
+        replayBusyPlaybookId={replayBusyPlaybookId}
+      />
 
       <div className="mt-4 flex w-full max-w-md flex-col items-center gap-2 rounded-md border border-dashed p-4">
         <p className="text-muted-foreground text-center text-xs font-medium tracking-wide uppercase">

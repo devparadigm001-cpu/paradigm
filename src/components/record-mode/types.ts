@@ -41,4 +41,25 @@ export type PlaybookSummaryView = {
   created_at: string;
   updated_at: string;
   step_count: number;
+  irreversible_count: number;
+};
+
+export type StepOutcomeView = {
+  step_order: number;
+  action_type: string;
+  selector: string | null;
+  result: string;
+  detail: string;
+  is_failure: boolean;
+};
+
+export type ReplayReportView = {
+  run_id: string;
+  playbook_id: string;
+  playbook_name: string;
+  /** "completed" | "failed" | "aborted" */
+  status: string;
+  steps_total: number;
+  steps_attempted: number;
+  outcomes: StepOutcomeView[];
 };
