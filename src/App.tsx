@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { invoke } from "@tauri-apps/api/core";
 import { Button } from "@/components/ui/button";
 import {
   MOCK_PLAYBOOK_IRREVERSIBLE,
@@ -9,10 +10,18 @@ import {
 } from "@/components/automation-preview";
 import { useAccessibilityPermissionGate } from "@/components/permission-gate";
 import {
+  RecordingBadgeView,
+  RecordingReviewScreen,
+  useRecordMode,
+  type PlaybookSummaryView,
+} from "@/components/record-mode";
+import {
   isProofWindow,
+  isRecordingBadgeWindow,
   isTauriRuntime,
   openProofWindow,
 } from "@/lib/windows";
+import { describeError } from "@/lib/errors";
 import { useWindowLabel } from "@/hooks/useWindowLabel";
 
 function ProofWindowView() {
@@ -23,6 +32,60 @@ function ProofWindowView() {
         Native secondary window — multi-window capability confirmed.
       </p>
     </main>
+  );
+}
+
+const RECORD_PHASE_LABEL: Record<string, string> = {
+  idle: "Start recording",
+  starting: "Starting...",
+  recording: "Stop recording",
+  stopping: "Stopping...",
+};
+
+function StoredPlaybooksSection() {
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
+    queryKey: ["playbooks"],
+    queryFn: () => invoke<PlaybookSummaryView[]>("list_playbooks"),
+  });
+
+  return (
+    <div className="mt-4 flex w-full max-w-md flex-col gap-2 rounded-md border p-4">
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-medium">Stored playbooks</p>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => void refetch()}
+          disabled={isFetching}
+        >
+          {isFetching ? "Refreshing..." : "Refresh"}
+        </Button>
+      </div>
+      {isLoading ? (
+        <p className="text-muted-foreground text-sm">Loading...</p>
+      ) : isError ? (
+        <p className="text-destructive text-sm">{describeError(error)}</p>
+      ) : !data || data.length === 0 ? (
+        <p className="text-muted-foreground text-sm">
+          No playbooks saved yet — record and save one below.
+        </p>
+      ) : (
+        <ul className="flex flex-col gap-1">
+          {data.map((playbook) => (
+            <li
+              key={playbook.id}
+              className="flex items-center justify-between gap-2 text-sm"
+            >
+              <span className="truncate">{playbook.name}</span>
+              <span className="text-muted-foreground shrink-0 text-xs">
+                {playbook.step_count} step{playbook.step_count === 1 ? "" : "s"}{" "}
+                · {playbook.source}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -96,6 +159,20 @@ function MainWindowView() {
     }
   }
 
+  const recordMode = useRecordMode();
+
+  if (recordMode.captureSummary) {
+    return (
+      <RecordingReviewScreen
+        summary={recordMode.captureSummary}
+        onDone={recordMode.dismissCaptureSummary}
+      />
+    );
+  }
+
+  const recordButtonDisabled =
+    recordMode.phase === "starting" || recordMode.phase === "stopping";
+
   return (
     <main className="flex min-h-svh flex-col items-center justify-center gap-4 p-8">
       <h1 className="text-2xl font-semibold tracking-tight">Paradigm</h1>
@@ -124,6 +201,31 @@ function MainWindowView() {
           {windowError}
         </p>
       ) : null}
+
+      <div className="mt-4 flex w-full max-w-md flex-col items-center gap-2 rounded-md border p-4">
+        <p className="text-sm font-medium">Record Mode</p>
+        <Button
+          variant={recordMode.phase === "recording" ? "destructive" : "default"}
+          disabled={recordButtonDisabled}
+          onClick={recordMode.toggle}
+        >
+          {RECORD_PHASE_LABEL[recordMode.phase]}
+        </Button>
+        <p className="text-muted-foreground text-center text-xs">
+          Global shortcut: Ctrl+Shift+R toggles start/stop from anywhere.
+          Accessibility permission:{" "}
+          <span className="font-medium">
+            {recordMode.hasAccessibilityPermission ? "granted" : "not granted"}
+          </span>
+        </p>
+        {recordMode.error ? (
+          <p className="text-destructive max-w-full text-center text-xs break-words">
+            {recordMode.error}
+          </p>
+        ) : null}
+      </div>
+
+      <StoredPlaybooksSection />
 
       <div className="mt-4 flex w-full max-w-md flex-col items-center gap-2 rounded-md border border-dashed p-4">
         <p className="text-muted-foreground text-center text-xs font-medium tracking-wide uppercase">
@@ -175,12 +277,17 @@ function MainWindowView() {
 
       {previewElement}
       {permissionGateElement}
+      {recordMode.permissionGateElement}
     </main>
   );
 }
 
 function App() {
   const windowLabel = useWindowLabel();
+
+  if (isRecordingBadgeWindow(windowLabel)) {
+    return <RecordingBadgeView />;
+  }
 
   if (isProofWindow(windowLabel)) {
     return <ProofWindowView />;

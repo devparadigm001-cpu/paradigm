@@ -8,9 +8,22 @@ pub mod replay;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 use capture::{CaptureSession, CapturedAction};
+
+/// Emitted (to every window) when the Record Mode global shortcut fires.
+/// The frontend's `useRecordMode` hook listens for this and runs the exact
+/// same start/stop flow the main window's button does -- there is no
+/// separate "shortcut path" through the backend.
+pub const RECORD_MODE_TOGGLE_SHORTCUT_EVENT: &str = "record-mode:toggle-shortcut";
+
+/// The one global shortcut Phase 1 wires up. A reasonable default, not a
+/// locked binding -- customization is an explicit later-pass item.
+fn record_mode_toggle_shortcut() -> Shortcut {
+    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyR)
+}
 
 /// Everything the commands need, managed once at startup.
 ///
@@ -89,7 +102,32 @@ fn model_path() -> PathBuf {
 pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if event.state() == ShortcutState::Pressed
+                        && shortcut == &record_mode_toggle_shortcut()
+                    {
+                        if let Err(e) = app.emit(RECORD_MODE_TOGGLE_SHORTCUT_EVENT, ()) {
+                            eprintln!(
+                                "[paradigm] failed to emit {RECORD_MODE_TOGGLE_SHORTCUT_EVENT}: {e}"
+                            );
+                        }
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
+            // Best-effort: a failure here (e.g. another app already holds this
+            // combination) should not stop Paradigm from starting -- the main
+            // window's Start/Stop button still works either way.
+            if let Err(e) = app.global_shortcut().register(record_mode_toggle_shortcut()) {
+                eprintln!(
+                    "[paradigm] could not register the Record Mode global shortcut \
+                     (Ctrl+Shift+R): {e}"
+                );
+            }
+
             let app_data_dir = data_dir(app)?;
             let (db_path, key_path) = db::paths_in(&app_data_dir);
             let conn = db::open(&db_path, &key_path)?;
