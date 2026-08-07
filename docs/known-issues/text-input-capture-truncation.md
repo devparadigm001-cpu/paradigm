@@ -9,11 +9,20 @@ measurements. Typed text is no longer taken from the recorder's
 **Found:** 2026-08-04, during Phase 1 Step 6 replay testing. Reproduced again
 the same day during Step 7's end-to-end IPC test.
 **Severity: MEDIUM.** The dangerous form of this defect — silently *wrong* text
-that every later stage trusts — is resolved: captured payloads were exact in
-40/40 measured trials, and no truncation was reproduced at any typing speed.
+that every later stage trusts — was not reproduced after the change: captured
+payloads were exact in 40/40 trials and never partial at any typing speed.
 What remains is a narrower race in which a typed action can be missed
 **entirely** (never wrong), and it still bites `tests/ipc_pipeline.rs`.
 A missing action is visible; a wrong one was not. See "Remaining limitation".
+
+**Scope of that claim.** Every measurement here used synthetic `type_text()`
+into web `<input>` elements in Microsoft Edge — the same narrow environment the
+original observations came from. Native Win32 fields, WinUI (Notepad), a second
+browser, and genuine human typing are all untested. Human typing matters most
+and is least like what was measured: it is slower, interleaved with mouse
+movement, and hits a different timing profile than any of these runs. Read
+"FIXED" as "not reproducible in the measured environment", not as "cannot
+happen".
 
 ## Summary
 
@@ -209,7 +218,9 @@ setup failures rather than scored.
 Independent element reads were correct in **every** trial of every run,
 including at 0 ms inter-keystroke delay — that is the finding the fix rests on.
 **No truncation was reproduced at any speed after the change**: captured
-payloads were either exact or absent, never partial.
+payloads were either exact or absent, never partial. That is an absence of
+evidence across 40 trials in one environment (Edge, web `<input>`, synthetic
+input), not proof that partial capture cannot occur elsewhere.
 
 Clicking through a pre-filled field without typing recorded nothing in 5/5 runs,
 so the emit condition does not fabricate actions.
