@@ -25,6 +25,7 @@
 
 pub mod exclusion;
 pub mod stream;
+pub mod text;
 
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,6 +40,7 @@ pub use exclusion::ExclusionList;
 pub use stream::{
     ActionCandidate, ActionKind, Admission, CapturedAction, CapturedStream, ExclusionRecord,
 };
+pub use text::TextFieldWatcher;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
@@ -65,6 +67,9 @@ pub struct CaptureSession {
     recorder: WorkflowRecorder,
     stream: Arc<Mutex<CapturedStream>>,
     unmapped: Arc<Mutex<usize>>,
+    /// Produces the `Type` actions. Shared with the pump so `stop_session` can
+    /// flush a field the user was still in when they stopped recording.
+    watcher: Arc<Mutex<TextFieldWatcher>>,
     pump: Option<JoinHandle<()>>,
 }
 
@@ -96,11 +101,24 @@ impl CaptureSession {
 
         let stream = Arc::new(Mutex::new(CapturedStream::new(exclusions)));
         let unmapped = Arc::new(Mutex::new(0usize));
+        let watcher = Arc::new(Mutex::new(TextFieldWatcher::new()));
 
         let pump_stream = Arc::clone(&stream);
         let pump_unmapped = Arc::clone(&unmapped);
+        let pump_watcher = Arc::clone(&watcher);
         let pump = tokio::spawn(async move {
             while let Some(event) = events.next().await {
+                // Typed text is synthesised from focus transitions rather than
+                // taken from the recorder's own TextInputCompleted -- see
+                // `capture::text` for the measurements behind that. Emitted
+                // BEFORE this event's own candidate so the typing is ordered
+                // ahead of the click that ended it.
+                if let Some(typed) = observe_text(&pump_watcher, &event) {
+                    if let Ok(mut s) = pump_stream.lock() {
+                        s.admit(typed);
+                    }
+                }
+
                 match to_candidate(&event) {
                     Some(candidate) => {
                         // The gate runs inside admit(); this task cannot bypass
@@ -128,6 +146,7 @@ impl CaptureSession {
             recorder,
             stream,
             unmapped,
+            watcher,
             pump: Some(pump),
         })
     }
@@ -144,6 +163,16 @@ impl CaptureSession {
         if let Some(pump) = self.pump.take() {
             pump.abort();
             let _ = pump.await;
+        }
+
+        // The user may have stopped recording while still inside a field, so
+        // nothing has signalled that its text is final. This is the last chance
+        // to record it. Done after the pump is stopped, so there is no second
+        // writer, and still through admit() so the gate applies.
+        if let (Ok(mut watcher), Ok(mut stream)) = (self.watcher.lock(), self.stream.lock()) {
+            if let Some(candidate) = watcher.flush(now_ms()) {
+                stream.admit(candidate);
+            }
         }
 
         let (actions, exclusions) = {
@@ -170,6 +199,47 @@ impl CaptureSession {
 
     pub fn excluded_so_far(&self) -> usize {
         self.stream.lock().map(|s| s.exclusions().len()).unwrap_or(0)
+    }
+}
+
+/// Feed one event to the text watcher, returning a `Type` candidate when the
+/// event finalises a field's contents.
+///
+/// This is where typed text comes from. `WorkflowEvent::TextInputCompleted` is
+/// deliberately not used for it -- see `capture::text` for the measurements.
+fn observe_text(
+    watcher: &Arc<Mutex<TextFieldWatcher>>,
+    event: &WorkflowEvent,
+) -> Option<ActionCandidate> {
+    let mut watcher = watcher.lock().ok()?;
+
+    match event {
+        // A click is how focus moves in practice, and it carries the element,
+        // its role, and the owning app all in one.
+        WorkflowEvent::Click(e) => {
+            let mut identifiers = Vec::new();
+            if let Some(p) = &e.process_name {
+                identifiers.push(p.clone());
+            }
+            identifiers.extend(app_identifiers(e.metadata.ui_element.as_ref()));
+            if let Some(url) = &e.page_url {
+                identifiers.push(url.clone());
+            }
+
+            watcher.focus_moved(
+                e.metadata.ui_element.as_ref(),
+                &e.element_role,
+                non_empty(&e.element_text),
+                identifiers,
+                e.metadata.timestamp.unwrap_or_else(now_ms),
+            )
+        }
+
+        WorkflowEvent::Keyboard(e) if e.is_key_down => {
+            watcher.key_pressed(e.key_code, e.metadata.timestamp.unwrap_or_else(now_ms))
+        }
+
+        _ => None,
     }
 }
 
@@ -210,26 +280,16 @@ fn to_candidate(event: &WorkflowEvent) -> Option<ActionCandidate> {
             })
         }
 
-        WorkflowEvent::TextInputCompleted(e) => {
-            let mut identifiers = Vec::new();
-            if let Some(p) = &e.process_name {
-                identifiers.push(p.clone());
-            }
-            identifiers.extend(app_identifiers(e.metadata.ui_element.as_ref()));
-
-            Some(ActionCandidate {
-                kind: ActionKind::Type,
-                identifiers,
-                element_role: Some(e.field_type.clone()),
-                element_name: e.field_name.clone(),
-                payload: Some(e.text_value.clone()),
-                detail: Some(format!(
-                    "{:?}, {} keystroke(s) over {}ms",
-                    e.input_method, e.keystroke_count, e.typing_duration_ms
-                )),
-                timestamp_ms: e.metadata.timestamp.unwrap_or_else(now_ms),
-            })
-        }
+        // Deliberately NOT mapped. This event is the recorder's own attempt at
+        // the same job `capture::text` now does, and it is not dependable
+        // enough to use: measured 1 delivery in 20 typed actions, and the two
+        // that arrived in earlier steps carried truncated text. Mapping it as
+        // well would mean two `Type` actions for the same field on the ~5% of
+        // occasions it does fire, so it is dropped rather than deduplicated.
+        //
+        // It still counts as an unmapped event, which keeps its arrival rate
+        // visible in `CaptureReport::unmapped_events` instead of hiding it.
+        WorkflowEvent::TextInputCompleted(_) => None,
 
         WorkflowEvent::ApplicationSwitch(e) => {
             // Both sides are checked: switching AWAY from a bank names the bank

@@ -40,4 +40,8 @@ uuid = { version = "1.24.0", features = ["v4"] }
 tauri = { version = "2", features = ["test"] }
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["rt", "macros"] }
+# Probes only. terminator-workflow-recorder reports its text-input decisions
+# through `tracing`; without a subscriber those messages go nowhere, which is
+# why the truncation defect was opaque for so long.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
