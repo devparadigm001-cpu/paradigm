@@ -22,6 +22,11 @@ use terminator::Desktop;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// The string this test types. Shared by the driver and the assertion so the
+/// two cannot drift -- the whole point of the check is that what came out of
+/// capture equals what went in.
+const TYPED_TEXT: &str = "ipc-pipeline-test";
+
 const LOGIN_HTML: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>Paradigm IPC Pipeline Test</title></head>
 <body style="font-family:sans-serif;padding:2rem">
@@ -92,7 +97,7 @@ async fn drive(desktop: &Desktop) {
                 let _ = desktop.click_at_coordinates(x + w / 2.0, y + h / 2.0);
             }
         }
-        let _ = f.type_text("ipc-pipeline-test", false);
+        let _ = f.type_text(TYPED_TEXT, false);
         tokio::time::sleep(Duration::from_millis(700)).await;
     }
 
@@ -176,6 +181,37 @@ async fn full_pipeline_over_ipc() {
             );
         }
     }
+
+    // The typed text must survive capture intact.
+    //
+    // This assertion exists because its absence hid a real defect: the test
+    // previously checked only that SOME actions were captured, so it passed
+    // green while typing was recorded as "ip", and again later while typing was
+    // not recorded at all. A test that cannot fail on the bug it covers is
+    // worse than no test. See docs/known-issues/text-input-capture-truncation.md.
+    let actions = summary["actions"].as_array().expect("actions array");
+    let typed: Vec<&serde_json::Value> = actions
+        .iter()
+        .filter(|a| a["action_type"] == "type")
+        .collect();
+
+    assert!(
+        !typed.is_empty(),
+        "no `type` action was captured, so the typed text was lost entirely. \
+         Captured actions were: {actions:#?}"
+    );
+
+    let payloads: Vec<&str> = typed
+        .iter()
+        .filter_map(|a| a["payload_preview"].as_str())
+        .collect();
+    assert!(
+        payloads.iter().any(|p| *p == TYPED_TEXT),
+        "captured typed text does not match what was typed.\n  \
+         expected : {TYPED_TEXT:?}\n  \
+         captured : {payloads:?}\n\
+         A truncated prefix here is the capture defect, not a replay problem."
+    );
 
     // ---- 3. compile + store ------------------------------------------------
     let stored = invoke(
