@@ -1,14 +1,19 @@
 # Capture: typed text is silently truncated in recorded actions
 
-**Status:** reproduced **twice, independently**, **root cause not investigated**.
+**Status: root cause identified; value corruption FIXED; a narrower miss
+remains.** Investigated 2026-08-06 — see "Investigation" below for the
+measurements. Typed text is no longer taken from the recorder's
+`TextInputCompleted`; `src/capture/text.rs` reads the field directly.
 **Affected:** `terminator-workflow-recorder` 0.23.35, text-input event assembly.
-**Platform:** Windows. Observed in Microsoft Edge; other apps untested.
+**Platform:** Windows. Observed in Microsoft Edge; other apps still untested.
 **Found:** 2026-08-04, during Phase 1 Step 6 replay testing. Reproduced again
 the same day during Step 7's end-to-end IPC test.
-**Severity: MEDIUM, rising.** Step 7 is complete and unaffected — its wiring
-faithfully carried what capture handed it. Must be resolved before Step 12 (the
-end-to-end human test) — see "Suggested priority" below. The second
-reproduction raises confidence that this is systematic, not incidental.
+**Severity: MEDIUM.** The dangerous form of this defect — silently *wrong* text
+that every later stage trusts — is resolved: captured payloads were exact in
+40/40 measured trials, and no truncation was reproduced at any typing speed.
+What remains is a narrower race in which a typed action can be missed
+**entirely** (never wrong), and it still bites `tests/ipc_pipeline.rs`.
+A missing action is visible; a wrong one was not. See "Remaining limitation".
 
 ## Summary
 
@@ -70,12 +75,18 @@ Both retained a **leading prefix**, not a suffix or an arbitrary slice. That is
 consistent with the accumulator being read while it is still filling, rather
 than with a corrupted or bounded buffer.
 
-One hypothesis fits both data points, and is worth testing first: the
-completion event fires on a short debounce measured from the *first* keystroke,
-capturing only the keystrokes that landed inside that window. It predicts a
-variable prefix length that scales with typing speed and system load, which is
-what was seen. It is a hypothesis consistent with two samples, not an
-established cause — n=2 cannot distinguish it from several alternatives.
+One hypothesis fitted both data points and was tested first: the completion
+event fires on a short debounce measured from the *first* keystroke, capturing
+only the keystrokes that landed inside that window. It predicts a variable
+prefix length that scales with typing speed.
+
+**REFUTED, 2026-08-06.** `examples/text_capture_probe` swept the
+inter-keystroke delay across 0 / 50 / 150 / 300 ms. Kept-prefix length did not
+track the delay at any setting. The refutation is stronger than "no
+correlation": across a five-run baseline sweep the event was delivered for
+**1 of 20** typed actions, and a timer from the first keystroke cannot produce
+*no event at all*. The mechanism was also wrong — there is no accumulator to
+read early. See "Investigation".
 
 Both observations came from synthetic `type_text()` input into web `<input>`
 elements in Microsoft Edge, so neither the input method nor the field type has
@@ -129,6 +140,97 @@ handed:
 
 None of them is at fault. The value was already wrong when it arrived.
 
+## Investigation (2026-08-06)
+
+### Root cause: there is no accumulator, and keystrokes are dropped on a lock
+
+`TextInputTracker` (`recorder/windows/structs.rs:29`) stores the element, a
+start time, a keystroke *count* and some flags. **It holds no character
+buffer.** `text_value` is produced at emit time by
+`TextInputTracker::get_completion_event`:
+
+```rust
+let text_value = match self.element.text(0) { ... }
+```
+
+That is a live UI Automation read of the field. So a truncated `text_value` is
+not a partially-filled buffer — it is a read that landed while the field still
+held a prefix.
+
+Whether the event is emitted at all is gated by `keystroke_count`, and the
+keystroke path drops keystrokes silently (`recorder/windows/mod.rs:1079`):
+
+```rust
+if let Ok(mut tracker) = current_text_input.try_lock() {
+    text_input.add_keystroke(key_code);
+}
+```
+
+A failed `try_lock` discards the keystroke — no retry, no queue. The UIA thread
+holds that same mutex across slow element resolution (150 ms sleeps, 100 ms and
+200 ms `recv_timeout`s). Lose every keystroke and `keystroke_count` stays 0, so
+`should_emit_completion` refuses and **no event is produced**. Lose some and the
+count is wrong, which is exactly the `"1 keystroke(s)"` reported for a
+28-character string above. The recorder's own trace shows the lock failing:
+
+```
+❌ Could not lock text input tracker for transition
+```
+
+Corroboration: enabling the recorder's `tracing` output made the defect vanish
+(4/4 events, all exact) — added log I/O shifts the timing. A Heisenbug of that
+shape is a race, not a data-assembly bug.
+
+Also observed in the same trace: `is_text_input_element` is very permissive,
+starting trackers on a `Document` and on a `Button` named "Done".
+
+### The fix
+
+`src/capture/text.rs` follows focus across text fields and reads the field
+directly — the same `element.text(0)` call, on our own trigger, with no
+`try_lock` anywhere. `WorkflowEvent::TextInputCompleted` is no longer mapped to
+an action at all. An action is emitted when the field's value changed since we
+began watching **or** when typing keystrokes were observed into it; requiring
+only the former loses text that arrived before the focus event was processed,
+and requiring neither invents actions for fields merely clicked through.
+
+### Measurements
+
+`examples/text_capture_probe`, 20-character strings, ground truth verified by an
+independent read; trials where the text never reached the field are excluded as
+setup failures rather than scored.
+
+| Configuration | Typed actions captured | Payload exact |
+|---|---|---|
+| `TextInputCompleted` (before) | **1/20 (5%)** | 1/1 |
+| Direct read, settled typing (A–D) | **40/40 (100%)** | 40/40 |
+| Direct read, no-settle fast typing (E) | **4/10** | 4/4 |
+
+Independent element reads were correct in **every** trial of every run,
+including at 0 ms inter-keystroke delay — that is the finding the fix rests on.
+**No truncation was reproduced at any speed after the change**: captured
+payloads were either exact or absent, never partial.
+
+Clicking through a pre-filled field without typing recorded nothing in 5/5 runs,
+so the emit condition does not fabricate actions.
+
+### Remaining limitation
+
+Trial E types the whole string in one `type_text` with no pause after the click.
+`initial` is read when the *click event is processed*, and the recorder resolves
+that element through UIA first, so with fast input the text can land before we
+know which field to watch — the baseline then already contains the text and the
+keystroke counter is also still zero, because both depend on watching having
+started.
+
+`tests/ipc_pipeline.rs` is shaped exactly this way and **still captures no
+`type` action.** Real human typing is A–D shaped (a pause after clicking, then
+per-keystroke input), where capture measured 40/40.
+
+An attempt to fix this by resolving the focused element on the first keystroke
+(`Desktop::focused_element`) was **measured and reverted**: it left E at 0/5 and
+regressed A from 5/5 to 0/5. Recorded so the next attempt does not repeat it.
+
 ## Why it matters
 
 Capture is the root of the pipeline, and every later stage inherits its errors
@@ -161,20 +263,19 @@ bite that run.
 
 ## Next steps
 
-- [ ] **Reproduce reliably.** Seen twice, in 2 of the small number of typed
-      actions across this session's probes — frequent enough that it is not a
-      rare edge case, but the rate is still not quantified. Write a loop that
-      types known strings of varying length and compares captured `text_value`
-      against ground truth, recording the kept-prefix length each time.
-- [ ] **Test the debounce hypothesis first.** Both reproductions kept a leading
-      prefix of differing length, which fits "the completion event fires on a
-      timer from the first keystroke". Vary the inter-keystroke delay: if the
-      kept prefix grows as typing slows, that confirms it and points at a timing
-      fix rather than a data-assembly one.
-- [ ] **Determine whether it is timing or assembly.** The alternative is that
-      the buffer is assembled incorrectly. The `1 keystroke(s)` versus
-      `26 keystroke(s)` discrepancy for identical input is evidence worth
-      chasing, since it is reproducible in the existing probe output.
+- [x] **Reproduce reliably.** Done — `examples/text_capture_probe` quantified
+      the baseline at 1/20 and the fix at 40/40 on settled typing.
+- [x] **Test the debounce hypothesis first.** Done — refuted, see above.
+- [x] **Determine whether it is timing or assembly.** Timing: a race on a
+      `try_lock`, plus a live UIA read at emit. Not assembly — there is no
+      buffer to assemble.
+- [ ] **Close the no-settle race (trial E, 4/10).** This is the one that still
+      bites `tests/ipc_pipeline.rs`. Note that `Desktop::focused_element` on the
+      first keystroke has already been tried and made things worse.
+- [ ] **Make `ipc_pipeline` assert on captured text.** It currently checks only
+      `action_count > 0` and `step_count == action_count`, so it passed green
+      through every variant of this defect, including capturing no typing at
+      all. A test that cannot fail on the bug it covers is worse than no test.
 - [ ] **Check field-type and browser sensitivity.** Only Edge, and only web
       `<input>` elements, have been observed. Test native Win32 fields, WinUI
       fields (Notepad's editor), and a second browser.
