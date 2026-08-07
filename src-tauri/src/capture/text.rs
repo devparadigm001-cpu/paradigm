@@ -65,7 +65,19 @@ const TEXT_ROLES: &[&str] = &[
     "password",
     "searchbox",
     "combobox",
+    // Notepad's editing surface. Excluded originally because the recorder's
+    // trace was seen starting a tracker on a browser page's Document, which
+    // looked like a false positive -- but a real Step 12 session then typed two
+    // full lines into Notepad and captured ZERO type actions, because
+    // `focus_moved` refused to watch the only element there is to watch.
+    // Confirmed by probe: Notepad reports role "Document" and 76 typed
+    // characters produced no action at all.
+    "document",
 ];
+
+/// Compared case-insensitively: Terminator reports `"Document"` from
+/// `UIElement::role()` but `"document"` on a click event's `element_role`, and
+/// both must match the same entry.
 
 pub fn is_text_role(role: &str) -> bool {
     let role = role.trim().to_lowercase();
@@ -305,15 +317,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognises_editable_roles_and_rejects_the_recorders_false_positives() {
+    fn recognises_editable_roles() {
         assert!(is_text_role("Edit"));
         assert!(is_text_role("edit"));
         assert!(is_text_role("PasswordBox"));
         assert!(is_text_role("  combobox  "));
 
-        // Both of these were observed starting a tracker in the recorder's own
-        // trace, which is what made its completion events so noisy.
-        assert!(!is_text_role("Document"));
+        // Notepad's editing surface. This assertion was previously inverted --
+        // Document was excluded as a suspected false positive, and that is
+        // exactly why a real session typing into Notepad captured nothing. The
+        // role is matched case-insensitively because `UIElement::role()` gives
+        // "Document" while a click event's `element_role` gives "document".
+        assert!(is_text_role("Document"), "Notepad's editing surface");
+        assert!(is_text_role("document"), "same role, as clicks report it");
+
         assert!(!is_text_role("Button"));
         assert!(!is_text_role("Text"));
         assert!(!is_text_role(""));

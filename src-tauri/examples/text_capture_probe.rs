@@ -35,7 +35,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use paradigm_lib::capture::{ActionKind, CaptureSession, ExclusionList};
+use paradigm_lib::capture::{text, ActionKind, CaptureSession, ExclusionList};
 use terminator::{Desktop, UIElement};
 
 /// How a trial drives the field.
@@ -137,10 +137,164 @@ fn init_tracing() {
     eprintln!("[probe] tracing enabled");
 }
 
+// --------------------------------------------------------- notepad mode ----
+//
+// Lives in this binary rather than its own because a freshly-named example
+// executable is refused by this machine's Application Control policy
+// ("An Application Control policy has blocked this file", os error 4551),
+// while rebuilds of an established one run fine.
+
+const NOTEPAD_LINE_ONE: &str = "first line typed by the notepad probe";
+const NOTEPAD_LINE_TWO: &str = "second line typed by the notepad probe";
+
+/// Find Notepad's editing surface without assuming what role it reports.
+async fn find_edit_surface(desktop: &Desktop) -> Option<(UIElement, String)> {
+    for selector in ["role:Document", "role:Edit", "role:Text"] {
+        if let Ok(el) = desktop
+            .locator(selector)
+            .first(Some(Duration::from_secs(3)))
+            .await
+        {
+            let role = el.role();
+            println!("  {selector:<16} -> matched, actual role {role:?}");
+            return Some((el, role));
+        }
+        println!("  {selector:<16} -> nothing");
+    }
+    None
+}
+
+/// Reproduce the Step 12 live failure: two typed lines into Notepad produced
+/// clicks and navigates but zero `type` actions.
+///
+/// The existing web trials cannot catch this -- they target `role:Edit`
+/// `<input>` elements in a browser, and the question here is what happens when
+/// the editing surface reports some other role entirely.
+async fn notepad_mode() -> ExitCode {
+    println!("== notepad capture probe ==\n");
+    println!("Driving the Step 12 human sequence: click once, type a line,");
+    println!("press Enter, type a second line, stop.\n");
+    println!("WARNING: performs real clicks and typing. Hands off.\n");
+
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", "notepad"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 5s for Notepad...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n-- probing Notepad's editing surface --");
+    let Some((element, role)) = find_edit_surface(&desktop).await else {
+        eprintln!("could not find Notepad's editing surface");
+        return ExitCode::FAILURE;
+    };
+
+    let accepted = text::is_text_role(&role);
+    println!("\n  editing surface role     : {role:?}");
+    println!("  accepted by is_text_role : {accepted}");
+    if !accepted {
+        println!("  ^^ capture will never start watching this element");
+    }
+
+    let session = match CaptureSession::start_session(
+        "notepad-capture-probe",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    println!("\n-- driving --");
+    robust_click(&desktop, &element);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    for ch in NOTEPAD_LINE_ONE.chars() {
+        let _ = element.type_text(&ch.to_string(), false);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = element.press_key("{Enter}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for ch in NOTEPAD_LINE_TWO.chars() {
+        let _ = element.type_text(&ch.to_string(), false);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Ground truth, read independently of capture.
+    let actual = element.text(0).unwrap_or_default();
+    println!("  field now holds {} char(s)", actual.chars().count());
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n================ RESULTS ================");
+    println!(
+        "captured {} action(s), {} unmapped event(s)\n",
+        report.actions.len(),
+        report.unmapped_events
+    );
+    for a in &report.actions {
+        println!(
+            "  {:<9} role={:<12} name={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-")
+        );
+        if let Some(p) = &a.payload {
+            println!("            payload={p:?}");
+        }
+    }
+
+    let types = report
+        .actions
+        .iter()
+        .filter(|a| a.kind == ActionKind::Type)
+        .count();
+
+    println!("\n--- verdict ---");
+    println!("  editing surface role     : {role:?}");
+    println!("  accepted by is_text_role : {accepted}");
+    println!("  text really in the field : {}", !actual.trim().is_empty());
+    println!("  `type` actions captured  : {types}");
+
+    if !actual.trim().is_empty() && types == 0 {
+        println!("\n  REPRODUCED: text is in the field, capture produced no `type` action.");
+    } else if types > 0 {
+        println!("\n  captured {types} type action(s)");
+    }
+
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
+
+    if std::env::args().any(|a| a == "notepad") {
+        return notepad_mode().await;
+    }
 
     println!("== text capture probe ==\n");
     println!("Typing {} chars per trial, one field each.", TAIL.len() + 1);
