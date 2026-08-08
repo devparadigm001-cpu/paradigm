@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { invoke } from "@tauri-apps/api/core";
+import { useDeletePlaybookConfirmation } from "@/components/delete-playbook";
 import { Button } from "@/components/ui/button";
 import {
   MOCK_PLAYBOOK_IRREVERSIBLE,
@@ -64,10 +65,36 @@ function StoredPlaybooksSection({
   onReplay,
   replayBusyPlaybookId,
 }: StoredPlaybooksSectionProps) {
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deletingPlaybookId, setDeletingPlaybookId] = useState<string | null>(
+    null,
+  );
   const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     queryKey: ["playbooks"],
     queryFn: () => invoke<PlaybookSummaryView[]>("list_playbooks"),
   });
+  const { requestDeleteConfirmation, deleteDialogElement } =
+    useDeletePlaybookConfirmation({
+      onConfirmError: (deleteErr, playbook) => {
+        setDeleteError(
+          `Delete "${playbook.name}" failed: ${describeError(deleteErr)}`,
+        );
+        setDeletingPlaybookId(null);
+      },
+    });
+
+  const actionsBusy =
+    replayBusyPlaybookId !== null || deletingPlaybookId !== null;
+
+  function handleDelete(playbook: PlaybookSummaryView) {
+    setDeleteError(null);
+    requestDeleteConfirmation(playbook, async () => {
+      setDeletingPlaybookId(playbook.id);
+      await invoke("delete_playbook", { playbookId: playbook.id });
+      await refetch();
+      setDeletingPlaybookId(null);
+    });
+  }
 
   return (
     <div className="mt-4 flex w-full max-w-md flex-col gap-2 rounded-md border p-4">
@@ -82,6 +109,9 @@ function StoredPlaybooksSection({
           {isFetching ? "Refreshing..." : "Refresh"}
         </Button>
       </div>
+      {deleteError ? (
+        <p className="text-destructive text-sm">{deleteError}</p>
+      ) : null}
       {isLoading ? (
         <p className="text-muted-foreground text-sm">Loading...</p>
       ) : isError ? (
@@ -107,18 +137,29 @@ function StoredPlaybooksSection({
                     : ""}
                 </p>
               </div>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={replayBusyPlaybookId !== null}
-                onClick={() => onReplay(playbook)}
-              >
-                Replay
-              </Button>
+              <div className="flex shrink-0 gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={actionsBusy}
+                  onClick={() => onReplay(playbook)}
+                >
+                  Replay
+                </Button>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={actionsBusy}
+                  onClick={() => handleDelete(playbook)}
+                >
+                  {deletingPlaybookId === playbook.id ? "Deleting..." : "Delete"}
+                </Button>
+              </div>
             </li>
           ))}
         </ul>
       )}
+      {deleteDialogElement}
     </div>
   );
 }
