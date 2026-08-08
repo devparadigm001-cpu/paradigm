@@ -9,6 +9,11 @@
 //! race the fast tests in `ipc_commands.rs`.
 //!
 //! WARNING: this test performs real clicks and typing.
+//!
+//! WARNING: this test currently FAILS most runs, on purpose. See the doc
+//! comment on `full_pipeline_over_ipc` before treating either outcome as
+//! meaningful — in particular, a pass does not mean the underlying capture
+//! defect is fixed.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -111,6 +116,35 @@ async fn drive(desktop: &Desktop) {
     }
 }
 
+/// # THIS TEST IS EXPECTED TO FAIL, MOST BUT NOT ALL OF THE TIME
+///
+/// It fails roughly 6 runs in 10 and passes the other 4. That is not test
+/// flakiness to be stabilised — it is the product's own behaviour being
+/// reported accurately, and the pass/fail split is the finding.
+///
+/// **A passing run does NOT mean the defect is fixed.** It means this run won
+/// the race. Before concluding anything from a green result here, read
+/// `docs/known-issues/text-input-capture-truncation.md`.
+///
+/// ## Why it flips
+///
+/// The typed-text assertion below is real: it checks that what capture recorded
+/// equals what was typed. This test drives the field the hardest possible way —
+/// the whole string in a single `type_text` with no pause after the click —
+/// which is exactly the "no-settle" shape measured at roughly 4 captures in 10.
+/// Capture reads the field's baseline when it processes the click event, and
+/// with input that fast the text can land before that happens, leaving nothing
+/// that looks like a change and no keystrokes counted. Real human typing is the
+/// settled shape, measured at 40/40.
+///
+/// ## Why it is left this way
+///
+/// Deliberately not stabilised, not retried until success, and not `#[ignore]`d.
+/// This assertion was added *because* its absence hid the defect: the test
+/// passed green while typing was captured as `"ip"`, and passed again later
+/// while typing was not captured at all. Retrying until one attempt succeeds
+/// would report "capture works" rather than "capture works sometimes", which is
+/// the less accurate of the two statements.
 #[tokio::test]
 async fn full_pipeline_over_ipc() {
     paradigm_lib::replay::ensure_dpi_aware();
