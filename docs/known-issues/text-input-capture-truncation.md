@@ -242,6 +242,104 @@ An attempt to fix this by resolving the focused element on the first keystroke
 (`Desktop::focused_element`) was **measured and reverted**: it left E at 0/5 and
 regressed A from 5/5 to 0/5. Recorded so the next attempt does not repeat it.
 
+### Investigating that reverted attempt (2026-08-08)
+
+A second session went back to ask *why* it regressed the settled case, which was
+never established at the time. The answer is still not known — but the space has
+been narrowed considerably, and one previously-recorded explanation turned out
+not to survive testing.
+
+**The code was never committed.** `git log -S "begin_from_keystroke"` returns
+nothing on any branch; it existed only in a working tree and was reverted before
+the surrounding commit. This investigation had to reconstruct it from a commit
+message. A failed attempt is worth committing to a scratch branch — the source
+would have made this much cheaper.
+
+#### Correction: the "focus resolved to the browser's address bar" finding does not replicate
+
+An earlier single-sample observation held that `focused_element()` on the first
+keystroke resolved to the browser's own address bar rather than the target
+field, and that this explained both halves of the failure. **Controlled testing
+refutes it.**
+
+`examples/text_capture_probe -- pumpcost` now drives two phases and records what
+focus resolved to on *every* keystroke:
+
+| Phase | Shape | First keystroke resolved to | Distinct targets across phase |
+|---|---|---|---|
+| 1 | settled (click, 400 ms, then type) | `role="Edit" name="FieldA"` | only `FieldA` |
+| 2 | no settle (click, type immediately) | `role="Edit" name="FieldB"` | only `FieldB` |
+
+**40 of 40 keystrokes resolved to the correct target field**, in both phases, at
+4–7 ms per call (max 21 ms). Never an address bar, never a stale element. The
+no-settle phase — the one where OS focus plausibly would not have settled —
+resolved just as cleanly as the settled one.
+
+Two explanations fit the earlier observation and this evidence cannot separate
+them: it may have been an artifact of a data-loss bug in the diagnostic itself
+(the probe called `pump.abort()` before `await`, so an aborted `JoinHandle`
+returned `Cancelled` and silently discarded everything collected — fixed this
+session), or a genuine one-off anomaly. Either way it is **not a reproducible
+mechanism** and should not be treated as the root cause.
+
+#### Correction: querying focus state on keystroke is NOT ruled out
+
+An earlier instruction, recorded here so the correction is explicit, was that
+this investigation should conclude that "query live focus state on keystroke" is
+a dead direction. **The evidence points the other way and that conclusion is
+withdrawn.** Focus resolution on keystroke is correct 40/40 and costs 4–7 ms,
+which is mechanically sound and fast enough to sit in the event path. Whatever
+broke the reverted fix, it was not this.
+
+Closing off a direction the measurements support would have been the more
+expensive mistake, so the direction stays open.
+
+#### What is ruled out, and what is not
+
+Ruled out, each by measurement rather than argument:
+
+* **Unreliable focus resolution** — 40/40 correct, both shapes (above).
+* **A different element handle causing a spurious flush.** The handle from
+  `focused_element()` and the one on the recorder's Click event are the same:
+  identical `id` (`Some("391359")`), `role`, and `name`, and both read text
+  identically. `same_element()` returns `true`, so the later click would *not*
+  have been mistaken for a move to another field.
+* **COM apartment / cross-thread issues.** `Desktop::new_default()` succeeds
+  inside the spawned pump task, and `focused_element()` returns correct results
+  from it.
+* **Broadcast-channel lag dropping events.** Zero `LAGGED` lines with a
+  subscriber installed; 96 events against a channel capacity of 1000. (The
+  channel *does* drop silently on lag — `Lagged(skipped) => continue`, reported
+  through `tracing`, which goes nowhere without a subscriber — so this was worth
+  checking rather than assuming.)
+* **The call being slow enough to starve the pump.** Mean 7.1 ms, max 21.4 ms,
+  283 ms total across 40 calls.
+
+**Still unknown: why the settled case regressed from 5/5 to 0/5 while that fix
+was active.** Every component tests sound in isolation, yet the composition
+measurably failed across five consecutive runs — too consistent to be noise. No
+supported mechanism has been found.
+
+#### A new risk for anyone revisiting this
+
+Before any click, `focused_element()` resolves to `role="Document"`. When the
+reverted fix was written, `is_text_role("Document")` was **false**. It is now
+**true**, added so Notepad's editing surface would be recognised. So a stray
+keystroke before any click would now start watching the *page document*, and a
+subsequent click would flush it — emitting the entire page text as a `type`
+action.
+
+Re-attempting this approach today is therefore **more dangerous than when it was
+tried**, and any new attempt must gate on something narrower than
+`is_text_role` alone.
+
+#### The next experiment, if this is picked up again
+
+Reconstruct the reverted fix *with instrumentation* — logging when watching
+starts, via which route, and what each flush observes — and watch it fail. That
+is the only remaining way to see the composition break, since none of its parts
+break alone. It is a session's work and should not be rushed into a fix.
+
 ## Why it matters
 
 Capture is the root of the pipeline, and every later stage inherits its errors
