@@ -101,6 +101,27 @@ const PAGE: &str = r#"<!doctype html>
 </body></html>
 "#;
 
+/// Which browser to open the probe page in.
+///
+/// Selectable so tab load can be varied deliberately. Trial E's success rate is
+/// suspected to depend on how quickly the recorder's click event is processed,
+/// which a large UI Automation tree slows down -- and a browser carrying ~90
+/// tabs against one carrying a handful is the cleanest way to test that without
+/// closing anyone's windows.
+///
+///     ... -- chrome     force Chrome
+///     ... -- edge       force Edge
+///     (default)         first that launches
+fn browser_order() -> Vec<&'static str> {
+    if std::env::args().any(|a| a == "chrome") {
+        vec!["chrome"]
+    } else if std::env::args().any(|a| a == "edge") {
+        vec!["msedge"]
+    } else {
+        vec!["msedge", "chrome", "firefox"]
+    }
+}
+
 /// Click that survives the multi-monitor visibility defect.
 /// See docs/known-issues/terminator-multi-monitor-visibility.md.
 fn robust_click(desktop: &Desktop, el: &UIElement) {
@@ -454,7 +475,7 @@ async fn handles_mode() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
-    for browser in ["msedge", "chrome", "firefox"] {
+    for browser in browser_order() {
         if let Ok(mut c) = std::process::Command::new("cmd")
             .args(["/C", "start", "", browser, &url])
             .spawn()
@@ -623,7 +644,7 @@ async fn pumpcost_mode() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
-    for browser in ["msedge", "chrome", "firefox"] {
+    for browser in browser_order() {
         if let Ok(mut c) = std::process::Command::new("cmd")
             .args(["/C", "start", "", browser, &url])
             .spawn()
@@ -886,7 +907,7 @@ async fn multiline_mode() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
-    for browser in ["msedge", "chrome", "firefox"] {
+    for browser in browser_order() {
         if let Ok(mut c) = std::process::Command::new("cmd")
             .args(["/C", "start", "", browser, &url])
             .spawn()
@@ -1061,7 +1082,7 @@ async fn windowswitch_mode() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
-    for browser in ["msedge", "chrome", "firefox"] {
+    for browser in browser_order() {
         if let Ok(mut c) = std::process::Command::new("cmd")
             .args(["/C", "start", "", browser, &url])
             .spawn()
@@ -1230,7 +1251,7 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
-    for browser in ["msedge", "chrome", "firefox"] {
+    for browser in browser_order() {
         if let Ok(mut c) = std::process::Command::new("cmd")
             .args(["/C", "start", "", browser, &url])
             .spawn()

@@ -119,15 +119,44 @@ fix in the same area cannot affect E either: every code path for E's shape emits
 the whole value, because the delta branch requires a `baseline_trusted` baseline
 that only a post-flush re-watch sets, and E never gets one.
 
-The most likely explanation is environmental and is offered as a lead rather
-than a finding: the probe opens a browser tab per run, and roughly 25 runs
-during this session grew the browser from about 67 tabs to 92. E is the only
-trial with no settle, so its margin is set by how quickly the click event is
-processed, and a larger UIA tree makes that slower. That is correlational, not
-established — a clean browser would test it in one run.
+#### The tab-count hypothesis was tested and is REFUTED
 
-The practical point: **the 4/10 figure is environment-sensitive** and should not
-be treated as a fixed property of the defect.
+This section originally proposed, as a correlational lead, that a browser
+growing from ~67 to 92 tabs across the session slowed click-event processing
+enough to push E outside its working window. **That was tested directly and is
+wrong.**
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Tab count | run in Chrome carrying **1 tab** | E **0/4** — same as Edge at 92 |
+| Any code change since the baseline | `git checkout df42f48` (the exact tree the 4/10 was measured on) and re-run | E **0/5** |
+| Windows update / reboot between measurements | `LastBootUpTime` | **2026-08-05 18:45** — both measurements fall in one boot session |
+| System load | CPU during the runs | ~10%, not loaded |
+
+The historical checkout is the decisive one: **the identical code that measured
+4/10 now measures 0/5.** No code change is responsible, and neither is tab load.
+
+Across every condition tonight E scored **1/21**.
+
+#### The most likely explanation now: the original 4/10 was a small sample
+
+The 4/10 baseline was two batches of five — **1/5 and then 3/5**. That is a wide
+spread for n=10, and it cannot distinguish a true rate of 40% from one nearer
+10–15% measured generously. A true rate of ~10% would make 1/21 unremarkable and
+4/10 the outlier.
+
+The remaining untested candidate is accumulated machine state within the single
+boot session — three days of uptime, 48 Edge processes, 13 Chrome, several
+orphaned Notepad instances, and several hundred UIA-heavy probe runs. Testing
+that needs a reboot, which was not done.
+
+**The practical point stands and is now well supported: 4/10 is not a reliable
+property of the defect and should not be used as a regression threshold.** Any
+future work on the no-settle race should re-establish a baseline with a much
+larger sample before treating a change in E's rate as signal.
+
+`examples/text_capture_probe` now takes `chrome` or `edge` to force a browser,
+which is what made the tab test possible and is kept for re-running it.
 
 ## Why it matters
 

@@ -213,7 +213,14 @@ setup failures rather than scored.
 |---|---|---|
 | `TextInputCompleted` (before) | **1/20 (5%)** | 1/1 |
 | Direct read, settled typing (A–D) | **40/40 (100%)** | 40/40 |
-| Direct read, no-settle fast typing (E) | **4/10** | 4/4 |
+| Direct read, no-settle fast typing (E) | **4/10** † | 4/4 |
+
+† **Do not treat 4/10 as this defect's rate.** It was two batches of five (1/5,
+then 3/5), and re-measurement on 2026-08-08 put E at **1/21** — including
+**0/5 on the identical code**, checked out at the commit the 4/10 was taken on.
+Tab load, code changes, a reboot, and system load were each tested and ruled
+out; the likeliest explanation is that n=10 was simply too small. See "A note on
+trial E" in `type-action-misattributed-after-window-switch.md` for the controls.
 
 Independent element reads were correct in **every** trial of every run,
 including at 0 ms inter-keystroke delay — that is the finding the fix rests on.
@@ -378,7 +385,11 @@ bite that run.
 - [x] **Determine whether it is timing or assembly.** Timing: a race on a
       `try_lock`, plus a live UIA read at emit. Not assembly — there is no
       buffer to assemble.
-- [ ] **Close the no-settle race (trial E, 4/10).** This is the one that still
+- [ ] **Re-establish E's baseline before anything else.** 4/10 does not
+      replicate (1/21 on 2026-08-08, including 0/5 on the identical code), so
+      there is currently no trustworthy figure to measure a fix against. Use a
+      much larger sample than n=10.
+- [ ] **Close the no-settle race (trial E).** This is the one that still
       bites `tests/ipc_pipeline.rs`. Note that `Desktop::focused_element` on the
       first keystroke has already been tried and made things worse.
 - [ ] **Make `ipc_pipeline` assert on captured text.** It currently checks only
