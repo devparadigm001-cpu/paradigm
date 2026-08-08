@@ -239,6 +239,27 @@ fn observe_text(
             watcher.key_pressed(e.key_code, e.metadata.timestamp.unwrap_or_else(now_ms))
         }
 
+        // Switching applications means focus has left whatever was being
+        // watched, even though nothing in the old window announced it -- the
+        // user typed and went straight to another app, with no Enter and no
+        // click elsewhere.
+        //
+        // Without this the watch survives the switch and is flushed later by
+        // some unrelated event, producing a `type` action that carries the OLD
+        // window's element but is ordered AFTER the navigate. Replay then
+        // switches windows and types into the previous one. Observed in Step 12
+        // (session record-403c9787: three lines typed into Notepad, then a
+        // switch to Google Docs, and the typing replayed back into Notepad
+        // while the run reported 7/7 succeeded) and reproduced deterministically
+        // by `examples/text_capture_probe -- windowswitch`.
+        //
+        // The pump admits this candidate before the event's own, so flushing
+        // here also puts the typing ahead of the navigate, which is the order it
+        // actually happened in.
+        WorkflowEvent::ApplicationSwitch(e) => {
+            watcher.flush(e.metadata.timestamp.unwrap_or_else(now_ms))
+        }
+
         _ => None,
     }
 }

@@ -1029,11 +1029,175 @@ async fn multiline_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ---------------------------------------------------- windowswitch mode ----
+//
+// Reproduces a Step 12 failure: a type action attributed to the WRONG window.
+//
+// Session record-403c9787 typed three lines into Notepad, then switched to
+// Google Docs before the field flushed. The type action was captured with
+// Notepad's selector (role:document|name:"Text editor") while appearing AFTER
+// the navigate-to-Google-Docs step. Replay reported 7/7 succeeded and typed the
+// payload back into Notepad.
+//
+// The shape being tested: type into a field, then switch applications WITHOUT
+// flushing first -- no Enter, no click elsewhere in the original window. If the
+// watch survives the switch, its eventual flush carries the old window's
+// element and lands after the navigate.
+//
+// Calculator is the second window: it has no text fields, so nothing can be
+// typed into it by accident.
+
+async fn windowswitch_mode() -> ExitCode {
+    const TYPED: &str = "switchtest0123456789";
+
+    println!("== window-switch attribution probe ==\n");
+    println!("Types into a browser field, then switches apps WITHOUT flushing");
+    println!("first -- no Enter, no click away.\n");
+    println!("WARNING: performs real clicks and typing. Hands off.\n");
+
+    let page = std::env::temp_dir().join("paradigm-text-capture-probe.html");
+    if let Err(e) = std::fs::write(&page, PAGE) {
+        eprintln!("could not write probe page: {e}");
+        return ExitCode::FAILURE;
+    }
+    let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+    for browser in ["msedge", "chrome", "firefox"] {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, &url])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("waiting 10s for the browser...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let field = match desktop
+        .locator("role:Edit|name:FieldA")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not find FieldA: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let session = match CaptureSession::start_session(
+        "windowswitch-probe",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    println!("-- typing into FieldA (browser) --");
+    robust_click(&desktop, &field);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    for ch in TYPED.chars() {
+        let _ = field.type_text(&ch.to_string(), false);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Straight to the switch. No Enter, no click elsewhere in the browser --
+    // nothing that would flush the field first.
+    println!("-- switching to Calculator WITHOUT flushing first --");
+    if let Err(e) = std::process::Command::new("calc.exe").spawn() {
+        eprintln!("could not launch Calculator: {e}");
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n================ RESULTS ================");
+    println!("captured {} action(s), in order:\n", report.actions.len());
+    for (i, a) in report.actions.iter().enumerate() {
+        println!(
+            "  [{i}] {:<9} role={:<10} name={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-")
+        );
+        println!("      source_app={:?}", a.source_app);
+        if let Some(p) = &a.payload {
+            println!("      payload={p:?}");
+        }
+    }
+
+    // Where does the typing sit relative to the app switch?
+    let type_idx = report
+        .actions
+        .iter()
+        .position(|a| a.kind == ActionKind::Type);
+    // The switch we caused, not the browser's own initial navigate.
+    let nav_idx = report.actions.iter().position(|a| {
+        a.kind == ActionKind::Navigate
+            && a.element_name
+                .as_deref()
+                .map(|n| n.contains("Calculator"))
+                .unwrap_or(false)
+    });
+
+    println!("\n--- verdict ---");
+    println!("  type action index         : {type_idx:?}");
+    println!("  switch-to-Calculator index: {nav_idx:?}");
+
+    match (type_idx, nav_idx) {
+        (None, _) => println!("\n  INCONCLUSIVE: no type action captured at all."),
+        (Some(t), Some(n)) if t > n => {
+            let a = &report.actions[t];
+            println!(
+                "\n  REPRODUCED: the typing was recorded AFTER the app switch,\n  \
+                 but carries the ORIGINAL window's target (role={:?} name={:?},\n  \
+                 source_app={:?}).\n  \
+                 Replayed in this order it types into the wrong window.",
+                a.element_role.as_deref().unwrap_or("-"),
+                a.element_name.as_deref().unwrap_or("-"),
+                a.source_app
+            );
+        }
+        (Some(t), Some(n)) => println!(
+            "\n  CORRECT: typing (index {t}) is ordered before the app switch (index {n})."
+        ),
+        (Some(_), None) => {
+            println!("\n  INCONCLUSIVE: no navigate action -- the app switch was not captured.")
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "windowswitch") {
+        return windowswitch_mode().await;
+    }
     if std::env::args().any(|a| a == "multiline") {
         return multiline_mode().await;
     }
