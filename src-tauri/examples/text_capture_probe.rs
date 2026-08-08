@@ -287,6 +287,426 @@ async fn notepad_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// --------------------------------------------------------- handles mode ----
+//
+// Answers the question left open when `begin_from_keystroke` was reverted:
+// is the element from `Desktop::focused_element()` the same handle, as far as
+// our code can tell, as the one the recorder attaches to a Click event?
+//
+// It matters because `TextFieldWatcher::focus_moved` compares them:
+//
+//     if same_element(new, &current.element) { return None; }   // keep going
+//     let leaving = self.flush(timestamp_ms);                   // else FLUSH
+//
+// If a watch started from `focused_element()` and the later Click event
+// carries a handle that does not compare equal, the click looks like a move to
+// a different field. The watcher flushes and re-baselines against text that has
+// already been typed, so the final flush sees no change and emits nothing --
+// which would explain the settled case regressing from 5/5 to 0/5.
+
+/// `same_element`'s logic, duplicated because it is private to `capture::text`.
+/// Kept identical on purpose; if that function changes this must too.
+fn would_compare_equal(a: &UIElement, b: &UIElement) -> bool {
+    match (a.id(), b.id()) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.role() == b.role() && a.name() == b.name(),
+    }
+}
+
+fn describe(label: &str, el: &UIElement) {
+    println!("  {label}:");
+    println!("    id   = {:?}", el.id());
+    println!("    role = {:?}", el.role());
+    println!("    name = {:?}", el.name());
+    match el.text(0) {
+        Ok(t) => println!("    text = {:?} ({} chars)", t, t.chars().count()),
+        Err(e) => println!("    text = <read failed: {e}>"),
+    }
+}
+
+async fn handles_mode() -> ExitCode {
+    use futures::StreamExt;
+    use terminator_workflow_recorder::{
+        WorkflowEvent, WorkflowRecorder, WorkflowRecorderConfig,
+    };
+
+    println!("== handle comparison probe ==\n");
+    println!("Compares the element the recorder attaches to a Click event against");
+    println!("the one Desktop::focused_element() returns for the same field.\n");
+    println!("WARNING: performs a real click. Hands off.\n");
+
+    let page = std::env::temp_dir().join("paradigm-text-capture-probe.html");
+    if let Err(e) = std::fs::write(&page, PAGE) {
+        eprintln!("could not write probe page: {e}");
+        return ExitCode::FAILURE;
+    }
+    let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+    for browser in ["msedge", "chrome", "firefox"] {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, &url])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("waiting 10s for the browser...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let field = match desktop
+        .locator("role:Edit|name:FieldA")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not find FieldA: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Subscribe before start(): the channel is a broadcast, so a later
+    // subscription would miss everything in between.
+    let config = WorkflowRecorderConfig {
+        record_mouse: true,
+        record_keyboard: true,
+        capture_ui_elements: true,
+        ..Default::default()
+    };
+    let mut recorder = WorkflowRecorder::new("handle-probe".to_string(), config);
+    let mut events = Box::pin(recorder.event_stream());
+    if let Err(e) = recorder.start().await {
+        eprintln!("could not start recorder: {e}");
+        return ExitCode::FAILURE;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    println!("-- clicking FieldA --");
+    robust_click(&desktop, &field);
+
+    // Resolve focus immediately, the way `begin_from_keystroke` did.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let focused = desktop.focused_element().ok();
+
+    // Then wait for the recorder's Click event for the same click.
+    let mut click_element = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), events.next()).await {
+            Ok(Some(WorkflowEvent::Click(e))) => {
+                if let Some(el) = e.metadata.ui_element.clone() {
+                    println!(
+                        "  got Click event: role={:?} text={:?}",
+                        e.element_role, e.element_text
+                    );
+                    click_element = Some(el);
+                    break;
+                }
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    let _ = recorder.stop().await;
+
+    println!("\n================ RESULTS ================\n");
+
+    let Some(click_el) = click_element else {
+        println!("  no Click event carrying an element arrived -- inconclusive");
+        return ExitCode::FAILURE;
+    };
+    let Some(focused_el) = focused else {
+        println!("  focused_element() returned nothing -- inconclusive");
+        return ExitCode::FAILURE;
+    };
+
+    describe("from the recorder's Click event", &click_el);
+    println!();
+    describe("from Desktop::focused_element()", &focused_el);
+
+    let equal = would_compare_equal(&click_el, &focused_el);
+    println!("\n--- verdict ---");
+    println!("  same_element() would consider them equal : {equal}");
+    if equal {
+        println!("\n  H1 REFUTED: the handles compare equal, so a watch started from");
+        println!("  focused_element() would NOT be spuriously flushed by the later click.");
+    } else {
+        println!("\n  H1 SUPPORTED: the handles do NOT compare equal. A watch started");
+        println!("  from focused_element() would be flushed and re-baselined when the");
+        println!("  click event arrived -- destroying the capture.");
+    }
+
+    ExitCode::SUCCESS
+}
+
+// -------------------------------------------------------- pumpcost mode ----
+//
+// Measures what the reverted fix actually cost. `begin_from_keystroke` called
+// `Desktop::focused_element()` from inside the event pump, holding the watcher
+// lock, on every typing keystroke while nothing was being watched. This
+// reproduces that shape and times each call.
+//
+// If the calls are slow, the pump falls behind the recorder's broadcast
+// channel. That channel drops events silently on lag --
+// `Lagged(skipped) => continue`, reported through `tracing`, which goes nowhere
+// unless a subscriber is installed. Run with PARADIGM_PROBE_TRACE=1 to see the
+// "Event stream LAGGED!" line if it happens.
+
+async fn pumpcost_mode() -> ExitCode {
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+    use terminator_workflow_recorder::{
+        WorkflowEvent, WorkflowRecorder, WorkflowRecorderConfig,
+    };
+
+    println!("== pump cost probe ==\n");
+    println!("Times Desktop::focused_element() called from inside the event pump,");
+    println!("the way the reverted begin_from_keystroke fix did.\n");
+    println!("WARNING: performs real clicks and typing. Hands off.\n");
+
+    let page = std::env::temp_dir().join("paradigm-text-capture-probe.html");
+    if let Err(e) = std::fs::write(&page, PAGE) {
+        eprintln!("could not write probe page: {e}");
+        return ExitCode::FAILURE;
+    }
+    let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+    for browser in ["msedge", "chrome", "firefox"] {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, &url])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("waiting 10s for the browser...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let field = match desktop
+        .locator("role:Edit|name:FieldA")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not find FieldA: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A baseline, measured from the main task with the pump idle.
+    let t0 = std::time::Instant::now();
+    let _ = desktop.focused_element();
+    println!("baseline focused_element() from an idle task: {:?}\n", t0.elapsed());
+
+    let config = WorkflowRecorderConfig {
+        record_mouse: true,
+        record_keyboard: true,
+        capture_ui_elements: true,
+        ..Default::default()
+    };
+    let mut recorder = WorkflowRecorder::new("pumpcost-probe".to_string(), config);
+    let mut events = Box::pin(recorder.event_stream());
+    if let Err(e) = recorder.start().await {
+        eprintln!("could not start recorder: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let events_seen = StdArc::new(AtomicUsize::new(0));
+    let keys_seen = StdArc::new(AtomicUsize::new(0));
+    let pump_events = StdArc::clone(&events_seen);
+    let pump_keys = StdArc::clone(&keys_seen);
+
+    // Collected through a shared handle rather than the task's return value:
+    // the task is aborted to stop it, and an aborted JoinHandle yields
+    // Cancelled, silently discarding everything it had gathered.
+    // (latency, resolved role, resolved name) per keystroke, so we can see
+    // WHAT focus resolved to and not merely how long it took.
+    type Resolution = (Duration, String, Option<String>);
+    let timings_shared: StdArc<std::sync::Mutex<Vec<Resolution>>> =
+        StdArc::new(std::sync::Mutex::new(Vec::new()));
+    let pump_timings = StdArc::clone(&timings_shared);
+
+    // The pump, shaped like ours: serial, and doing the UIA call inline.
+    // Passed in from the caller's thread, exactly as the reverted fix did --
+    // it built the Desktop in start_session and moved it into the pump.
+    let shared_desktop = StdArc::new(match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("could not build the shared Desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    });
+    let pump_shared = StdArc::clone(&shared_desktop);
+
+    let pump = tokio::spawn(async move {
+        // Two candidates: one built HERE (inside the task) and one built on the
+        // caller's thread and moved in. If UIA is apartment-bound, these behave
+        // differently, and the reverted fix used the second.
+        let inner = match Desktop::new_default() {
+            Ok(d) => {
+                println!("  [pump] Desktop::new_default() inside the task: OK");
+                Some(d)
+            }
+            Err(e) => {
+                println!("  [pump] Desktop::new_default() inside the task FAILED: {e}");
+                None
+            }
+        };
+
+        let probe_target = inner.as_ref().unwrap_or(&pump_shared);
+        match probe_target.focused_element() {
+            Ok(el) => println!(
+                "  [pump] focused_element() works from the pump: role={:?}",
+                el.role()
+            ),
+            Err(e) => println!("  [pump] focused_element() FAILED from the pump: {e}"),
+        }
+
+        let mut timings: Vec<Duration> = Vec::new();
+
+        while let Some(event) = events.next().await {
+            pump_events.fetch_add(1, Ordering::Relaxed);
+
+            if let WorkflowEvent::Keyboard(e) = &event {
+                if e.is_key_down && paradigm_lib::capture::text::is_typing_key(e.key_code) {
+                    pump_keys.fetch_add(1, Ordering::Relaxed);
+                    let d = inner.as_ref().unwrap_or(&pump_shared);
+                    let t = std::time::Instant::now();
+                    let got = d.focused_element();
+                    let elapsed = t.elapsed();
+                    timings.push(elapsed);
+
+                    // Record what focus actually resolved to. This is the
+                    // question: does it name the field being typed into, or
+                    // something else (an address bar, the document, a stale
+                    // element) because OS focus has not settled?
+                    let (role, name) = match &got {
+                        Ok(el) => (el.role(), el.name()),
+                        Err(e) => (format!("<err: {e}>"), None),
+                    };
+                    if let Ok(mut shared) = pump_timings.lock() {
+                        shared.push((elapsed, role, name));
+                    }
+                }
+            }
+        }
+        timings
+    });
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // PHASE 1 -- settled: click, wait 400ms, then type. Trial A's shape, the
+    // case that regressed 5/5 -> 0/5 and is supposed to work.
+    println!("-- PHASE 1 (settled): click FieldA, wait 400ms, then type --");
+    robust_click(&desktop, &field);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let typed = trial_text('A');
+    let type_start = std::time::Instant::now();
+    for ch in typed.chars() {
+        let _ = field.type_text(&ch.to_string(), false);
+    }
+    println!("   typing took {:?} of wall clock", type_start.elapsed());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let phase1_len = timings_shared.lock().map(|t| t.len()).unwrap_or(0);
+
+    // PHASE 2 -- no settle: click and type immediately, the trial E / ipc_pipeline
+    // shape. This is where OS focus may genuinely not have settled, and the
+    // case never previously measured.
+    println!("\n-- PHASE 2 (no settle): click FieldB and type IMMEDIATELY --");
+    if let Ok(field_b) = desktop
+        .locator("role:Edit|name:FieldB")
+        .first(Some(Duration::from_secs(10)))
+        .await
+    {
+        robust_click(&desktop, &field_b);
+        let _ = field_b.type_text(&trial_text('B'), false);
+    } else {
+        println!("   could not find FieldB -- phase 2 skipped");
+    }
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let _ = recorder.stop().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    pump.abort();
+    let _ = pump.await;
+    let resolutions: Vec<Resolution> =
+        timings_shared.lock().map(|t| t.clone()).unwrap_or_default();
+    let timings: Vec<Duration> = resolutions.iter().map(|(d, _, _)| *d).collect();
+
+    println!("\n================ RESULTS ================\n");
+    println!("  events reaching the pump : {}", events_seen.load(Ordering::Relaxed));
+    println!("  typing keydowns seen     : {}", keys_seen.load(Ordering::Relaxed));
+    println!("  focused_element() calls  : {}", timings.len());
+
+    if timings.is_empty() {
+        println!("\n  no calls timed -- inconclusive");
+        return ExitCode::FAILURE;
+    }
+
+    let total: Duration = timings.iter().sum();
+    let max = timings.iter().max().copied().unwrap_or_default();
+    let min = timings.iter().min().copied().unwrap_or_default();
+    let mean = total / timings.len() as u32;
+
+    println!("\n  per-call latency: min {min:?}, mean {mean:?}, max {max:?}");
+    println!("  TOTAL time the pump spent blocked: {total:?}");
+
+    // The decisive part: WHAT did focus resolve to on the first keystroke of
+    // each phase? If the no-settle phase names something other than FieldB --
+    // an address bar, the document, a stale element -- that is the mechanism.
+    println!("\n--- what focus resolved to, per phase ---");
+    let show = |label: &str, slice: &[Resolution]| {
+        println!("  {label}:");
+        if slice.is_empty() {
+            println!("    (no keystrokes recorded)");
+            return;
+        }
+        println!(
+            "    FIRST keystroke -> role={:?} name={:?}",
+            slice[0].1, slice[0].2
+        );
+        let mut distinct: Vec<String> = slice
+            .iter()
+            .map(|(_, r, n)| format!("{r:?}/{n:?}"))
+            .collect();
+        distinct.dedup();
+        distinct.sort();
+        distinct.dedup();
+        println!("    distinct targets across the phase: {distinct:?}");
+    };
+    show("PHASE 1 (settled)", &resolutions[..phase1_len.min(resolutions.len())]);
+    if resolutions.len() > phase1_len {
+        show("PHASE 2 (no settle)", &resolutions[phase1_len..]);
+    } else {
+        println!("  PHASE 2 (no settle): (no keystrokes recorded)");
+    }
+    println!("\n  (the pump is serial, so this is time during which NO event --");
+    println!("   including the click events the settled case depends on -- was");
+    println!("   being processed)");
+
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
@@ -294,6 +714,12 @@ async fn main() -> ExitCode {
 
     if std::env::args().any(|a| a == "notepad") {
         return notepad_mode().await;
+    }
+    if std::env::args().any(|a| a == "handles") {
+        return handles_mode().await;
+    }
+    if std::env::args().any(|a| a == "pumpcost") {
+        return pumpcost_mode().await;
     }
 
     println!("== text capture probe ==\n");

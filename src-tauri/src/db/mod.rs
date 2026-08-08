@@ -44,6 +44,13 @@ pub enum DbError {
     )]
     BadKey,
 
+    /// A statement addressed a row that is not there. Distinguished from
+    /// success because SQL `DELETE` and `UPDATE` succeed while affecting zero
+    /// rows, and a caller asking to remove something that does not exist has
+    /// almost certainly made a mistake worth reporting.
+    #[error("no {what} with id {id:?}")]
+    NotFound { what: &'static str, id: String },
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

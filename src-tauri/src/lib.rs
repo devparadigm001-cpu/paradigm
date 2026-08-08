@@ -162,6 +162,7 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
             commands::stop_record_session,
             commands::compile_and_store_playbook,
             commands::list_playbooks,
+            commands::delete_playbook,
             commands::replay_playbook,
             commands::get_run_history,
         ])

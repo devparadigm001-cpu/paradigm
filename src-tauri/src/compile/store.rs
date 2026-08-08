@@ -162,6 +162,36 @@ pub fn list(conn: &Connection) -> Result<Vec<PlaybookSummary>, DbError> {
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// Delete a playbook and, through the schema, its steps.
+///
+/// One statement is enough because migration 20260803000001 already declares
+/// the consequences:
+///
+/// * `playbook_steps.playbook_id` is `ON DELETE CASCADE`, so the steps go with
+///   the playbook.
+/// * `runs.playbook_id` is `ON DELETE SET NULL`, deliberately -- the Step 1
+///   migration comment reads "run history must outlive its playbook". Runs are
+///   detached, not deleted, and their `run_steps_log` rows survive with them.
+///
+/// All of that depends on `PRAGMA foreign_keys = ON`, which `db::open` sets per
+/// connection. SQLite ignores foreign-key clauses entirely when it is off, so
+/// the cascade is asserted in the tests below rather than trusted.
+///
+/// Deleting an id that is not there is an error, not a no-op: `DELETE` succeeds
+/// while affecting zero rows, and silently reporting success to a caller who
+/// asked to remove something nonexistent hides a real mistake.
+pub fn delete(conn: &Connection, playbook_id: &str) -> Result<(), DbError> {
+    let affected = conn.execute("DELETE FROM playbooks WHERE id = ?1", [playbook_id])?;
+
+    if affected == 0 {
+        return Err(DbError::NotFound {
+            what: "playbook",
+            id: playbook_id.to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Parse a stored `control_role` back into the enum. Unknown values become
 /// `Other`, matching the compile-time mapping's fallback.
 pub fn parse_control_role(raw: &str) -> ControlRole {
@@ -258,6 +288,137 @@ mod tests {
             "no step here matches an irreversible keyword"
         );
         assert_eq!(playbook.irreversible_count(), 0, "fixture is wrong, not the SQL");
+    }
+
+    /// Open a scratch database the same way the app does, so the connection
+    /// carries the same pragmas -- `PRAGMA foreign_keys` in particular, which
+    /// the deletion behaviour depends on entirely.
+    fn scratch_db(dir: &TempDir) -> Connection {
+        let (db_path, key_path) = crate::db::paths_in(dir.path());
+        crate::db::open(&db_path, &key_path).expect("open encrypted db")
+    }
+
+    fn count(conn: &Connection, sql: &str, id: &str) -> i64 {
+        conn.query_row(sql, [id], |r| r.get(0)).expect("count query")
+    }
+
+    #[test]
+    fn deleting_a_playbook_removes_its_steps_but_detaches_rather_than_deletes_runs() {
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+
+        // The whole cascade rests on this being enforced. SQLite parses
+        // ON DELETE clauses and then ignores them when it is off, so a passing
+        // test would otherwise prove nothing.
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .expect("read PRAGMA foreign_keys");
+        assert_eq!(fk, 1, "foreign keys are OFF; ON DELETE clauses are a no-op");
+
+        let playbook = compile(
+            &clicks(&["Send", "Cancel", "Back"]),
+            "To Be Deleted",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        {
+            let mut conn = scratch_db(&dir);
+            store(&mut conn, &playbook).expect("store playbook");
+        }
+        let conn = scratch_db(&dir);
+
+        // A run against it, so the retention rule has something to act on.
+        let run_id = crate::replay::journal::start_run(&conn, &playbook.id).expect("start run");
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM playbook_steps WHERE playbook_id = ?1",
+                &playbook.id
+            ),
+            3,
+            "fixture should have stored three steps"
+        );
+
+        delete(&conn, &playbook.id).expect("delete playbook");
+
+        // 1. The playbook itself is gone.
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM playbooks WHERE id = ?1", &playbook.id),
+            0
+        );
+
+        // 2. Its steps cascaded away with it.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM playbook_steps WHERE playbook_id = ?1",
+                &playbook.id
+            ),
+            0,
+            "steps should cascade with the playbook"
+        );
+
+        // 3. The run SURVIVES, detached -- "run history must outlive its
+        //    playbook" (migration 20260803000002). Deleting it instead would be
+        //    a silent loss of audit history.
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM runs WHERE id = ?1", &run_id),
+            1,
+            "the run should survive its playbook"
+        );
+        let orphaned: Option<String> = conn
+            .query_row("SELECT playbook_id FROM runs WHERE id = ?1", [&run_id], |r| {
+                r.get(0)
+            })
+            .expect("read the run back");
+        assert_eq!(
+            orphaned, None,
+            "the surviving run's playbook_id should be NULL, not the dead id"
+        );
+    }
+
+    #[test]
+    fn deleting_an_unknown_playbook_is_an_error_not_a_silent_success() {
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+
+        // DELETE affects zero rows and succeeds at the SQL level, so without an
+        // explicit check this would report success and the caller would believe
+        // something was removed.
+        let err = delete(&conn, "no-such-playbook").expect_err("must not succeed");
+        assert!(
+            matches!(err, DbError::NotFound { what: "playbook", .. }),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn deleting_one_playbook_leaves_the_others_alone() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut conn = scratch_db(&dir);
+
+        let doomed = compile(
+            &clicks(&["Send"]),
+            "Doomed",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        let keeper = compile(
+            &clicks(&["Cancel", "Back"]),
+            "Keeper",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        store(&mut conn, &doomed).expect("store doomed");
+        store(&mut conn, &keeper).expect("store keeper");
+
+        delete(&conn, &doomed.id).expect("delete");
+
+        let rows = list(&conn).expect("list");
+        assert_eq!(rows.len(), 1, "exactly one playbook should remain");
+        assert_eq!(rows[0].id, keeper.id);
+        assert_eq!(rows[0].step_count, 2, "the survivor keeps its steps");
     }
 
     #[test]
