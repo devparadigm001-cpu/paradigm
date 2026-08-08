@@ -147,6 +147,7 @@ const REGISTERED_COMMANDS: &[(&str, &str)] = &[
     ("stop_record_session", "{}"),
     ("compile_and_store_playbook", r#"{"nameHint":"x"}"#),
     ("list_playbooks", "{}"),
+    ("delete_playbook", r#"{"playbookId":"does-not-exist"}"#),
     ("replay_playbook", r#"{"playbookId":"does-not-exist"}"#),
     ("get_run_history", r#"{"playbookId":"does-not-exist"}"#),
 ];
@@ -406,6 +407,53 @@ fn a_negative_step_index_is_rejected() {
         .expect_err("a negative index must be rejected");
     println!("negative index rejected with: {err}");
     assert_eq!(pending_count(&app), Some(2));
+}
+
+#[test]
+fn delete_playbook_removes_it_from_the_list_over_ipc() {
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+    seed_pending(&app, &["alpha", "bravo"]);
+
+    let info = compile(&webview, "Doomed", None).expect("compile");
+    let id = info["playbook_id"].as_str().expect("playbook_id").to_string();
+
+    let deleted = invoke(
+        &webview,
+        "delete_playbook",
+        InvokeBody::Json(serde_json::json!({ "playbookId": id })),
+    );
+    assert!(deleted.is_ok(), "delete_playbook failed: {:?}", deleted.err());
+
+    let list = invoke(&webview, "list_playbooks", InvokeBody::default())
+        .expect("list_playbooks")
+        .deserialize::<serde_json::Value>()
+        .expect("deserialize list");
+    assert!(
+        list.as_array().expect("array").is_empty(),
+        "the deleted playbook is still listed: {list}"
+    );
+}
+
+#[test]
+fn deleting_an_unknown_playbook_reports_an_error_over_ipc() {
+    // A silent success here would tell the frontend something was removed when
+    // nothing was, which is the specific behaviour store::delete guards against.
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+
+    let result = invoke(
+        &webview,
+        "delete_playbook",
+        InvokeBody::Json(serde_json::json!({ "playbookId": "no-such-playbook" })),
+    );
+
+    let err = result.expect_err("deleting a nonexistent playbook must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no playbook with id"),
+        "unhelpful error: {msg}"
+    );
 }
 
 #[test]

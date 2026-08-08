@@ -385,6 +385,19 @@ pub async fn list_playbooks(
         .collect())
 }
 
+/// Delete a stored playbook and its steps.
+///
+/// Irreversible, and there is no undo: the frontend should confirm before
+/// calling this. Past runs are deliberately kept — see `store::delete`.
+#[tauri::command]
+pub async fn delete_playbook(
+    state: State<'_, AppState>,
+    playbook_id: String,
+) -> Result<(), String> {
+    let conn = state.db.lock().await;
+    store::delete(&conn, &playbook_id).map_err(|e| e.to_string())
+}
+
 /// Replay a stored playbook. Performs real input on the user's desktop.
 #[tauri::command]
 pub async fn replay_playbook(
