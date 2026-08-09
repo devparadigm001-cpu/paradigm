@@ -1211,11 +1211,354 @@ async fn windowswitch_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// -------------------------------------------------------- windowid mode ----
+//
+// Decides what a "window session id" can safely be keyed on.
+//
+// `ApplicationSwitchEvent` has no HWND field -- there is no `hwnd` anywhere in
+// terminator-workflow-recorder. Its identity fields are the window title, the
+// process name, and `to_process_id`. A window handle is still reachable through
+// `metadata.ui_element` via `UIElement::get_native_window_handle()`, which would
+// be the better key because it identifies a *window* rather than a *process*
+// (pid would merge two Notepad tabs sharing one process).
+//
+// Whether that is usable is an empirical question, and this answers it:
+//
+//   * is `metadata.ui_element` populated on ApplicationSwitch events?
+//   * does `get_native_window_handle()` succeed, and return something non-zero?
+//   * is the handle STABLE when returning to a window whose TITLE has changed?
+//
+// The last one is the whole point. The bug being fixed
+// (replay-window-selector-ambiguity.md) happened because a Notepad window was
+// "Untitled - Notepad" on the first visit and "*draft note... - Notepad" on the
+// return. The page used here retitles itself as text is typed, reproducing that
+// exactly without going near Notepad.
+
+const RETITLING_PAGE: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Untitled - Probe</title></head>
+<body style="font-family:sans-serif;padding:2rem">
+<h2>Window identity probe</h2>
+<p>This page renames its own window as you type, the way Notepad does.</p>
+<label for="t">FieldTitle</label><br>
+<input id="t" name="FieldTitle" aria-label="FieldTitle"
+       oninput="document.title = (this.value || 'Untitled') + ' - Probe'"
+       style="font-size:1.2rem;padding:.4rem;width:30rem">
+</body></html>
+"#;
+
+async fn windowid_mode() -> ExitCode {
+    use futures::StreamExt;
+    use terminator_workflow_recorder::{
+        WorkflowEvent, WorkflowRecorder, WorkflowRecorderConfig,
+    };
+
+    println!("== window identity probe ==\n");
+    println!("Types into a page that renames its own window, switches away,");
+    println!("then switches back -- and reports what identity each switch carries.\n");
+    println!("WARNING: performs real clicks and typing. Hands off.\n");
+
+    let page = std::env::temp_dir().join("paradigm-window-id-probe.html");
+    if let Err(e) = std::fs::write(&page, RETITLING_PAGE) {
+        eprintln!("could not write probe page: {e}");
+        return ExitCode::FAILURE;
+    }
+    let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+    for browser in browser_order() {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, &url])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("waiting 10s for the browser...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let field = match desktop
+        .locator("role:Edit|name:FieldTitle")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not find FieldTitle: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let config = WorkflowRecorderConfig {
+        record_mouse: true,
+        record_keyboard: true,
+        capture_ui_elements: true,
+        record_application_switches: true,
+        ..Default::default()
+    };
+    let mut recorder = WorkflowRecorder::new("windowid-probe".to_string(), config);
+    let mut events = Box::pin(recorder.event_stream());
+    if let Err(e) = recorder.start().await {
+        eprintln!("could not start recorder: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // Collect every ApplicationSwitch with the identity it carries.
+    type Switch = (String, u32, Option<Result<isize, String>>);
+    let collected: std::sync::Arc<std::sync::Mutex<Vec<Switch>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&collected);
+
+    let pump = tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            if let WorkflowEvent::ApplicationSwitch(e) = &event {
+                let hwnd = e.metadata.ui_element.as_ref().map(|el| {
+                    el.get_native_window_handle().map_err(|err| err.to_string())
+                });
+                if let Ok(mut v) = sink.lock() {
+                    v.push((
+                        e.to_window_and_application_name.clone(),
+                        e.to_process_id,
+                        hwnd,
+                    ));
+                }
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    println!("-- typing into the field (this renames the window) --");
+    robust_click(&desktop, &field);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    for ch in "draft note".chars() {
+        let _ = field.type_text(&ch.to_string(), false);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    println!("-- switching away to Calculator --");
+    if let Err(e) = std::process::Command::new("calc.exe").spawn() {
+        eprintln!("could not launch Calculator: {e}");
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    println!("-- switching BACK to the (now renamed) page --");
+    // Activate through the window we already hold, not a title lookup: the
+    // title has deliberately changed, which is the whole point of the test.
+    match field.window() {
+        Ok(Some(w)) => {
+            if let Err(e) = w.activate_window() {
+                println!("   activate_window failed ({e}); falling back to a click");
+                robust_click(&desktop, &field);
+            }
+        }
+        _ => robust_click(&desktop, &field),
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // A second nudge: some switch detection needs real input in the window.
+    robust_click(&desktop, &field);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let _ = recorder.stop().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    pump.abort();
+    let _ = pump.await;
+
+    let switches = collected.lock().map(|v| v.clone()).unwrap_or_default();
+
+    println!("\n================ RESULTS ================");
+    println!("{} ApplicationSwitch event(s):\n", switches.len());
+    for (i, (title, pid, hwnd)) in switches.iter().enumerate() {
+        let hwnd_desc = match hwnd {
+            None => "ui_element ABSENT".to_string(),
+            Some(Ok(h)) => format!("hwnd={h:#x} ({h})"),
+            Some(Err(e)) => format!("hwnd FAILED: {e}"),
+        };
+        println!("  [{i}] pid={pid:<6} {hwnd_desc}");
+        println!("      title={title:?}");
+    }
+
+    println!("\n--- verdict ---");
+    let with_element = switches.iter().filter(|(_, _, h)| h.is_some()).count();
+    let with_hwnd = switches
+        .iter()
+        .filter(|(_, _, h)| matches!(h, Some(Ok(v)) if *v != 0))
+        .count();
+    println!("  switches carrying a ui_element : {with_element}/{}", switches.len());
+    println!("  switches yielding a usable hwnd: {with_hwnd}/{}", switches.len());
+
+    // The decisive test: two visits to the same window under different titles.
+    let browserish: Vec<&Switch> = switches
+        .iter()
+        .filter(|(t, _, _)| t.contains("Probe"))
+        .collect();
+    println!("\n  visits to the probe window: {}", browserish.len());
+    for (t, pid, h) in &browserish {
+        println!("    title={t:?} pid={pid} hwnd={h:?}");
+    }
+    if browserish.len() >= 2 {
+        let titles_differ = browserish[0].0 != browserish[browserish.len() - 1].0;
+        let pids_same = browserish[0].1 == browserish[browserish.len() - 1].1;
+        // A zero handle is NOT an identity. `get_native_window_handle` returns
+        // Ok(0) rather than an error for windows it cannot resolve, so
+        // comparing two zeroes reports "stable" while carrying no information.
+        // An earlier version of this verdict did exactly that and claimed HWND
+        // was a valid key when every browser handle was 0.
+        let hwnds_same = match (&browserish[0].2, &browserish[browserish.len() - 1].2) {
+            (Some(Ok(a)), Some(Ok(b))) if *a != 0 && *b != 0 => Some(a == b),
+            _ => None,
+        };
+        println!("\n  titles differ between visits : {titles_differ}");
+        println!("  pid same between visits      : {pids_same}");
+        println!(
+            "  hwnd usable and same         : {}",
+            match hwnds_same {
+                Some(true) => "yes",
+                Some(false) => "no -- differs",
+                None => "n/a -- at least one handle was 0 or unavailable",
+            }
+        );
+        if titles_differ && hwnds_same == Some(true) {
+            println!("\n  HWND IS A VALID KEY: stable across the title change that broke replay.");
+        } else if titles_differ && pids_same {
+            println!("\n  hwnd NOT usable here; pid WAS stable across the title change.");
+        }
+    } else {
+        println!("\n  INCONCLUSIVE: fewer than two switches back to the probe window.");
+    }
+
+    ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------- ambiguity mode ----
+//
+// Feasibility check for the fail-loud fix, plus a reproduction of the
+// ambiguity itself.
+//
+// The fix needs replay to know, at the moment it resolves a window selector,
+// whether that selector matched more than one window. `Locator::all()` is the
+// obvious way to count -- but during earlier work tonight
+// `locator("role:Window").all()` returned ZERO Notepad windows while `first()`
+// succeeded on the same tree, so its reliability for window selectors cannot be
+// assumed. If `.all()` under-reports, counting with it would either miss real
+// ambiguity or fail legitimate replays.
+//
+// This opens the same page in TWO browser windows so one title genuinely
+// matches two windows, then reports what each path sees.
+
+async fn ambiguity_mode() -> ExitCode {
+    println!("== window selector ambiguity probe ==\n");
+    println!("Opens one page in TWO windows, then asks what the resolution");
+    println!("path replay uses actually reports.\n");
+
+    let page = std::env::temp_dir().join("paradigm-ambiguity-probe.html");
+    let html = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Ambiguity Probe Window</title></head>
+<body style="font-family:sans-serif;padding:2rem"><h2>Ambiguity probe</h2>
+<input id="f" name="AmbigField" aria-label="AmbigField" style="font-size:1.2rem;width:20rem">
+</body></html>
+"#;
+    if let Err(e) = std::fs::write(&page, html) {
+        eprintln!("could not write probe page: {e}");
+        return ExitCode::FAILURE;
+    }
+    let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+
+    let browser = browser_order()[0];
+    println!("opening window 1 in {browser}...");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", &url])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    println!("opening window 2 (same page, same title)...");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", &url])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n================ RESULTS ================\n");
+
+    // What replay does today, and what a counting path would see.
+    for selector in [
+        "role:Window|name:Ambiguity Probe Window",
+        "role:Edit|name:AmbigField",
+        "role:Window",
+    ] {
+        println!("selector {selector:?}");
+
+        let first = desktop
+            .locator(selector)
+            .first(Some(Duration::from_secs(5)))
+            .await;
+        match &first {
+            Ok(el) => println!(
+                "  .first() -> Ok   role={:?} name={:?}   <-- replay acts on this today",
+                el.role(),
+                el.name()
+            ),
+            Err(e) => println!("  .first() -> Err  {e}"),
+        }
+
+        match desktop
+            .locator(selector)
+            .all(Some(Duration::from_secs(5)), None)
+            .await
+        {
+            Ok(all) => {
+                println!("  .all()   -> {} candidate(s)", all.len());
+                for (i, el) in all.iter().take(6).enumerate() {
+                    println!("      [{i}] role={:?} name={:?}", el.role(), el.name());
+                }
+            }
+            Err(e) => println!("  .all()   -> Err  {e}"),
+        }
+        println!();
+    }
+
+    println!("--- what this decides ---");
+    println!("  If .all() reports >= 2 for the duplicated window title while");
+    println!("  .first() silently returns one, the fail-loud fix is implementable");
+    println!("  and the ambiguity is reproduced.");
+    println!("  If .all() reports 0 or 1 for a title that demonstrably matches two");
+    println!("  windows, it CANNOT be used to detect ambiguity and the design");
+    println!("  needs a different candidate-counting path.");
+
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "ambiguity") {
+        return ambiguity_mode().await;
+    }
+    if std::env::args().any(|a| a == "windowid") {
+        return windowid_mode().await;
+    }
     if std::env::args().any(|a| a == "windowswitch") {
         return windowswitch_mode().await;
     }
