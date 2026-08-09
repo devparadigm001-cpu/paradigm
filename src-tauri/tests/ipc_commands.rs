@@ -207,6 +207,7 @@ fn gated_actions(names: &[&str]) -> Vec<CapturedAction> {
         stream.admit(ActionCandidate {
             kind: ActionKind::Click,
             identifiers: vec!["paradigm-ipc-test.exe".into()],
+            process_name: Some("paradigm-ipc-test.exe".into()),
             element_role: Some("Button".into()),
             element_name: Some((*name).to_string()),
             payload: None,

@@ -226,6 +226,7 @@ mod tests {
             stream.admit(ActionCandidate {
                 kind: ActionKind::Click,
                 identifiers: vec!["app.exe".into()],
+                process_name: None,
                 element_role: Some("Button".into()),
                 element_name: Some((*name).to_string()),
                 payload: None,
@@ -375,6 +376,81 @@ mod tests {
         assert_eq!(
             orphaned, None,
             "the surviving run's playbook_id should be NULL, not the dead id"
+        );
+    }
+
+    /// Layer 2 of the process-name plumbing: it must survive compile, the
+    /// store, and the read back. Verified against a real encrypted database
+    /// rather than by inspecting the JSON that `compile` builds, because the
+    /// question is whether it survives the round trip.
+    #[test]
+    fn the_process_name_survives_compile_store_and_load() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut conn = scratch_db(&dir);
+
+        // Built through the real gate, with a process name attached.
+        let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
+        stream.admit(ActionCandidate {
+            kind: ActionKind::Navigate,
+            identifiers: vec!["Untitled - Notepad".into()],
+            process_name: Some("notepad.exe".into()),
+            element_role: Some("Window".into()),
+            element_name: Some("Untitled - Notepad".into()),
+            payload: None,
+            detail: None,
+            timestamp_ms: 0,
+        });
+        let actions = stream.actions().to_vec();
+        assert_eq!(
+            actions[0].process_name.as_deref(),
+            Some("notepad.exe"),
+            "the gate dropped the process name"
+        );
+
+        let playbook = compile(
+            &actions,
+            "Process Name Round Trip",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        store(&mut conn, &playbook).expect("store");
+
+        let loaded = load(&conn, &playbook.id).expect("load");
+        let payload: serde_json::Value =
+            serde_json::from_str(&loaded.steps[0].action_payload_json).expect("payload json");
+
+        assert_eq!(
+            payload["process"].as_str(),
+            Some("notepad.exe"),
+            "process name did not survive to the stored payload: {payload}"
+        );
+        // And the display string is still the title, unchanged.
+        assert_eq!(payload["app"].as_str(), Some("Untitled - Notepad"));
+    }
+
+    /// An action with no process name -- an old recording, or an event that
+    /// reported none -- must store a null rather than failing or inventing one.
+    #[test]
+    fn a_missing_process_name_stores_as_null() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut conn = scratch_db(&dir);
+
+        let playbook = compile(
+            &clicks(&["Send"]),
+            "No Process Name",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        store(&mut conn, &playbook).expect("store");
+
+        let loaded = load(&conn, &playbook.id).expect("load");
+        let payload: serde_json::Value =
+            serde_json::from_str(&loaded.steps[0].action_payload_json).expect("payload json");
+
+        assert!(
+            payload["process"].is_null(),
+            "expected null, got {}",
+            payload["process"]
         );
     }
 

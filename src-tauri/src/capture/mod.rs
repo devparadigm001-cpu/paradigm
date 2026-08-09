@@ -231,6 +231,7 @@ fn observe_text(
                 &e.element_role,
                 non_empty(&e.element_text),
                 identifiers,
+                e.process_name.clone(),
                 e.metadata.timestamp.unwrap_or_else(now_ms),
             )
         }
@@ -292,6 +293,7 @@ fn to_candidate(event: &WorkflowEvent) -> Option<ActionCandidate> {
 
             Some(ActionCandidate {
                 kind: ActionKind::Click,
+                process_name: e.process_name.clone(),
                 identifiers,
                 element_role: Some(e.element_role.clone()),
                 element_name: non_empty(&e.element_text),
@@ -329,6 +331,11 @@ fn to_candidate(event: &WorkflowEvent) -> Option<ActionCandidate> {
             Some(ActionCandidate {
                 kind: ActionKind::Navigate,
                 identifiers,
+                // The destination's executable. `element_name` below is the
+                // window TITLE, which changes as the user works -- a Notepad
+                // window is "Untitled - Notepad" until the first keystroke.
+                // This is the part that does not move.
+                process_name: e.to_process_name.clone(),
                 element_role: Some("Window".to_string()),
                 element_name: Some(e.to_window_and_application_name.clone()),
                 payload: None,

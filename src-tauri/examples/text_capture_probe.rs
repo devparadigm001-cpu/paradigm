@@ -1437,6 +1437,142 @@ async fn windowid_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// -------------------------------------------------------- procname mode ----
+//
+// Layer 1 verification for the process-name plumbing: does a real driven
+// session actually produce CapturedActions carrying a process name?
+//
+// Checked empirically rather than by reading the code, because the whole reason
+// this field exists is that the obvious assumption -- "identifiers already
+// carries it" -- turned out to be false: `admit` keeps only the first non-empty
+// identifier as `source_app` and drops the rest.
+
+async fn procname_mode() -> ExitCode {
+    println!("== process-name plumbing probe (capture layer) ==\n");
+    println!("Drives a real session and reports the process_name on each");
+    println!("captured action, alongside source_app for comparison.\n");
+    println!("WARNING: performs real clicks and typing. Hands off.\n");
+
+    let page = std::env::temp_dir().join("paradigm-text-capture-probe.html");
+    if let Err(e) = std::fs::write(&page, PAGE) {
+        eprintln!("could not write probe page: {e}");
+        return ExitCode::FAILURE;
+    }
+    let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+    for browser in browser_order() {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, &url])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("waiting 10s for the browser...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let field = match desktop
+        .locator("role:Edit|name:FieldA")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not find FieldA: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let session = match CaptureSession::start_session(
+        "procname-probe",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // A click, some typing, and an app switch -- one of each action kind.
+    robust_click(&desktop, &field);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    for ch in "procname-test".chars() {
+        let _ = field.type_text(&ch.to_string(), false);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    println!("-- switching to Calculator to produce a navigate action --");
+    let _ = std::process::Command::new("calc.exe").spawn();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n================ RESULTS ================");
+    println!("captured {} action(s)\n", report.actions.len());
+    println!(
+        "  {:<9} {:<28} {}",
+        "kind", "process_name", "source_app (for contrast)"
+    );
+    println!("  {}", "-".repeat(92));
+    for a in &report.actions {
+        println!(
+            "  {:<9} {:<28} {:?}",
+            a.kind.as_str(),
+            format!("{:?}", a.process_name),
+            a.source_app
+        );
+    }
+
+    let total = report.actions.len();
+    let with_proc = report
+        .actions
+        .iter()
+        .filter(|a| a.process_name.as_deref().map(|p| !p.trim().is_empty()) == Some(true))
+        .count();
+    let navigates_with_proc = report
+        .actions
+        .iter()
+        .filter(|a| a.kind == ActionKind::Navigate)
+        .filter(|a| a.process_name.is_some())
+        .count();
+    let navigates = report
+        .actions
+        .iter()
+        .filter(|a| a.kind == ActionKind::Navigate)
+        .count();
+
+    println!("\n--- verdict (capture layer) ---");
+    println!("  actions carrying a process_name : {with_proc}/{total}");
+    println!("  navigate actions with one       : {navigates_with_proc}/{navigates}");
+    if with_proc == 0 {
+        println!("\n  LAYER 1 FAILS: nothing carries a process name. Stop here.");
+    } else if navigates > 0 && navigates_with_proc == 0 {
+        println!("\n  LAYER 1 PARTIAL: navigate actions -- the ones whose selector needs");
+        println!("  scoping -- carry no process name. The fix cannot work as designed.");
+    } else {
+        println!("\n  LAYER 1 OK: process names reach real captured actions.");
+    }
+
+    ExitCode::SUCCESS
+}
+
 // ------------------------------------------------------- ambiguity mode ----
 //
 // Feasibility check for the fail-loud fix, plus a reproduction of the
@@ -1500,11 +1636,19 @@ async fn ambiguity_mode() -> ExitCode {
 
     println!("\n================ RESULTS ================\n");
 
-    // What replay does today, and what a counting path would see.
+    // The scoped forms are what the fix actually builds. `process:` is what
+    // `Locator::all()` demanded when it rejected the desktop-wide versions --
+    // this is where we find out whether supplying it is enough.
+    let browser_proc = if browser == "chrome" { "chrome.exe" } else { "msedge.exe" };
+    println!("(scoped selectors use process:{browser_proc})\n");
+
     for selector in [
+        // Desktop-wide, as stored today -- known to be rejected by .all().
         "role:Window|name:Ambiguity Probe Window",
         "role:Edit|name:AmbigField",
-        "role:Window",
+        // Scoped, as the fix builds them.
+        &format!("process:{browser_proc}|role:Window|name:Ambiguity Probe Window") as &str,
+        &format!("process:{browser_proc}|role:Edit|name:AmbigField") as &str,
     ] {
         println!("selector {selector:?}");
 
@@ -1553,6 +1697,9 @@ async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "procname") {
+        return procname_mode().await;
+    }
     if std::env::args().any(|a| a == "ambiguity") {
         return ambiguity_mode().await;
     }

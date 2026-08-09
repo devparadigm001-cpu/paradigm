@@ -243,6 +243,98 @@ been tested and which `.all()`'s behaviour gives reason to doubt.
 Neither is a small change, and both need their own evidence before being
 committed to.
 
+## Route 1 built, and refuted at the last layer (2026-08-09)
+
+Route 1 was implemented in full. **Layers 1–3 work and are kept. Layer 4 — the
+ambiguity detection the whole route existed for — does not, and was removed.**
+
+### Layers 1–3: verified, kept
+
+Each layer was verified before the next was built, because the assumption that
+started this ("`identifiers` already carries the process name") turned out to be
+false: `admit` keeps only the first non-empty identifier as `source_app` and
+drops the rest, and `compile` never sees `identifiers` at all. A new field was
+required on both `ActionCandidate` and `CapturedAction`.
+
+**Layer 1 — capture records it.** A real driven session
+(`text_capture_probe -- procname`):
+
+```
+  kind      process_name                     source_app (for contrast)
+  navigate  Some("msedge.exe")               "Paradigm Text Capture Probe and 63 more pages … Edge"
+  click     Some("msedge.exe")               "msedge.exe"
+  type      Some("msedge.exe")               "msedge.exe"
+  navigate  Some("ApplicationFrameHost.exe") "Calculator"
+
+  actions carrying a process_name : 4/4
+  navigate actions with one       : 2/2
+```
+
+The contrast is the point: the navigate action's `source_app` is the long,
+mutable window title while `process_name` is the stable `msedge.exe`.
+
+Note Calculator resolves to `ApplicationFrameHost.exe` — the UWP frame host,
+shared by *every* UWP app. Scoping to it would scope to all of them. That is a
+real limit on how much a process name can ever narrow things, and it matches the
+pid instability measured for Calculator in the refuted identity work above.
+
+**Layer 2 — it survives compile → store → load.** Two tests in
+`compile/store.rs` against a real encrypted database:
+`the_process_name_survives_compile_store_and_load` asserts `"process"` reads
+back as `"notepad.exe"` while `"app"` is still the title, and
+`a_missing_process_name_stores_as_null` asserts an action without one stores
+`null` rather than failing or inventing a value.
+
+**Layer 3 — `StepPayload::scoped_selector()` builds the prefix.** Four unit
+tests, including `an_old_playbook_without_a_process_name_cannot_be_scoped`,
+which pins the strictly-additive requirement: a playbook recorded before this
+field existed returns `None`, keeps its original unscoped selector, and replays
+exactly as it always did.
+
+### Layer 4: the count answers a different question
+
+Supplying a `process:` prefix *does* stop `Locator::all()` rejecting the
+selector — that specific blocker is gone. But the number it returns is not a
+count of the selector's matches.
+
+Measured with two windows sharing a title, in a browser holding three windows
+total:
+
+```
+selector "process:msedge.exe|role:Window|name:Ambiguity Probe Window"
+  .all() -> 3 candidate(s)
+      [0] Window "Ambiguity Probe Window - Personal - Microsoft Edge"
+      [1] Window "Ambiguity Probe Window - Personal - Microsoft Edge"
+      [2] Window "Paradigm Text Capture Probe and 63 more pages …"   <-- name does not match
+
+selector "process:msedge.exe|role:Edit|name:AmbigField"
+  .all() -> 3 candidate(s)
+      [0] role="Window" …                                            <-- asked for Edit, got Window
+```
+
+**Two entirely different selectors returned the same three elements.** With a
+`process:` prefix, `all()` returns every top-level window of that process and
+ignores the role and name criteria.
+
+So the count cannot answer "does this selector match more than one window". It
+answers "how many windows does this process have", which for a browser is
+routinely three or more. Wiring the check to it would have failed legitimate,
+unambiguous replays — the exact over-cautious-rejection risk flagged against
+Route 2, which turns out to afflict Route 1 too.
+
+The check and its `count_candidates` helper were removed rather than shipped.
+
+### What is kept, and why
+
+`process_name` now flows capture → compile → storage correctly, and
+`scoped_selector()` builds the prefix correctly including the empty-string and
+missing-selector edge cases. Both are marked `#[allow(dead_code)]` and remain
+tested.
+
+They are kept because **any** future approach needs a stable process identity —
+including one that never calls `Locator::all()`. Rebuilding that plumbing is the
+expensive part; the three-line counting call that failed is not.
+
 ## Pattern: a swallowed error produces a confident false conclusion
 
 Three times in one session, and worth naming because the shape repeats and each
@@ -273,6 +365,15 @@ empty, or equal, prove the call *succeeded* before drawing anything from the
 value. `.ok()` and `unwrap_or_default()` in diagnostic code are where these
 originate.
 
+A related but distinct variant, worth one line rather than a section: during the
+Route 1 work an edit that *deleted* the ambiguity check read as contradictory,
+because the tool's diff shows the removed code in full next to the replacement
+comment. Nothing was wrong with the change; the presentation made a deletion
+look like a retention. Different mechanism from the swallowed errors above —
+this is display, not data — but the same cost, a round trip spent establishing
+what the actual state was. Stating "this removes X" in prose alongside a
+deletion avoids it.
+
 ## Why it matters
 
 The failure is invisible from every vantage point a user has. The run reports
@@ -297,19 +398,27 @@ generic-titled window in step 1.
       abandoned — see "Refuted approach" above. No reliable window identity
       signal exists: HWND is 0 for browser windows, and pid is unstable for at
       least one app class.
-- [ ] **Unblock the fail-loud check by picking Route 1 or Route 2** (see
-      "Blocked approach" above). This is the recommended direction; only the
-      candidate-counting mechanism is missing.
+- [x] ~~**Unblock the fail-loud check by picking Route 1 or Route 2.**~~
+      **Route 1 built and refuted** — see "Route 1 built, and refuted at the
+      last layer". Its plumbing works and is kept; its counting mechanism does
+      not. **Route 2 remains the only unexplored option**, and was already
+      flagged as high-risk for rejecting legitimate replays.
+- [ ] **Reconsider whether fail-loud-on-ambiguity is the right design at all.**
+      This now deserves asking before a third counting mechanism is attempted.
+      Two independent tries at "count candidates through the library's own API"
+      have failed for *different* reasons — `all()` rejecting desktop-wide
+      selectors, then `all()` counting the wrong thing once scoped — which
+      suggests the API does not expose the notion of "how many things does this
+      selector match" at all. If that holds, the answer is not a third counting
+      path but a different design: resolving targets once per run,
+      post-execution verification that the right window was written to, or
+      capture recording enough context that replay never has to disambiguate.
 - [ ] **Prefer identifiers that do not change with content.** A window title that
       mutates as the user types is a poor key. Process id continuity, or a
       window handle held for the run, would be stable across exactly the change
-      that broke this. Note that process id has its own limits — Windows 11
-      Notepad hands new launches to an existing instance, measured while
-      investigating the multi-line duplication.
-- [ ] **Consider refusing to act on an ambiguous selector.** Still the right
-      idea, and now blocked only on how to count candidates — see "Blocked
-      approach". Failing loudly would have turned this run into an honest
-      failure instead of a false success.
+      that broke this. Note the measured limits: Windows 11 Notepad hands new
+      launches to an existing instance, HWND is 0 for browser windows, and a
+      UWP app's process resolves to the shared `ApplicationFrameHost.exe`.
 - [ ] **Reproduce it in a probe.** This is recorded from a live session and read
       out of the code; it has not been driven deterministically the way the
       capture defects were. A probe would confirm the mechanism and give any fix

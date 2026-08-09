@@ -92,6 +92,9 @@ struct Watched {
     /// focused it. The exclusion gate needs these, and resolving them later
     /// risks the element being gone.
     identifiers: Vec<String>,
+    /// Executable owning the field, from the same click. Carried so the emitted
+    /// action can be process-scoped at replay time.
+    process_name: Option<String>,
     /// Value when we started watching, so we can emit only on a real change.
     initial: String,
     started_ms: u64,
@@ -138,6 +141,7 @@ impl TextFieldWatcher {
         role: &str,
         name: Option<String>,
         identifiers: Vec<String>,
+        process_name: Option<String>,
         timestamp_ms: u64,
     ) -> Option<ActionCandidate> {
         // Re-focusing the same field is not a transition; keep accumulating.
@@ -156,6 +160,7 @@ impl TextFieldWatcher {
                 role: role.to_string(),
                 name,
                 identifiers,
+                process_name,
                 started_ms: timestamp_ms,
                 keystrokes: 0,
                 // Read at click-processing time, which can be later than the
@@ -203,18 +208,20 @@ impl TextFieldWatcher {
                 w.role.clone(),
                 w.name.clone(),
                 w.identifiers.clone(),
+                w.process_name.clone(),
             )
         });
 
         let candidate = self.flush(timestamp_ms);
 
-        if let Some((element, role, name, identifiers)) = carry {
+        if let Some((element, role, name, identifiers, process_name)) = carry {
             self.watching = Some(Watched {
                 initial: read_text(&element).unwrap_or_default(),
                 element,
                 role,
                 name,
                 identifiers,
+                process_name,
                 started_ms: timestamp_ms,
                 keystrokes: 0,
                 // Read here, immediately after emitting, with no gap for
@@ -307,6 +314,7 @@ impl TextFieldWatcher {
         Some(ActionCandidate {
             kind: ActionKind::Type,
             identifiers: watched.identifiers,
+            process_name: watched.process_name,
             element_role: Some(watched.role),
             element_name: watched.name,
             payload: Some(payload),

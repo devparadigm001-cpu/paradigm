@@ -119,6 +119,16 @@ fn compile_step(
             "selector": selector_for(action),
         },
         "app": action.source_app,
+        // The owning executable, kept separate from `app` because `app` is a
+        // display string -- for a navigate step it is the window TITLE, which
+        // changes as the user works. Replay needs the stable half to build a
+        // `process:`-scoped selector, which is what `Locator::all()` demands
+        // before it will count candidates.
+        //
+        // Null for playbooks recorded before this existed. Replay must treat
+        // that as "no scoping available" and behave exactly as it did before,
+        // never as an error.
+        "process": action.process_name,
     });
 
     if action.kind == ActionKind::Type {
@@ -168,6 +178,7 @@ mod tests {
             s.admit(ActionCandidate {
                 kind,
                 identifiers: vec!["app.exe".into()],
+                process_name: None,
                 element_role: Some(role.to_string()),
                 element_name: Some(name.to_string()),
                 payload: payload.map(str::to_string),

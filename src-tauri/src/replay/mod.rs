@@ -163,6 +163,43 @@ struct StepPayload {
     redacted: bool,
     target_name: Option<String>,
     app: Option<String>,
+    /// Owning executable, recorded from 2026-08-09. `None` for anything stored
+    /// before that, and for events that reported no process name.
+    ///
+    /// Parsed but not yet consumed by replay: it exists so a future ambiguity
+    /// check has the data it needs. Capture, compile and storage all carry it
+    /// today (verified end to end), so the collection half is done and only the
+    /// use of it is outstanding.
+    #[allow(dead_code)]
+    process: Option<String>,
+}
+
+impl StepPayload {
+    /// The selector with a `process:` prefix when one can be built.
+    ///
+    /// This exists because `Locator::all()` refuses a desktop-wide selector
+    /// outright -- "Selector must include 'process:' prefix" -- while
+    /// `Locator::first()` accepts one. Counting candidates, and therefore
+    /// detecting ambiguity at all, is only possible on a scoped selector.
+    ///
+    /// Returns `None` when there is no process name, which is the case for
+    /// every playbook recorded before this field existed. Callers must then
+    /// behave exactly as they did before rather than treating it as an error.
+    ///
+    /// Unused in the product today: the counting path it was written for turned
+    /// out not to work (see the note above `navigate`). Kept, and kept tested,
+    /// because building the prefix correctly -- including the empty-string and
+    /// missing-selector cases -- is the part a future attempt would otherwise
+    /// get wrong again.
+    #[allow(dead_code)]
+    fn scoped_selector(&self) -> Option<String> {
+        let selector = self.selector.as_deref()?;
+        let process = self.process.as_deref()?.trim();
+        if process.is_empty() {
+            return None;
+        }
+        Some(format!("process:{process}|{selector}"))
+    }
 }
 
 fn parse_payload(raw: &str) -> StepPayload {
@@ -173,8 +210,20 @@ fn parse_payload(raw: &str) -> StepPayload {
         redacted: v["redacted"].as_bool().unwrap_or(false),
         target_name: v["target"]["name"].as_str().map(str::to_string),
         app: v["app"].as_str().map(str::to_string),
+        process: v["process"].as_str().map(str::to_string),
     }
 }
+
+// A `count_candidates` helper lived here, counting a scoped selector's matches
+// with `Locator::all()` so `navigate` could refuse an ambiguous target. It was
+// implemented, measured, and removed: `all()` on a `process:`-scoped selector
+// returns every top-level window of that process and ignores the role and name,
+// so the number answers a different question than the one asked. Deleted rather
+// than kept, because three lines are cheap to rewrite and unused code that
+// looks purposeful is not.
+//
+// `StepPayload::scoped_selector` is kept and tested for whatever counting path
+// a future attempt uses.
 
 /// Best-effort name of the foreground application, for `system_state_json`.
 fn foreground_app(desktop: &Desktop) -> String {
@@ -355,6 +404,17 @@ async fn navigate(
     mk: &impl Fn(StepResult, String) -> StepOutcome,
 ) -> StepOutcome {
     if let Some(selector) = payload.selector.as_deref() {
+        // An ambiguity check belongs here -- a generic selector like
+        // `role:Window|name:"Untitled - Notepad"` can match several real
+        // windows, and silently taking the first is how a run reported
+        // "Completed, 12/12 succeeded" while typing into the wrong one.
+        //
+        // It was implemented and removed. Counting with `Locator::all()` on a
+        // `process:`-scoped selector does not work: measured, it returns every
+        // top-level window of that process and ignores the role and name
+        // entirely, so a browser with three windows reports three matches for
+        // any selector. Failing on that would break working playbooks.
+        // See docs/known-issues/replay-window-selector-ambiguity.md.
         match desktop.locator(selector).first(Some(LOCATE_TIMEOUT)).await {
             Ok(window) => {
                 return match window.activate_window() {
@@ -509,6 +569,58 @@ mod tests {
         assert_eq!(p.selector.as_deref(), Some("role:Edit|name:Password"));
         assert_eq!(p.target_name.as_deref(), Some("Password"));
         assert_eq!(p.text.as_deref(), Some("[REDACTED]"));
+    }
+
+    #[test]
+    fn a_process_name_produces_a_scoped_selector() {
+        let raw = r#"{"app":"Untitled - Notepad","process":"notepad.exe",
+                      "target":{"name":"Untitled - Notepad","raw_role":"Window",
+                                "selector":"role:Window|name:Untitled - Notepad"}}"#;
+        let p = parse_payload(raw);
+
+        assert_eq!(p.process.as_deref(), Some("notepad.exe"));
+        assert_eq!(
+            p.scoped_selector().as_deref(),
+            Some("process:notepad.exe|role:Window|name:Untitled - Notepad"),
+            "the scoped form is what Locator::all() will accept"
+        );
+    }
+
+    #[test]
+    fn an_old_playbook_without_a_process_name_cannot_be_scoped() {
+        // Recorded before the field existed. This must not error and must not
+        // invent a prefix -- it simply cannot be counted, and replay falls back
+        // to exactly the behaviour it had before this fix.
+        let raw = r#"{"app":"Untitled - Notepad",
+                      "target":{"name":"Untitled - Notepad","raw_role":"Window",
+                                "selector":"role:Window|name:Untitled - Notepad"}}"#;
+        let p = parse_payload(raw);
+
+        assert_eq!(p.process, None);
+        assert_eq!(p.scoped_selector(), None);
+        // The unscoped selector is untouched, so `first()` behaves as before.
+        assert_eq!(
+            p.selector.as_deref(),
+            Some("role:Window|name:Untitled - Notepad")
+        );
+    }
+
+    #[test]
+    fn a_blank_process_name_is_treated_as_absent() {
+        // An empty string would build `process:|role:Window|...`, which is not
+        // a scoping at all. Treated as missing rather than passed through.
+        let raw = r#"{"app":"x","process":"   ",
+                      "target":{"selector":"role:Window|name:x"}}"#;
+        let p = parse_payload(raw);
+        assert_eq!(p.scoped_selector(), None);
+    }
+
+    #[test]
+    fn a_step_with_no_selector_cannot_be_scoped_either() {
+        let raw = r#"{"app":"x","process":"notepad.exe","target":{}}"#;
+        let p = parse_payload(raw);
+        assert_eq!(p.selector, None);
+        assert_eq!(p.scoped_selector(), None);
     }
 
     #[test]

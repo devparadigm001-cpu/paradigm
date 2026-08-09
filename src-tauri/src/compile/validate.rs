@@ -148,6 +148,7 @@ mod tests {
         s.admit(ActionCandidate {
             kind: ActionKind::Click,
             identifiers: vec!["app.exe".into()],
+            process_name: None,
             element_role: Some("Button".into()),
             element_name: Some("Go".into()),
             payload: None,

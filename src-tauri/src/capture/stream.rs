@@ -50,6 +50,14 @@ pub struct ActionCandidate {
     /// Every identifier we have for the source application: process name,
     /// window title, UIA application name. All are checked.
     pub identifiers: Vec<String>,
+    /// The owning process's executable name, when the event reported one.
+    ///
+    /// Kept as its own field rather than left in `identifiers`, because
+    /// `identifiers` does not survive the gate: `admit` keeps only the first
+    /// non-empty entry as `source_app` and drops the rest. Replay needs this
+    /// specifically -- `Locator::all()` refuses a desktop-wide selector and
+    /// demands a `process:` prefix, so without it ambiguity cannot be counted.
+    pub process_name: Option<String>,
     pub element_role: Option<String>,
     pub element_name: Option<String>,
     /// Typed text and similar. Dropped, never stored, when excluded.
@@ -68,6 +76,10 @@ struct Gated;
 pub struct CapturedAction {
     pub kind: ActionKind,
     pub source_app: String,
+    /// Executable name of the owning process, when known. `source_app` is a
+    /// display string -- for a window switch it is the window TITLE -- and a
+    /// title changes as the user works. This is the stable half.
+    pub process_name: Option<String>,
     pub element_role: Option<String>,
     pub element_name: Option<String>,
     pub payload: Option<String>,
@@ -177,6 +189,7 @@ impl CapturedStream {
         self.actions.push(CapturedAction {
             kind: candidate.kind,
             source_app,
+            process_name: candidate.process_name,
             element_role: candidate.element_role,
             element_name: candidate.element_name,
             payload: candidate.payload,
@@ -213,6 +226,7 @@ mod tests {
         ActionCandidate {
             kind: ActionKind::Type,
             identifiers: vec![app.to_string()],
+            process_name: None,
             element_role: Some("Edit".into()),
             element_name: Some("field".into()),
             payload: Some(payload.to_string()),
