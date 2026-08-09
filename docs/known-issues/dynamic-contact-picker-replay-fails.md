@@ -108,6 +108,107 @@ tree. Where that assumption does not hold, a different addressing approach —
 positional, relational, or vision-based — may be required regardless of how many
 individual widget bugs are fixed.
 
+## That question was tested. The answer is: two separate bugs (2026-08-09)
+
+**Everything above this heading was an inference from two data points, and it
+said so.** It has now been tested directly, and the shared-root-cause framing
+does not survive. The category is real; the common mechanism is not.
+
+### The two general hypotheses, both refuted
+
+Tested on a controlled page (`text_capture_probe -- widgets`) where one property
+varies at a time — something the real sites cannot offer.
+
+**Hypothesis 1: ARIA roles map inconsistently to UIA roles, so selectors built
+from them are fragile by construction. REFUTED.**
+
+| Declared ARIA | UIA reports |
+|---|---|
+| `group` | `Group` |
+| `combobox` | `ComboBox` |
+| `grid` | `DataGrid` |
+| `gridcell` | `DataItem` |
+| `textbox` | `Edit` |
+| `listbox` | `List` |
+| `option` | `ListItem` |
+
+Every one is the standard documented mapping. This inverts the reading of the
+evidence: Gmail's `role:group` and Sheets' `combobox` are **faithful** records.
+Those sites really do declare a recipient field as a group and a cell as a
+combobox. Capture is not mistranslating anything — it is accurately recording an
+unhelpful choice made by the site.
+
+**Hypothesis 2: re-rendering replaces DOM nodes, invalidating element handles
+between capture and replay. REFUTED.**
+
+```
+  before        id=282054  text="original"
+  after mutate  id=282054  text="mutated"     (id same: true)
+  after replace id=282054  text="replaced"    (id same: true)
+```
+
+The UIA runtime id was **identical** after the node was destroyed and recreated
+via `innerHTML`, and re-resolving the selector found it. Re-rendering alone
+cannot explain an "element not found" at replay.
+
+(One incidental finding: the *held* handle then read `""` rather than erroring —
+stale but not dead, a silent wrong answer rather than a detectable failure. Same
+shape as the `Ok(0)` window handle and the swallowed `Err` recorded in
+`replay-window-selector-ambiguity.md`.)
+
+### Why the two bugs are structurally different
+
+With both general mechanisms gone, the failures stop resembling each other:
+
+| | Sheets | Gmail |
+|---|---|---|
+| Pipeline half | **capture** | **replay** |
+| The element | exists; is read wrongly | **does not exist** when needed |
+| Symptom | empty/garbled text, attribution drifting between cells | selector times out at 8s, not found |
+| Remaining explanation | async Name Box indirection, canvas-rendered cells | the picker is not rendered until compose is open and focused |
+
+Sheets is a **timing-and-indirection** problem while the element is present.
+Gmail is an **existence** problem. If the picker only renders once compose is
+open, the selector failing is not an accessibility defect at all — it is replay
+failing to reproduce the precondition that creates the widget. That needs no
+shared mechanism to explain, and the Gmail doc listed the possibility from the
+start without eliminating it.
+
+### The one thing they do share, and what it is not
+
+Both captured a **container** role rather than an editable leaf:
+`role:group|name:"To - Select contacts"`, and `combobox` cells. In both, the
+element the user interacts with, the element holding the value, and the element
+holding the identity are three different things — capture records the wrapper the
+click event names.
+
+That is a genuine structural pattern, and plausibly a general weakness. But it
+explains **neither** failure: it would not produce "not found", and it would not
+produce garbled text. Recorded as an observation worth revisiting, not as the
+unifying cause.
+
+### Recommendation
+
+**Treat these as two independent bugs, each already documented, and do not build
+a unified "complex widget" strategy for them.** A general fix would be machinery
+for a general problem, and the evidence does not support one existing. Each doc's
+own next steps remain the right work.
+
+What survives as genuinely useful is the pair of negative results above. Both
+were plausible, both were load-bearing for the "different addressing approach"
+argument, and both are now closed with measurements rather than left as open
+suspicions.
+
+**Confidence: moderate, not high.** Two mechanisms are refuted and the failure
+shapes clearly differ, but the remaining site-specific explanations were not
+themselves confirmed against the live sites. The single check that would most
+change this verdict: **does Gmail's picker exist at replay time?** If it does,
+and the selector still fails, Gmail moves back into the same family as Sheets.
+
+The category lesson is unaffected and still worth keeping: every one of these was
+found by a human on a real application, never by a probe. That is a
+testing-coverage gap, not a mechanism.
+
 ## Secondary observation: `"est"` for `"Test"`
 
 The same session captured the Subject field's payload as `"est"` where `"Test"`

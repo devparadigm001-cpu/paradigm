@@ -114,6 +114,40 @@ only as corroboration; see that doc for the issue itself.
 Note that doc currently exists on the `frontend-dev` branch only, so the link
 above will not resolve from `backend-dev` until the branches meet.
 
+## Not the same bug as the Gmail picker (tested 2026-08-09)
+
+These findings and the Gmail recipient picker
+(`dynamic-contact-picker-replay-fails.md`) were grouped as instances of one
+problem — "dynamic JS-rendered widgets do not present stable accessibility
+elements". **That was an inference from two data points, never tested. It has
+now been tested directly and does not hold.**
+
+Two general mechanisms were proposed and both were refuted on a controlled page
+(`text_capture_probe -- widgets`):
+
+* **ARIA roles map inconsistently to UIA roles** — refuted. `group`→`Group`,
+  `combobox`→`ComboBox`, `gridcell`→`DataItem` and the rest are all the standard
+  documented mappings. Which inverts the reading: a Sheets cell reporting
+  `combobox` is capture *faithfully* recording what Sheets declares, not a
+  translation fault.
+* **Re-rendering invalidates element handles** — refuted. A node destroyed and
+  recreated via `innerHTML` kept the same UIA runtime id (`282054`), and
+  re-resolution found it.
+
+With those gone, the two bugs stop resembling each other. Sheets is a
+**capture-time misread**: the element is present, and the text or the cell
+attribution is wrong. Gmail is a **replay-time not-found**: the element is
+absent when needed, most likely because the picker is not rendered until compose
+is open.
+
+**Recommendation: treat this as an independent bug and fix it on its own terms.**
+The next steps below are the right work; no unified "complex widget" strategy is
+warranted, because the evidence for a common mechanism did not survive testing.
+
+Full analysis, including the one structural property the two do share and why it
+explains neither failure, is in `dynamic-contact-picker-replay-fails.md` under
+"That question was tested".
+
 ## Why it matters
 
 Spreadsheet data entry is close to the archetypal task this product automates:
@@ -158,8 +192,10 @@ immediately. Probe coverage has been measuring the environment it was built for.
       two problems until shown otherwise.
 - [ ] **Test a second complex grid** — Excel Online, or any non-Sheets
       virtualized data grid — to establish how much of this is Sheets-specific
-      versus general to grid UIs. This determines whether the fix is a
-      special case or a category.
+      versus general to grid UIs. Still worth doing, but note the scope has
+      narrowed: the cross-application "widget category" theory was tested and
+      refuted (see above), so this is now asking whether *grids* share a
+      mechanism, not whether all dynamic widgets do.
 - [ ] **Add a complex-grid target to routine probe coverage.** The gap that let
       both findings reach a human test is that nothing between the simple
       `<input>` probes and a live user session ever exercised one.

@@ -1437,6 +1437,235 @@ async fn windowid_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// --------------------------------------------------------- widgets mode ----
+//
+// Tests the MECHANISMS that Sheets and Gmail were speculated to share, on a
+// controlled page where one thing varies at a time. The real sites can only
+// show correlation; this can show causation.
+//
+// Two candidate mechanisms, from the two known-issue docs:
+//
+//   A. ARIA roles map inconsistently to UIA roles. Gmail's recipient field is
+//      `role:group`; a Sheets cell is `combobox`. If ARIA roles surface in UIA
+//      in surprising ways, selectors built from them are fragile by
+//      construction.
+//
+//   B. Re-rendering replaces DOM nodes rather than mutating them, invalidating
+//      element handles between capture and replay. This would explain Gmail's
+//      "element not found" on a selector that captured fine.
+//
+// Neither has been tested. Both are testable here.
+
+const WIDGET_PAGE: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Widget Mechanism Probe</title></head>
+<body style="font-family:sans-serif;padding:1.5rem">
+<h2>Widget mechanism probe</h2>
+
+<h3>A. ARIA roles, as UIA sees them</h3>
+<div role="group" aria-label="AriaGroup" style="border:1px solid #999;padding:.4rem">
+  <input aria-label="InsideGroup" style="width:16rem">
+</div><br>
+<div role="combobox" aria-label="AriaCombobox" contenteditable="true"
+     style="border:1px solid #999;padding:.4rem;width:16rem">cell text</div><br>
+<div role="grid" aria-label="AriaGrid" style="border:1px solid #999;padding:.4rem">
+  <div role="row"><div role="gridcell" aria-label="AriaGridCell"
+       contenteditable="true" style="border:1px solid #ccc;width:10rem">A1</div></div>
+</div><br>
+<div role="textbox" aria-label="AriaTextbox" contenteditable="true"
+     style="border:1px solid #999;padding:.4rem;width:16rem">textbox text</div><br>
+<div role="listbox" aria-label="AriaListbox" style="border:1px solid #999;padding:.4rem">
+  <div role="option" aria-label="AriaOption">an option</div>
+</div>
+
+<h3>B. Identity across a re-render</h3>
+<div id="host"><input id="target" aria-label="StableTarget" value="original" style="width:16rem"></div>
+<button aria-label="MutateBtn" onclick="document.getElementById('target').value='mutated'">Mutate in place</button>
+<button aria-label="ReplaceBtn" onclick="
+  var h=document.getElementById('host');
+  h.innerHTML='<input id=\'target\' aria-label=\'StableTarget\' value=\'replaced\' style=\'width:16rem\'>';
+">Replace the node</button>
+</body></html>
+"#;
+
+async fn widgets_mode() -> ExitCode {
+    println!("== widget mechanism probe ==\n");
+    println!("Controlled test of the two mechanisms Sheets and Gmail were");
+    println!("speculated to share. Local page only -- no accounts, no real data.\n");
+
+    let page = std::env::temp_dir().join("paradigm-widget-probe.html");
+    if let Err(e) = std::fs::write(&page, WIDGET_PAGE) {
+        eprintln!("could not write probe page: {e}");
+        return ExitCode::FAILURE;
+    }
+    let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+    for browser in browser_order() {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, &url])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("waiting 10s for the browser...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // ---- A. what UIA role does each ARIA role surface as? -----------------
+    println!("\n================ A. ARIA -> UIA ROLE MAPPING ================\n");
+    println!("  Looking each element up by NAME under several candidate roles,");
+    println!("  so the ARIA role it was declared with can be compared against");
+    println!("  the role UIA actually reports.\n");
+
+    for (aria, name) in [
+        ("group", "AriaGroup"),
+        ("combobox", "AriaCombobox"),
+        ("grid", "AriaGrid"),
+        ("gridcell", "AriaGridCell"),
+        ("textbox", "AriaTextbox"),
+        ("listbox", "AriaListbox"),
+        ("option", "AriaOption"),
+    ] {
+        println!("  declared aria role={aria:?}, aria-label={name:?}");
+        let mut found = false;
+        for probe_role in [
+            "Group", "ComboBox", "Edit", "Document", "Text", "DataGrid", "DataItem",
+            "List", "ListItem", "Custom", "Pane",
+        ] {
+            let selector = format!("role:{probe_role}|name:{name}");
+            if let Ok(el) = desktop
+                .locator(selector.as_str())
+                .first(Some(Duration::from_millis(700)))
+                .await
+            {
+                println!(
+                    "      MATCHED as role:{probe_role:<10} (UIA reports role={:?})",
+                    el.role()
+                );
+                found = true;
+            }
+        }
+        if !found {
+            println!("      no candidate role matched -- UIA may not expose it at all");
+        }
+    }
+
+    // ---- B. does identity survive a re-render? ----------------------------
+    println!("\n================ B. IDENTITY ACROSS A RE-RENDER ================\n");
+
+    let target_sel = "role:Edit|name:StableTarget";
+    let before = desktop
+        .locator(target_sel)
+        .first(Some(Duration::from_secs(5)))
+        .await;
+    let (before_id, before_handle) = match &before {
+        Ok(el) => {
+            println!("  before      id={:?} text={:?}", el.id(), el.text(0).ok());
+            (el.id(), Some(el.clone()))
+        }
+        Err(e) => {
+            eprintln!("  could not find the target at all: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Mutating in place: the DOM node survives.
+    println!("\n  -- clicking 'Mutate in place' (node survives) --");
+    if let Ok(b) = desktop
+        .locator("role:Button|name:MutateBtn")
+        .first(Some(Duration::from_secs(5)))
+        .await
+    {
+        robust_click(&desktop, &b);
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let after_mutate = desktop
+        .locator(target_sel)
+        .first(Some(Duration::from_secs(5)))
+        .await;
+    match &after_mutate {
+        Ok(el) => println!(
+            "  after mutate id={:?} text={:?}   (id same as before: {})",
+            el.id(),
+            el.text(0).ok(),
+            el.id() == before_id
+        ),
+        Err(e) => println!("  after mutate NOT FOUND: {e}"),
+    }
+    if let Some(h) = &before_handle {
+        println!(
+            "  the ORIGINAL handle still reads: {:?}",
+            h.text(0).map_err(|e| e.to_string())
+        );
+    }
+
+    // Replacing the node: the DOM node is destroyed and recreated.
+    println!("\n  -- clicking 'Replace the node' (node destroyed + recreated) --");
+    if let Ok(b) = desktop
+        .locator("role:Button|name:ReplaceBtn")
+        .first(Some(Duration::from_secs(5)))
+        .await
+    {
+        robust_click(&desktop, &b);
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let after_replace = desktop
+        .locator(target_sel)
+        .first(Some(Duration::from_secs(5)))
+        .await;
+    let after_replace_id = match &after_replace {
+        Ok(el) => {
+            println!(
+                "  after replace id={:?} text={:?}   (id same as before: {})",
+                el.id(),
+                el.text(0).ok(),
+                el.id() == before_id
+            );
+            el.id()
+        }
+        Err(e) => {
+            println!("  after replace NOT FOUND: {e}");
+            None
+        }
+    };
+    if let Some(h) = &before_handle {
+        match h.text(0) {
+            Ok(t) => println!("  the ORIGINAL handle STILL reads: {t:?} (handle survived)"),
+            Err(e) => println!("  the ORIGINAL handle is now DEAD: {e}"),
+        }
+    }
+
+    println!("\n--- what B decides ---");
+    match (before_id.as_deref(), after_replace_id.as_deref()) {
+        (Some(a), Some(b)) if a == b => println!(
+            "  Element id is STABLE across a DOM replacement ({a}).\n  \
+             Handle invalidation is NOT the mechanism -- re-resolution finds the\n  \
+             same identity even after the node is destroyed."
+        ),
+        (Some(a), Some(b)) => println!(
+            "  Element id CHANGED across a DOM replacement: {a} -> {b}.\n  \
+             A selector re-resolved after a re-render addresses a DIFFERENT\n  \
+             element identity, which is a real candidate mechanism."
+        ),
+        (_, None) => println!(
+            "  The element could not be re-resolved after replacement at all --\n  \
+             the strongest form of the mechanism."
+        ),
+        _ => println!("  inconclusive: ids unavailable"),
+    }
+
+    ExitCode::SUCCESS
+}
+
 // -------------------------------------------------------- procname mode ----
 //
 // Layer 1 verification for the process-name plumbing: does a real driven
@@ -1526,10 +1755,7 @@ async fn procname_mode() -> ExitCode {
 
     println!("\n================ RESULTS ================");
     println!("captured {} action(s)\n", report.actions.len());
-    println!(
-        "  {:<9} {:<28} {}",
-        "kind", "process_name", "source_app (for contrast)"
-    );
+    println!("  {:<9} {:<28} source_app (for contrast)", "kind", "process_name");
     println!("  {}", "-".repeat(92));
     for a in &report.actions {
         println!(
@@ -1697,6 +1923,9 @@ async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "widgets") {
+        return widgets_mode().await;
+    }
     if std::env::args().any(|a| a == "procname") {
         return procname_mode().await;
     }
