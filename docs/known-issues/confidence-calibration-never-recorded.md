@@ -1,8 +1,12 @@
 # Calibration: no confidence samples are ever recorded in production
 
-**Status:** confirmed by direct inspection of the real on-device database.
-**Root cause identified** — the recording call is simply absent from the product
-code path. Not fixed.
+**Status: FIXED** (2026-08-08, commit `0e1012f`). Calibration samples are now
+recorded from the real labelling path. The everything-below describes the
+original finding; see "The fix" for what changed and "Still open, and correctly
+so" for the one part deliberately left for Phase 2.
+**Originally:** confirmed by direct inspection of the real on-device database.
+**Root cause identified** — the recording call was simply absent from the
+product code path.
 **Affected:** `confidence_calibration` (migration 20260803000003),
 `src/labeling/calibration.rs`, `src/commands.rs::compile_and_store_playbook`.
 **Found:** 2026-08-05, during Phase 1 Step 13 (confirm calibration data
@@ -125,6 +129,75 @@ not produce samples from user-named saves.** Any test of the fix must exercise
 the auto-label path, and whoever plans Phase 2 should know that samples
 accumulate only from sessions the user does not name.
 
+## The fix (2026-08-08, commit `0e1012f`)
+
+`compile_and_store_playbook` builds a `CalibrationSample::from_outcome` after
+`engine.label()` returns and records it against the connection already in
+scope — the real database, not a temp path. The labelling branch returns the
+sample as a third element, because `outcome` was previously consumed by
+`(outcome.label, true)`.
+
+```rust
+if let Some(sample) = &calibration_sample {
+    if let Err(e) = calibration::record(&mut conn, sample) {
+        eprintln!("[paradigm] calibration sample not recorded: {e}");
+    }
+}
+```
+
+Two decisions, both commented at the call site:
+
+* **Recorded before `store::store`**, so a store failure does not discard an
+  observation that is already valid. The model ran either way — the sample is
+  about the model, not about whether this playbook was saved.
+* **A recording failure is logged and dropped, never propagated.** Refusing to
+  save a user's recording because a statistics row could not be written would
+  trade something they care about for something they have never heard of.
+
+### Verification
+
+Three tests in `tests/ipc_commands.rs`, which went from 12 to 15 tests:
+
+| Test | What it establishes |
+|---|---|
+| `model_labelling_records_a_calibration_sample` | An empty name hint routes through the model and a real row appears. Reads the row back rather than counting it: non-blank `model_source`, bin bounds a sane half-open tenth inside `0..=1`, `sample_count` exactly 1, `success_count` in range, and `normalized_score` still NULL |
+| `supplying_a_name_records_no_calibration_sample` | A caller-supplied name records nothing, asserted explicitly rather than left as an absence someone might notice |
+| `a_calibration_failure_does_not_prevent_saving_the_playbook` | **The adversarial one.** Drops `confidence_calibration` so `record` genuinely fails, then confirms the playbook still saves — verified by finding it in `list_playbooks`, not by trusting the command's own report |
+
+The third is the one that matters most for the design decision above. Without
+it, "calibration failure must not block a save" would be a comment rather than a
+behaviour anything checks.
+
+Suite at the time of the fix: 76 lib, 8 `db_encryption`, 15 `ipc_commands`, 2
+`replay_aborted` passing. `ipc_pipeline` remains deliberately red on the
+unrelated no-settle race. Clippy clean on both changed files.
+
+The `normalized_score IS NULL` assertion deserves a note: it is not incidental.
+Phase 1 records raw observations only, and that test will fail the moment
+something starts populating the normalised column early.
+
+## Still open, and correctly so: nothing reads the data back
+
+Samples now accumulate. **Nothing consumes them yet** —
+`calibration::bins_for` exists, is tested, and has no caller in product code.
+
+**This is not a new defect.** It is the division of labour the schema was
+designed around: migration `20260803000003` comments `normalized_score` as
+"Written by Phase 2's calibration pass. NULL = not yet calibrated." Phase 1's
+job is to collect honest raw observations; turning them into a calibrated
+mapping is explicitly Phase 2's.
+
+So the correct reading is that the collection half is done and the consumption
+half is scheduled, not missing. The thing that *was* wrong — samples never being
+collected at all, so Phase 2 would arrive to an empty table — is fixed.
+
+One consequence worth stating plainly for whoever builds Phase 2: samples only
+ever accumulate from sessions the user does **not** name, because a supplied
+name means no model runs and there is no confidence score to calibrate. That is
+correct behaviour, but it means the sample rate is a function of user naming
+habits rather than of session count, and the table will fill more slowly than a
+count of recordings would suggest.
+
 ## Why it matters
 
 Phase 2's job is to turn the model's raw self-reported confidence into a
@@ -145,18 +218,22 @@ call site, plus a test that the row lands.
 
 ## Next steps
 
-1. **Wire it.** Record a `CalibrationSample::from_outcome(&outcome)` after
-   `engine.label(...)` in `compile_and_store_playbook`. Decide deliberately
-   whether a failure to record is logged-and-ignored or surfaced — a
-   calibration write failing should almost certainly not fail the user's save.
-2. **Test it against a real path**, not a probe. The existing IPC tests seed
-   `pending_actions` and pass a `nameHint`, which skips labeling entirely; a
-   test for this must omit the hint so the model branch runs.
+1. ~~**Wire it.**~~ **Done** — commit `0e1012f`, see "The fix". Failure is
+   logged and dropped, deliberately.
+2. ~~**Test it against a real path**, not a probe.~~ **Done** — three tests in
+   `tests/ipc_commands.rs` driving the real IPC command, including one that
+   drops the table to prove a calibration failure cannot block a save.
 3. **Check the other candidate producers.** Chat Mode intent parsing and form
    Q&A generation (Phase 2) will produce `LabelOutcome`-shaped confidence too.
    Wiring one call site now is right, but the recording point should be somewhere
    every future model call can reach rather than copied per command.
-4. **Re-verify with `cargo run --example calibration_dump -- <app_data_dir>`**
-   after the fix, against the real store, and confirm rows appear with
-   `normalized_score` still NULL — Phase 1 records raw observations only;
-   populating `normalized_score` is Phase 2's calibration pass.
+4. **Re-verify against the real store**, with
+   `cargo run --example calibration_dump -- <app_data_dir>`, once a real session
+   has been saved *without* a name. The tests prove the wiring against a scratch
+   database; this would confirm it on the on-device one. Not yet done — the
+   table was last dumped before the fix.
+5. **Consider whether Phase 2 needs a faster sample rate.** Samples only accrue
+   from unnamed sessions (see "Still open"), so the table fills as a function of
+   naming habits rather than usage. If that proves too slow, the options are to
+   record confidence from other model calls (item 3) or to reconsider the
+   assumption that a supplied name means nothing worth calibrating.
