@@ -456,6 +456,149 @@ fn deleting_an_unknown_playbook_reports_an_error_over_ipc() {
     );
 }
 
+// ------------------------------------------------- calibration recording ----
+//
+// `confidence_calibration` accumulated nothing from real use because
+// `calibration::record` had one caller, in a probe writing to a temp directory.
+// These cover the wiring into the real command path.
+
+fn calibration_rows(app: &App<MockRuntime>) -> i64 {
+    let state = app.state::<AppState>();
+    let conn = state.db.blocking_lock();
+    conn.query_row("SELECT COUNT(*) FROM confidence_calibration", [], |r| {
+        r.get(0)
+    })
+    .expect("count calibration rows")
+}
+
+#[test]
+fn model_labelling_records_a_calibration_sample() {
+    // An empty name hint is what routes through the local model, and the model
+    // running is the only thing that produces a confidence score to calibrate.
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+    seed_pending(&app, &["alpha", "bravo"]);
+
+    assert_eq!(calibration_rows(&app), 0, "should start empty");
+
+    let info = match compile(&webview, "", None) {
+        Ok(i) => i,
+        Err(e) => {
+            // The local model must be present for this to mean anything. Fail
+            // loudly rather than passing vacuously.
+            panic!("compile with model labelling failed: {e}");
+        }
+    };
+
+    assert_eq!(
+        info["label_generated"], true,
+        "the model should have named this playbook"
+    );
+    assert!(
+        calibration_rows(&app) > 0,
+        "the model ran but no calibration sample was recorded"
+    );
+
+    // A row existing is not enough -- check it carries real values, so a
+    // degenerate write would not pass this.
+    let state = app.state::<AppState>();
+    let conn = state.db.blocking_lock();
+    let (model, min, max, samples, success, normalized): (
+        String,
+        f64,
+        f64,
+        i64,
+        i64,
+        Option<f64>,
+    ) = conn
+        .query_row(
+            "SELECT model_source, raw_score_min, raw_score_max, sample_count,
+                    success_count, normalized_score
+               FROM confidence_calibration",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .expect("read the calibration row back");
+
+    assert!(!model.trim().is_empty(), "model_source is blank");
+    assert!(
+        (0.0..=1.0).contains(&min) && (0.0..=1.0).contains(&max) && min < max,
+        "bin bounds are not a sane half-open tenth: [{min}, {max})"
+    );
+    assert_eq!(samples, 1, "one save should record exactly one sample");
+    assert!(
+        success == 0 || success == 1,
+        "success_count out of range: {success}"
+    );
+    assert!(
+        normalized.is_none(),
+        "normalized_score should stay NULL -- populating it is Phase 2's job"
+    );
+}
+
+#[test]
+fn supplying_a_name_records_no_calibration_sample() {
+    // Explicitly asserted rather than left as an absence someone might notice:
+    // with a caller-supplied name no model runs, so there is nothing to
+    // calibrate. Samples only ever come from unnamed sessions.
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+    seed_pending(&app, &["alpha"]);
+
+    let info = compile(&webview, "Named By Hand", None).expect("compile");
+
+    assert_eq!(info["label_generated"], false, "no model should have run");
+    assert_eq!(
+        calibration_rows(&app),
+        0,
+        "a calibration row appeared without the model having run"
+    );
+}
+
+#[test]
+fn a_calibration_failure_does_not_prevent_saving_the_playbook() {
+    // Calibration is bookkeeping. Refusing to save a user's recording because a
+    // statistics row could not be written would trade something they care about
+    // for something they have never heard of.
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+    seed_pending(&app, &["alpha", "bravo"]);
+
+    // Remove the table so `calibration::record` genuinely fails.
+    {
+        let state = app.state::<AppState>();
+        let conn = state.db.blocking_lock();
+        conn.execute("DROP TABLE confidence_calibration", [])
+            .expect("drop the calibration table");
+    }
+
+    let info = compile(&webview, "", None)
+        .expect("the playbook must still save when calibration recording fails");
+    let id = info["playbook_id"].as_str().expect("playbook_id").to_string();
+
+    // And it really is stored, not merely reported.
+    let list = invoke(&webview, "list_playbooks", InvokeBody::default())
+        .expect("list_playbooks")
+        .deserialize::<serde_json::Value>()
+        .expect("deserialize list");
+    assert!(
+        list.as_array()
+            .expect("array")
+            .iter()
+            .any(|p| p["id"] == id.as_str()),
+        "the playbook was reported saved but is not in the list: {list}"
+    );
+}
+
 #[test]
 fn unregistered_command_is_rejected() {
     // Without this, the tests above could pass against a harness that never
