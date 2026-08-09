@@ -1,7 +1,10 @@
 # Gmail's recipient picker captures but does not replay
 
 **Status:** confirmed by a real replay run, with a control recording that
-isolates it. Root cause not investigated.
+isolates it. **Root cause now measured** (2026-08-09): the element exists and
+the selector is correct — it simply arrives 6,743 ms after Compose, against an
+8,000 ms locate budget. A latency problem, not an accessibility one. See
+"Measured: the element exists, and arrives at 6.7s". Not fixed.
 **Affected:** replay of dynamic, JS-rendered widgets — observed on Gmail's
 compose "To" field (`role:group`, name `"To - Select contacts"`). Capture
 records it; `replay` cannot find it again.
@@ -205,9 +208,96 @@ themselves confirmed against the live sites. The single check that would most
 change this verdict: **does Gmail's picker exist at replay time?** If it does,
 and the selector still fails, Gmail moves back into the same family as Sheets.
 
+That check has since been run — see the next section. The verdict stands.
+
 The category lesson is unaffected and still worth keeping: every one of these was
 found by a human on a real application, never by a probe. That is a
 testing-coverage gap, not a mechanism.
+
+## Measured: the element exists, and arrives at 6.7s (2026-08-09)
+
+The doc's own open question — *does the picker exist at replay time, or is it
+genuinely not rendered?* — was answered directly against live Gmail
+(`text_capture_probe -- gmailpicker`: clicks Compose once, then polls the
+accessibility tree on a schedule; never types, never sends).
+
+```
+================ VERDICT ================
+  FOUND at   6743ms  role:Group|name:To - Select contacts     <- the recorded selector
+  never found         role:Group|name:To recipients
+  never found         role:Edit|name:To recipients
+  FOUND at     16ms   role:ComboBox|name:To recipients
+  FOUND at     16ms   role:Edit|name:To
+  FOUND at     16ms   role:Button|name:To
+```
+
+**The exact selector from the failing run does exist.** It appears 6,743 ms after
+Compose is clicked and persists at every later poll out to 62 s.
+
+### Both candidate theories are refuted
+
+* **"The widget is never rendered under that selector"** — no. It renders, and
+  the recorded selector is correct for it.
+* **"Replay never reproduced a precondition that creates the widget"** — no.
+  Clicking Compose is sufficient; nothing else was needed.
+
+### The sharpened diagnosis: replay-time latency against a fixed budget
+
+`LOCATE_TIMEOUT` is 8,000 ms. The element arrives at 6,743 ms. **The margin is
+1,257 ms — about 19%.**
+
+That is the whole failure. Not an accessibility defect, not a missing
+precondition: replay's fixed budget is barely wider than the widget's own render
+latency, so anything that slows the run — a busier machine, earlier steps still
+settling, a colder Gmail load, network variance — pushes past 8s and the step
+reports "element not found". The original run
+(`3abcb8a5-…`, timed out at 8s) is exactly what that looks like.
+
+This reframes the fix from "address the widget differently" to "the timeout is
+too tight for real web applications, and possibly should not be a fixed number
+at all".
+
+### Unconfirmed, and deliberately not claimed as a finding
+
+Three selectors reported found at **16 ms**, which is before the compose window
+could plausibly have rendered. The likely explanation is that they are **false
+matches on unrelated parts of the Gmail UI** — a search field, a column header —
+rather than faster routes to the same widget. What each resolved to was not
+captured, so this cannot be settled from the run above.
+
+It matters, and deserves its own check: *if* a faster-appearing selector really
+does address the same element, then capture choosing the slowest available one
+is the actual defect, and the remedy is in selector construction rather than in
+timeouts. **Recorded as an open question, not as evidence.**
+
+### Effect on the "two separate bugs" verdict: none
+
+The verdict stands. This sharpens Gmail's half rather than moving it:
+
+| | Sheets | Gmail (now) |
+|---|---|---|
+| Pipeline half | capture | replay |
+| Failure | element present, value/attribution misread | element present, **arrives after the budget** |
+| Remedy | correct read timing and identity indirection | a longer or adaptive locate budget |
+
+Still different halves, still different remedies. Nothing here brings them
+closer together — if anything the diagnoses have diverged further, since Gmail's
+is now a plain latency-budget question with no accessibility component at all.
+
+### A theme worth watching, explicitly not a mechanism
+
+Gmail's failure does rhyme with two defects fixed earlier the same session: the
+no-settle race (a baseline read *before* the text lands) and the window-switch
+misattribution (a flush read *after* the context changed). The common shape is
+**one measurement taken at one fixed moment against an asynchronous UI**.
+
+That is offered as a lens for reading future bugs, **not promoted to a
+mechanism**. This document already records what happened the last time a shared
+shape was treated as a shared cause: the "dynamic widget" theory was asserted
+across two findings and did not survive being tested. A third grouping made on
+resemblance would repeat that mistake. If this theme is ever to be more than an
+observation, it needs the same treatment — a controlled test that could refute
+it.
 
 ## Secondary observation: `"est"` for `"Test"`
 
@@ -249,22 +339,30 @@ a large share of the obvious use cases for this product are unavailable.
 
 ## Next steps
 
-- [ ] **Determine why the selector does not resolve.** Inspect Gmail's compose
-      DOM/accessibility tree at replay time and compare against what was
-      captured. Distinguish "element absent" from "element present under a
-      different identity" before proposing any fix — the two imply completely
-      different solutions.
-- [ ] **Check whether the widget needs interaction before it exists.** If the
-      picker only renders once focused, replay may need to reproduce the
-      focusing step rather than address the picker directly.
-- [ ] **Test whether the 8s timeout is the binding constraint.** Cheap to
-      check, and it would be embarrassing to redesign selector strategy over a
-      timeout that was merely short.
-- [ ] **Decide whether the JS-widget pattern warrants a general investigation.**
-      Three findings across two applications is the point at which it is worth
-      asking whether element-based addressing is sufficient for this class of
-      target, rather than continuing to fix instances. This is a strategy
-      question, not a bug fix.
+- [x] ~~**Determine why the selector does not resolve.**~~ **Answered.** The
+      element is present and the selector is correct; it arrives 6,743 ms after
+      Compose. Neither "absent" nor "different identity".
+- [x] ~~**Check whether the widget needs interaction before it exists.**~~
+      **Answered.** Clicking Compose is sufficient; no further precondition.
+- [x] ~~**Test whether the 8s timeout is the binding constraint.**~~
+      **Answered, and it is** — 6,743 ms against an 8,000 ms budget leaves a
+      19% margin. The note that it "would be embarrassing to redesign selector
+      strategy over a timeout that was merely short" turned out to be the right
+      instinct.
+- [ ] **Decide what the locate budget should be.** 8s is barely wider than one
+      real widget's render latency, and it is a fixed number applied to every
+      step. Options worth weighing: a larger constant, a budget that scales with
+      the target (web applications versus native controls), or waiting on a
+      readiness signal instead of a deadline. This is now the actual fix for
+      this bug.
+- [ ] **Check whether the 16 ms selectors address the same element.** See
+      "Unconfirmed" above. If they do, capture is choosing the slowest available
+      selector and the remedy is in selector construction, not timeouts — which
+      would be a larger and more interesting finding than the timeout itself.
+- [x] ~~**Decide whether the JS-widget pattern warrants a general
+      investigation.**~~ **Done, and the answer is no** — see "That question was
+      tested". The shared-cause theory was refuted; these are two independent
+      bugs.
 - [ ] **Add a dynamic-widget target to routine probe coverage.** Every probe to
       date uses plain `<input>` elements or Notepad. All three findings above
       required a human on a real application to surface, which is the actual

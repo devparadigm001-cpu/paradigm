@@ -1437,6 +1437,166 @@ async fn windowid_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ----------------------------------------------------- gmailpicker mode ----
+//
+// Answers one question from docs/known-issues/dynamic-contact-picker-replay-fails.md:
+// does `role:group|name:"To - Select contacts"` EXIST when replay looks for it,
+// or was the widget genuinely not rendered?
+//
+// Run 7b99fae2 timed out after 8s with "element not found". The untested theory
+// is that the picker only appears once compose is open and settled, making this
+// a timing/sequencing problem rather than an accessibility defect.
+//
+// ## Safety
+//
+// This drives a REAL Gmail account. It is deliberately constrained:
+//
+//   * it clicks Compose, once, and nothing else;
+//   * it NEVER types, and never clicks anything whose name suggests Send,
+//     Discard, Delete, or Reply;
+//   * everything after the Compose click is read-only tree inspection.
+//
+// Side effect: one empty draft. It aborts rather than guessing if Gmail does not
+// look loaded, so a login page cannot be clicked at blindly.
+
+/// Selectors to poll. The first is the one the failing recording actually
+/// stored; the rest are plausible alternatives, so "the selector was wrong" can
+/// be distinguished from "the element was not there".
+const PICKER_SELECTORS: &[&str] = &[
+    "role:Group|name:To - Select contacts",
+    "role:Group|name:To recipients",
+    "role:Edit|name:To recipients",
+    "role:ComboBox|name:To recipients",
+    "role:Edit|name:To",
+    "role:Button|name:To",
+];
+
+async fn gmailpicker_mode() -> ExitCode {
+    println!("== Gmail recipient picker: existence and timing ==\n");
+    println!("Clicks Compose ONCE, then only reads the accessibility tree.");
+    println!("Never types. Never clicks Send/Discard/Delete.");
+    println!("Side effect: one empty draft.\n");
+
+    for browser in browser_order() {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "https://mail.google.com/"])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("waiting 20s for Gmail to load...");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // GUARD: only proceed if this looks like a loaded mailbox. A login or
+    // consent page must abort rather than be clicked at.
+    let compose = match desktop
+        .locator("role:Button|name:Compose")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "no Compose button found ({e}).\n\
+                 Gmail may not be loaded or signed in. Aborting rather than \
+                 clicking blindly at an unknown page."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("found Compose; clicking it once\n");
+
+    let opened_at = std::time::Instant::now();
+    robust_click(&desktop, &compose);
+
+    // Poll each selector on a schedule. `first()` with a short timeout is used
+    // deliberately: a long timeout would hide WHEN the element appeared.
+    let schedule_ms = [0u64, 500, 1000, 2000, 3000, 5000, 8000, 12000, 20000, 30000];
+    let mut first_seen: Vec<Option<u64>> = vec![None; PICKER_SELECTORS.len()];
+
+    println!("  elapsed   selector                                    found");
+    println!("  {}", "-".repeat(78));
+
+    for target in schedule_ms {
+        let now = opened_at.elapsed().as_millis() as u64;
+        if now < target {
+            tokio::time::sleep(Duration::from_millis(target - now)).await;
+        }
+        let elapsed = opened_at.elapsed().as_millis() as u64;
+
+        for (i, sel) in PICKER_SELECTORS.iter().enumerate() {
+            let hit = desktop
+                .locator(*sel)
+                .first(Some(Duration::from_millis(250)))
+                .await
+                .is_ok();
+            if hit && first_seen[i].is_none() {
+                first_seen[i] = Some(elapsed);
+            }
+            if hit {
+                println!("  {elapsed:>6}ms  {sel:<44} YES");
+            }
+        }
+    }
+
+    // If nothing matched, dump what IS present so a wrong selector can be told
+    // apart from a missing element.
+    let any_found = first_seen.iter().any(|f| f.is_some());
+    if !any_found {
+        println!("\n  none of the candidate selectors matched. What IS present:");
+        for role in ["Group", "Edit", "ComboBox", "Button", "List"] {
+            if let Ok(el) = desktop
+                .locator(format!("role:{role}").as_str())
+                .first(Some(Duration::from_secs(2)))
+                .await
+            {
+                println!("    role:{role:<10} -> name={:?}", el.name());
+            }
+        }
+    }
+
+    println!("\n================ VERDICT ================\n");
+    for (i, sel) in PICKER_SELECTORS.iter().enumerate() {
+        match first_seen[i] {
+            Some(ms) => println!("  FOUND at {ms:>6}ms  {sel}"),
+            None => println!("  never found     {sel}"),
+        }
+    }
+
+    let recorded = first_seen[0];
+    println!("\n--- answering the doc's question ---");
+    match recorded {
+        Some(ms) if ms <= 8000 => println!(
+            "  The recorded selector DOES exist, first seen {ms}ms after Compose.\n  \
+             That is inside the 8s LOCATE_TIMEOUT, so the original failure is NOT\n  \
+             explained by the element being absent -- something else went wrong."
+        ),
+        Some(ms) => println!(
+            "  The recorded selector exists but only after {ms}ms, which is BEYOND\n  \
+             the 8s LOCATE_TIMEOUT. A timing problem: replay gave up too early."
+        ),
+        None => println!(
+            "  The recorded selector NEVER appeared, even after 30s.\n  \
+             So the failure is not replay being impatient. Either the selector is\n  \
+             wrong for this UI, or the picker needs a precondition beyond opening\n  \
+             compose that replay never reproduced."
+        ),
+    }
+
+    println!("\n  (an empty draft was created; nothing was typed or sent)");
+    ExitCode::SUCCESS
+}
+
 // --------------------------------------------------------- widgets mode ----
 //
 // Tests the MECHANISMS that Sheets and Gmail were speculated to share, on a
@@ -1923,6 +2083,9 @@ async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "gmailpicker") {
+        return gmailpicker_mode().await;
+    }
     if std::env::args().any(|a| a == "widgets") {
         return widgets_mode().await;
     }
