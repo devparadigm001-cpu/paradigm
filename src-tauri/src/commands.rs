@@ -35,7 +35,7 @@ use tauri::State;
 
 use crate::capture::{ActionKind, CaptureSession, CapturedAction, ExclusionList};
 use crate::compile::{compile, store, validate, ReversibilityPolicy};
-use crate::labeling::{self, clean, RedactionPolicy};
+use crate::labeling::{self, calibration, clean, CalibrationSample, RedactionPolicy};
 use crate::replay::{self, journal};
 use crate::AppState;
 
@@ -311,12 +311,17 @@ pub async fn compile_and_store_playbook(
     let redaction = RedactionPolicy::placeholder();
 
     // Label: caller's hint wins, otherwise the local model names it.
-    let (label, label_generated) = match name_hint
+    //
+    // The third element is a calibration sample, and it is `None` whenever the
+    // caller supplied a name. That is not an omission: no model ran, so there is
+    // no confidence score to calibrate. Samples therefore only ever accumulate
+    // from sessions the user chooses not to name.
+    let (label, label_generated, calibration_sample) = match name_hint
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(hint) => (hint.to_string(), false),
+        Some(hint) => (hint.to_string(), false, None),
         None => {
             let engine = labeling::shared(&model_path(&state))
                 .map_err(|e| format!("labeling model unavailable: {e}"))?;
@@ -324,7 +329,8 @@ pub async fn compile_and_store_playbook(
             let outcome = engine
                 .label(&cleaned.description)
                 .map_err(|e| format!("could not label the session: {e}"))?;
-            (outcome.label, true)
+            let sample = CalibrationSample::from_outcome(&outcome);
+            (outcome.label, true, Some(sample))
         }
     };
 
@@ -354,6 +360,27 @@ pub async fn compile_and_store_playbook(
 
     {
         let mut conn = state.db.lock().await;
+
+        // Calibration is bookkeeping about the MODEL, not about this playbook,
+        // and it is deliberately not part of the command's contract:
+        //
+        //  * recorded BEFORE the store, so a store failure does not discard an
+        //    observation that is already valid -- the model ran either way;
+        //  * a failure here is logged and dropped, never propagated. Refusing to
+        //    save a user's recording because a statistics row could not be
+        //    written would trade something they care about for something they
+        //    have never heard of.
+        //
+        // This is the call the whole subsystem was missing: `record` previously
+        // had exactly one caller, in a probe writing to a temp directory, so
+        // `confidence_calibration` could never accumulate anything from real
+        // use. See docs/known-issues/confidence-calibration-never-recorded.md.
+        if let Some(sample) = &calibration_sample {
+            if let Err(e) = calibration::record(&mut conn, sample) {
+                eprintln!("[paradigm] calibration sample not recorded: {e}");
+            }
+        }
+
         store::store(&mut conn, &playbook).map_err(|e| e.to_string())?;
     }
 

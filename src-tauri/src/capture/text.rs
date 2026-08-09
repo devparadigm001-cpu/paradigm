@@ -78,7 +78,6 @@ const TEXT_ROLES: &[&str] = &[
 /// Compared case-insensitively: Terminator reports `"Document"` from
 /// `UIElement::role()` but `"document"` on a click event's `element_role`, and
 /// both must match the same entry.
-
 pub fn is_text_role(role: &str) -> bool {
     let role = role.trim().to_lowercase();
     TEXT_ROLES.iter().any(|r| role == *r)
@@ -99,6 +98,19 @@ struct Watched {
     /// Printable/editing key-downs seen while watching. Reported as provenance;
     /// unlike the recorder's counter this never gates whether we emit.
     keystrokes: u32,
+    /// Whether `initial` can be trusted as "the text before this edit".
+    ///
+    /// False when it came from a click, because the baseline is read when the
+    /// click event is *processed* and that can land after typing has begun --
+    /// measured at roughly one character late even with a 400ms settle. True
+    /// only when we set it ourselves, immediately after emitting a flush, where
+    /// there is no gap to lose characters in.
+    ///
+    /// Only a trusted baseline may be subtracted to form a delta. Subtracting
+    /// an untrusted one silently drops the leading characters, which is how the
+    /// first version of this regressed every A-E trial to `"0123456789..."`
+    /// with the leading letter eaten.
+    baseline_trusted: bool,
 }
 
 /// Follows focus across text fields and produces `Type` candidates.
@@ -146,6 +158,9 @@ impl TextFieldWatcher {
                 identifiers,
                 started_ms: timestamp_ms,
                 keystrokes: 0,
+                // Read at click-processing time, which can be later than the
+                // click itself. Not safe to subtract.
+                baseline_trusted: false,
             }),
             _ => None,
         };
@@ -202,6 +217,11 @@ impl TextFieldWatcher {
                 identifiers,
                 started_ms: timestamp_ms,
                 keystrokes: 0,
+                // Read here, immediately after emitting, with no gap for
+                // characters to slip into. This is the only baseline safe to
+                // subtract -- and the only one that needs to be, since
+                // duplication arises precisely from this re-watch.
+                baseline_trusted: true,
             });
         }
 
@@ -243,16 +263,58 @@ impl TextFieldWatcher {
             return None;
         }
 
+        // Record what was ADDED since watching began, not the whole field.
+        //
+        // Replay types payloads at the caret without clearing first
+        // (`element.type_text` -> `send_text`, key by key), so a field flushed
+        // more than once would otherwise have every action repeat all the text
+        // before it. Enter on a multi-line surface is the common way that
+        // happens: it flushes and re-baselines, and the next flush re-reads the
+        // whole document.
+        //
+        // Measured on a <textarea> before this change: two actions carrying
+        // "alpha line" and "alpha line\nbeta line", which a replay writes out
+        // as "alpha linealpha line\nbeta line" -- 30 characters for a 20
+        // character field. A real user hit this as a doubled draft.
+        //
+        // This is deliberately not keyed on the field being multi-line. There
+        // is no signal for that: a <textarea> reports role "Edit", identical to
+        // a single-line <input>, and terminator exposes no multiline property.
+        // Emitting the delta needs no such distinction.
+        //
+        // Only an append has a well-defined delta. Editing in the middle,
+        // deleting, or replacing a selection falls back to the whole value --
+        // which is exactly what this did before, so no case gets worse.
+        let payload = if changed && watched.baseline_trusted {
+            match current.strip_prefix(watched.initial.as_str()) {
+                Some(added) => added.to_string(),
+                None => current.clone(),
+            }
+        } else {
+            // Either nothing changed (so the baseline was read too late to be
+            // meaningful) or the baseline came from a click and cannot be
+            // subtracted without risking the leading characters. Record the
+            // whole value, exactly as before this change.
+            current.clone()
+        };
+
+        if payload.is_empty() {
+            return None;
+        }
+
+        let appended = payload.len() < current.len();
         let duration = timestamp_ms.saturating_sub(watched.started_ms);
         Some(ActionCandidate {
             kind: ActionKind::Type,
             identifiers: watched.identifiers,
             element_role: Some(watched.role),
             element_name: watched.name,
-            payload: Some(current),
+            payload: Some(payload),
             detail: Some(format!(
-                "read from element, {} keystroke(s) over {}ms",
-                watched.keystrokes, duration
+                "read from element ({}), {} keystroke(s) over {}ms",
+                if appended { "appended" } else { "full value" },
+                watched.keystrokes,
+                duration
             )),
             timestamp_ms,
         })

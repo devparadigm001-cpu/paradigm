@@ -1,15 +1,21 @@
 # Multi-line documents capture cumulative text, so replay duplicates it
 
-**Status:** confirmed by probe; root cause understood. Not fixed.
-**Affected:** `src-tauri/src/capture/text.rs` — `TextFieldWatcher::flush`, on
-any `Document`-role (multi-line) editing surface. Single-line `Edit` fields are
-unaffected.
+**Status: FIXED for the append case** (2026-08-08). Two caveats remain and are
+stated in "What is not fixed" — mid-edit scenarios still emit the full value,
+and the `Document`-role path could not be re-tested this session.
+**Affected:** `src-tauri/src/capture/text.rs` — `TextFieldWatcher::flush`.
+**Not** limited to `Document`-role surfaces, contrary to this document's first
+version: a web `<textarea>` reports role `"Edit"`, identical to a single-line
+`<input>`, and duplicated exactly the same way.
 **Found:** 2026-08-07, immediately after Notepad capture began working at all
 (see "Relationship to the Document-role fix").
-**Severity: MEDIUM.** Capture is no longer silently empty for these surfaces —
-the text is recorded and correct. What is wrong is that successive actions each
-carry the *whole* document rather than what was added, so replaying a
-multi-line recording writes duplicated content into a real file.
+**Confirmed in real use:** 2026-08-08, a live user session replayed a recording
+that typed "Weekly summary draft" **twice**. Until then the duplication was
+inferred from stored payloads; it is now observed end to end.
+**Severity: was MEDIUM.** Capture was never silently empty for these surfaces —
+the text was recorded and correct. What was wrong is that successive actions
+each carried the *whole* document rather than what was added, so replaying a
+multi-line recording wrote duplicated content into a real file.
 
 ## Summary
 
@@ -92,6 +98,96 @@ watcher was ever pointed at.
 The web A–E trials pass 5/5 across three runs with exactly one correct action
 per field, confirming single-line behaviour is unaffected.
 
+## The fix (2026-08-08)
+
+`flush` now records **what was added** since watching began, rather than the
+whole field.
+
+### Why not "stop flushing on Enter for multi-line fields"
+
+That was the leading hypothesis and it cannot be implemented: **there is no
+signal for "this control is multi-line".** A `<textarea>` reports role `"Edit"`,
+byte-identical to a single-line `<input>` (measured), and terminator exposes no
+multiline property — no accessor, and the attribute bag carries `AutomationId`
+only. Keying the fix on `role == "document"` would have fixed Notepad and left
+every web textarea duplicating, which is the same defect with less visibility.
+
+A behavioural substitute — on Enter, check whether a newline appeared — was
+rejected as racy: the keyboard event can reach us before the app has processed
+the key, so the first Enter in a fresh field is a coin flip.
+
+Emitting the delta needs no such distinction, which is why it was chosen.
+
+### The correctness argument
+
+Replay types each payload at the caret **without clearing** — `type_text` with
+`use_clipboard: false` routes to `send_text`, key by key. So concatenating a
+field's payloads is exactly what a replay writes. Cumulative payloads therefore
+*must* duplicate; deltas compose.
+
+| Flush | Baseline | Field now | Emitted before | Emitted now |
+|---|---|---|---|---|
+| 1 (Enter) | `""` | `alpha line` | `alpha line` | `alpha line` |
+| 2 (exit) | `alpha line` | `alpha line\nbeta line` | `alpha line\nbeta line` | `\nbeta line` |
+
+### A regression this caused, caught by the A–E suite
+
+The first implementation subtracted the baseline **unconditionally**, and
+regressed every settled trial from 5/5 to **0/5 across three runs**. Payloads
+came back as `"0123456789abcdefghi"` — the leading letter eaten.
+
+The cause is that `initial` is read when the *click event is processed*, which
+lands roughly one character after typing begins even with a 400 ms settle.
+Subtracting that baseline silently removes the characters that arrived before
+it. That trades visible duplication for invisible truncation, which is strictly
+worse: too much text is obvious, missing text is not.
+
+The repair is that a delta may only be subtracted from a baseline we can trust:
+
+* set by a **click** — read at click-processing time, possibly late →
+  **untrusted**, emit the whole value, exactly as before this change;
+* set by our **own re-watch immediately after a flush** — no gap for characters
+  to slip into → **trusted**, emit the delta.
+
+Duplication only ever arises from the second, so this fixes it without touching
+the path every single-flush field depends on. The distinction is carried by
+`Watched::baseline_trusted`.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Duplication reproduced, unfixed (`<textarea>`) | `"alpha linealpha line\nbeta line"` (30 chars) vs 20 in field — **fail, as expected** |
+| Same scenario, fixed | `"alpha line\nbeta line"` — **replay matches exactly** |
+| A–E regression, 3 runs | **A–D 12/12**; E 1/3 (pre-existing no-settle race, measured 4/10 before this work) |
+| Pre-filled field, 3 runs | no fabricated action |
+| Exit path: click-away | 2 actions, replay matches exactly |
+| Exit path: Tab | 2 actions, replay matches exactly |
+| Full suite | 76 lib, 8 db_encryption, 12 ipc_commands, 2 replay_aborted pass; `ipc_pipeline` red on the separate no-settle race |
+
+## What is not fixed
+
+**Mid-edit still emits the full value.** A delta is only well-defined for an
+append. Editing in the middle, deleting, or replacing a selection falls back to
+emitting the whole field — which is precisely the pre-fix behaviour, so nothing
+regressed, but nothing improved either. A recording that edits into the middle
+of an existing paragraph and is flushed twice can still duplicate.
+
+**The `Document` path was not re-tested this session.** Verification ran against
+a web `<textarea>`, not Notepad. Windows 11 hands a fresh `notepad.exe` launch
+off to an already-running instance — measured directly, focus landed on pid
+18552 while the probe had launched 9596 — so Notepad cannot be targeted without
+risking typing into a window the probe does not own. That is the same hand-off
+documented in the no-settle-race investigation in
+`text-input-capture-truncation.md`. The `<textarea>` exercises the same code
+path (a multi-line surface flushed twice, delta emitted from a trusted
+baseline), so the fix is not believed to be role-specific — but "not believed
+to be" is weaker than "measured", and Notepad specifically is unverified.
+
+An earlier attempt in this session to make the probe target Notepad safely also
+demonstrated the risk concretely: an unscoped `role:Document` search matched a
+Spotify tab in the user's browser and typed probe text into it.
+
 ## Why it matters
 
 Notepad is the simplest possible multi-line target, and the one a first-time
@@ -107,9 +203,13 @@ content into a real document.
 
 ## Next steps
 
-- [ ] **Confirm the replay behaviour empirically.** The duplication is inferred
-      from stored payloads, not observed. Record a two-line Notepad session,
-      replay it, and compare the resulting file against the original.
+- [x] **Confirm the replay behaviour empirically.** Done — a live user session
+      on 2026-08-08 replayed a recording that typed "Weekly summary draft"
+      twice, and the probe reproduced it on a `<textarea>` before the fix.
+- [ ] **Verify the fix against a `Document`-role surface.** See "What is not
+      fixed" — Notepad could not be safely targeted this session.
+- [ ] **Decide whether mid-edit deserves a real answer**, or whether
+      full-value-on-mid-edit is acceptable indefinitely.
 - [ ] **Decide what a multi-line action should carry — this is the real
       design question.** Options, none obviously right:
       *the delta since the last flush* (replay appends; needs the delta to be

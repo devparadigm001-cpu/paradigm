@@ -1,0 +1,185 @@
+# Typing was attributed to the wrong window after an application switch
+
+**Status: FIXED** (2026-08-08). Found and fixed the same day, so this was never
+open as a tracked issue — it is filed as a record of the defect, the evidence,
+and the fix.
+**Affected:** `src-tauri/src/capture/mod.rs` — `observe_text`. Any session where
+the user typed into a field and then switched applications without first
+pressing Enter or clicking elsewhere in the original window.
+**Found:** 2026-08-08, during Step 12 testing (session
+`record-403c9787-3859-4c0d-896b-94c9979cdd5d`).
+**Severity: was HIGH.** Not because it broke a run, but because it did not:
+replay reported **7/7 succeeded** while typing into the wrong application. A
+loud failure would have been safer.
+
+## Summary
+
+`observe_text` handled `Click` and `Keyboard` events and let everything else
+fall through to `None`. `WorkflowEvent::ApplicationSwitch` was in that
+"everything else", so **a window switch never reached the text watcher**.
+
+The watch therefore survived the switch. `to_candidate` recorded the switch as
+a `navigate` action, and the still-open watch was flushed later by some
+unrelated event — emitting a `type` action that carried the **old window's**
+element while sitting **after** the navigate in the sequence.
+
+Replayed in that order, capture navigates to the new application and then types
+into the previous one.
+
+## Evidence
+
+### The real session
+
+`record-403c9787-3859-4c0d-896b-94c9979cdd5d`: the user typed three lines into
+Notepad, then switched to Google Docs before the Notepad field had flushed. The
+resulting `type` action was stored with Notepad's selector —
+`role:document|name:"Text editor"` — despite appearing after the
+navigate-to-Google-Docs step.
+
+Replay `6c91a66a-225b-45d9-977c-411513ac8806` finished with status **Completed,
+7/7 succeeded**, and typed the payload back into Notepad.
+
+### Reproduced deterministically
+
+`cargo run --example text_capture_probe -- windowswitch` drives the same shape:
+type into a browser field, then switch applications with **no Enter and no click
+elsewhere** — nothing that would flush first. Calculator is the second window
+because it has no text fields, so nothing can be typed into it by accident.
+
+Before the fix:
+
+```
+  [1] click     role=edit    name="FieldA"      source_app="msedge.exe"
+  [2] navigate  role=Window  name="Calculator"  source_app="Calculator"
+  [3] type      role=edit    name="FieldA"      source_app="msedge.exe"
+      payload="switchtest0123456789"
+```
+
+After:
+
+```
+  [1] click     role=edit    name="FieldA"      source_app="msedge.exe"
+  [2] type      role=edit    name="FieldA"      source_app="msedge.exe"
+      payload="switchtest0123456789"
+  [3] navigate  role=Window  name="Calculator"  source_app="Calculator"
+```
+
+## The fix
+
+`observe_text` now flushes the active watch on `ApplicationSwitch`:
+
+```rust
+WorkflowEvent::ApplicationSwitch(e) => {
+    watcher.flush(e.metadata.timestamp.unwrap_or_else(now_ms))
+}
+```
+
+Correct ordering falls out of the existing pump rather than needing new
+machinery: it already admits `observe_text`'s candidate before the event's own
+candidate, so the typing lands ahead of the navigate — the order it actually
+happened in.
+
+This is the same shape as `stop_session`'s existing end-of-session flush: a
+signal that the field will get no further input, so record it now with the
+context it was typed in.
+
+## Relationship to the no-settle race
+
+Related but distinct, and worth keeping separate when reading
+`text-input-capture-truncation.md`.
+
+Both are "the flush happens too late, carrying stale context". The no-settle
+race is about **typing speed** relative to flush timing — the baseline is read
+after the text lands. This is about a **window switch** arriving before any
+flush, so the flush happens at the right moment for the *watcher* but the wrong
+moment for the *user's intent*.
+
+Fixing one does not fix the other; they were fixed separately.
+
+## Verification
+
+| Check | Result |
+|---|---|
+| Window-switch scenario, before | typing after the switch, old window's element — **reproduced** |
+| Window-switch scenario, after | typing before the switch, correct element — **correct** |
+| A–E web trials, 6 runs | **A–D 12/12**; no fabricated action for the pre-filled field |
+| Multi-line delta fix, click-away | 2 actions, replay matches exactly |
+| Multi-line delta fix, Tab | 2 actions, replay matches exactly |
+| Suite | 76 lib, 8 db_encryption, 12 ipc_commands, 2 replay_aborted pass |
+| Clippy | no warnings in changed files |
+
+### A note on trial E, for whoever next works on the no-settle race
+
+E — the no-settle trial — scored **0/9 in this session**, against the **4/10**
+recorded in `text-input-capture-truncation.md`.
+
+**This fix is not responsible.** A direct control isolating it measured E at
+**0/3 with the fix removed** and **0/6 with it applied** — identical. The delta
+fix in the same area cannot affect E either: every code path for E's shape emits
+the whole value, because the delta branch requires a `baseline_trusted` baseline
+that only a post-flush re-watch sets, and E never gets one.
+
+#### The tab-count hypothesis was tested and is REFUTED
+
+This section originally proposed, as a correlational lead, that a browser
+growing from ~67 to 92 tabs across the session slowed click-event processing
+enough to push E outside its working window. **That was tested directly and is
+wrong.**
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Tab count | run in Chrome carrying **1 tab** | E **0/4** — same as Edge at 92 |
+| Any code change since the baseline | `git checkout df42f48` (the exact tree the 4/10 was measured on) and re-run | E **0/5** |
+| Windows update / reboot between measurements | `LastBootUpTime` | **2026-08-05 18:45** — both measurements fall in one boot session |
+| System load | CPU during the runs | ~10%, not loaded |
+
+The historical checkout is the decisive one: **the identical code that measured
+4/10 now measures 0/5.** No code change is responsible, and neither is tab load.
+
+Across every condition tonight E scored **1/21**.
+
+#### The most likely explanation now: the original 4/10 was a small sample
+
+The 4/10 baseline was two batches of five — **1/5 and then 3/5**. That is a wide
+spread for n=10, and it cannot distinguish a true rate of 40% from one nearer
+10–15% measured generously. A true rate of ~10% would make 1/21 unremarkable and
+4/10 the outlier.
+
+The remaining untested candidate is accumulated machine state within the single
+boot session — three days of uptime, 48 Edge processes, 13 Chrome, several
+orphaned Notepad instances, and several hundred UIA-heavy probe runs. Testing
+that needs a reboot, which was not done.
+
+**The practical point stands and is now well supported: 4/10 is not a reliable
+property of the defect and should not be used as a regression threshold.** Any
+future work on the no-settle race should re-establish a baseline with a much
+larger sample before treating a change in E's rate as signal.
+
+`examples/text_capture_probe` now takes `chrome` or `edge` to force a browser,
+which is what made the tab test possible and is kept for re-running it.
+
+## Why it matters
+
+The failure mode is the dangerous kind this project keeps meeting: silent,
+plausible, and self-consistent. Every individual step looks right — a real
+navigate, a real type action with a real selector and the correct text. Only the
+*pairing* of the two is wrong, and nothing in validation can detect it, because
+a playbook that navigates and then types is entirely ordinary.
+
+Replay reporting **7/7 succeeded** while writing into the wrong application is
+worse than a failure would have been. A user reviewing that run has no signal
+that anything went wrong.
+
+Switching applications mid-task is also not an edge case. It is the normal shape
+of the work this product automates — copy from one place, paste into another.
+
+## Next steps
+
+- [ ] **Consider whether other events imply focus loss.** Window minimise,
+      window close, and session-level focus changes are not currently treated as
+      flush triggers. `ApplicationSwitch` was the one with evidence behind it;
+      the others are untested rather than known-good.
+- [ ] **Consider asserting window consistency at compile time.** A `type` step
+      whose target belongs to a different application than the preceding
+      `navigate` is suspicious, and cheap to detect once. That would have caught
+      this defect as a validation error rather than a silent wrong write.
