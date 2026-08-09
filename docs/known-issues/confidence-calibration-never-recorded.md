@@ -1,9 +1,11 @@
 # Calibration: no confidence samples are ever recorded in production
 
-**Status: FIXED** (2026-08-08, commit `0e1012f`). Calibration samples are now
-recorded from the real labelling path. The everything-below describes the
-original finding; see "The fix" for what changed and "Still open, and correctly
-so" for the one part deliberately left for Phase 2.
+**Status: FIXED** (2026-08-08, commit `0e1012f`), and **confirmed on the real
+on-device database** on 2026-08-09. Calibration samples are now recorded from
+the real labelling path. Everything below describes the original finding; see
+"The fix" for what changed, "Verified on the on-device database" for the real
+row, and "Still open, and correctly so" for the one part deliberately left for
+Phase 2.
 **Originally:** confirmed by direct inspection of the real on-device database.
 **Root cause identified** — the recording call was simply absent from the
 product code path.
@@ -176,6 +178,57 @@ The `normalized_score IS NULL` assertion deserves a note: it is not incidental.
 Phase 1 records raw observations only, and that test will fail the moment
 something starts populating the normalised column early.
 
+### Verified on the on-device database (2026-08-09)
+
+The three tests prove the wiring against a scratch database. This is the same
+thing proven on the real store — the one that was empty when this issue was
+filed.
+
+A real unnamed playbook saved through the running app, then
+`cargo run --example calibration_dump -- %APPDATA%\com.amitj.paradigm`:
+
+```
+confidence_calibration: 1 row(s)
+
+  model_source                   bin         samples  success  normalized  updated_at
+  qwen2.5-0.5b-instruct-q4_k_m   [0.7,0.8)       1        1        NULL  2026-08-09T04:15:18.760Z
+
+  ids (deterministic, model|bin_min):
+    qwen2.5-0.5b-instruct-q4_k_m|0.70
+
+  most recent playbooks:
+    2026-08-09T04:15:18.761Z  record_mode  Type into Text editor?  18350f7b-c3d3-4d21-b644-f8e7c6c5161a
+```
+
+Real `model_source`, a sane half-open tenth inside `0..=1`, one sample, one
+success (the generation was well-formed, not repaired), and `normalized_score`
+still NULL.
+
+The timestamps are worth noting: the calibration row is `…18.760Z` and the
+playbook `…18.761Z`, **one millisecond apart**. Same save, and the ordering
+confirms the record-before-store decision is behaving as its comment claims.
+
+### Two traps that made this verification harder than it should have been
+
+Both cost a full round trip, and both would catch anyone re-checking this.
+
+**1. A running app can predate the fix.** The first attempt dumped the real
+database and found it empty. The fix was not at fault: the app process had been
+launched at 12:33, roughly ten hours before the code existed, so it could not
+have contained it. `target/debug/paradigm.exe` was also older than the commit,
+so restarting alone would not have helped — it needed a rebuild.
+
+**2. And a rebuild is not enough if the branch does not have the fix.** The
+runnable app lives in a *different worktree* (`paradigm-frontend`, on
+`frontend-dev`), which was seven commits behind `backend-dev` and contained no
+`calibration::record` call at all — `grep -c` returned 0. A fresh rebuild there
+would still have produced an app without the fix.
+
+So verifying a backend change against the real database requires **both**: the
+branch the app runs must contain the commit, and the binary must be rebuilt
+after merging. Checking the process start time alone is not sufficient evidence,
+and neither is checking that the commit exists somewhere in the repo.
+
 ## Still open, and correctly so: nothing reads the data back
 
 Samples now accumulate. **Nothing consumes them yet** —
@@ -227,11 +280,11 @@ call site, plus a test that the row lands.
    Q&A generation (Phase 2) will produce `LabelOutcome`-shaped confidence too.
    Wiring one call site now is right, but the recording point should be somewhere
    every future model call can reach rather than copied per command.
-4. **Re-verify against the real store**, with
-   `cargo run --example calibration_dump -- <app_data_dir>`, once a real session
-   has been saved *without* a name. The tests prove the wiring against a scratch
-   database; this would confirm it on the on-device one. Not yet done — the
-   table was last dumped before the fix.
+4. ~~**Re-verify against the real store.**~~ **Done, 2026-08-09.** A real
+   unnamed playbook saved through the running app
+   (`18350f7b-c3d3-4d21-b644-f8e7c6c5161a`, model-generated label
+   "Type into Text editor?") produced a real row — see "Verified on the
+   on-device database" below.
 5. **Consider whether Phase 2 needs a faster sample rate.** Samples only accrue
    from unnamed sessions (see "Still open"), so the table fills as a function of
    naming habits rather than usage. If that proves too slow, the options are to
