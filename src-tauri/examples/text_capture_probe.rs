@@ -3025,6 +3025,138 @@ async fn ambiguity_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------- rootcount mode ----
+// Third attempt at counting selector candidates.
+//
+// Route 1 satisfied `find_elements`' scoping guard with a `process:` prefix,
+// which routes through the Chain arm and returned every top-level window of
+// the process, ignoring role and name. This mode tests the OTHER way to
+// satisfy that guard, which neither prior route used: supply a root element
+// via `Locator::within()`. That reaches `Selector::Role`'s matcher directly,
+// where `control_type` and `contains_name` filters are actually applied.
+//
+// The controls are the point. A counter that reports 2 for a duplicated title
+// is worthless unless it also reports 1 for a unique one -- over-rejection of
+// legitimate replays is what sank both previous attempts.
+async fn rootcount_mode() -> ExitCode {
+    println!("== root-scoped candidate counting ==\n");
+    println!("Opens TWO windows sharing a title and ONE with a unique title,");
+    println!("then counts candidates via within(desktop.root()).\n");
+
+    let dup = std::env::temp_dir().join("paradigm-rootcount-dup.html");
+    let uniq = std::env::temp_dir().join("paradigm-rootcount-uniq.html");
+    let mk = |title: &str| {
+        format!(
+            "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{title}</title></head>\n\
+             <body style=\"font-family:sans-serif;padding:2rem\"><h2>{title}</h2>\n\
+             <input id=\"f\" name=\"RootCountField\" aria-label=\"RootCountField\" \
+             style=\"font-size:1.2rem;width:20rem\"></body></html>\n"
+        )
+    };
+    if std::fs::write(&dup, mk("RootCount Duplicated")).is_err()
+        || std::fs::write(&uniq, mk("RootCount Unique")).is_err()
+    {
+        eprintln!("could not write probe pages");
+        return ExitCode::FAILURE;
+    }
+    let as_url = |p: &std::path::Path| format!("file:///{}", p.to_string_lossy().replace('\\', "/"));
+
+    let browser = browser_order()[0];
+    let browser_proc = if browser == "chrome" { "chrome.exe" } else { "msedge.exe" };
+    for (n, path) in [("1 (dup)", &dup), ("2 (dup, same title)", &dup), ("3 (unique)", &uniq)] {
+        println!("opening window {n}...");
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "--new-window", &as_url(path)])
+            .spawn()
+        {
+            let _ = c.wait();
+        }
+        tokio::time::sleep(Duration::from_secs(8)).await;
+    }
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n================ RESULTS ================\n");
+
+    // (selector, what a correct counter must report)
+    let cases: [(&str, &str); 4] = [
+        ("role:Window|name:RootCount Duplicated", "2  (genuine ambiguity)"),
+        ("role:Window|name:RootCount Unique", "1  (must NOT over-reject)"),
+        ("role:Window|name:RootCount Absent Window", "0  (nothing matches)"),
+        ("role:Edit|name:RootCountField", ">=3 (one per window)"),
+    ];
+
+    let mut verdict_ok = true;
+    for (selector, expected) in cases {
+        println!("selector {selector:?}");
+        println!("  expected: {expected}");
+
+        for depth in [Some(1usize), Some(3), None] {
+            let started = std::time::Instant::now();
+            let res = desktop
+                .locator(selector)
+                .within(desktop.root())
+                .all(Some(Duration::from_secs(5)), depth)
+                .await;
+            let ms = started.elapsed().as_millis();
+            let label = match depth {
+                Some(d) => format!("depth {d}"),
+                None => "depth default".to_string(),
+            };
+            match res {
+                Ok(all) => {
+                    println!("  {label:<14} -> {} candidate(s)   [{ms} ms]", all.len());
+                    for (i, el) in all.iter().take(5).enumerate() {
+                        println!("        [{i}] role={:?} name={:?}", el.role(), el.name());
+                    }
+                    // Sanity: every returned element must actually match the name.
+                    let wanted = selector.rsplit("name:").next().unwrap_or("");
+                    let bad = all
+                        .iter()
+                        .filter(|el| !el.name().unwrap_or_default().contains(wanted))
+                        .count();
+                    if bad > 0 {
+                        println!("        !! {bad} returned element(s) do NOT contain the name");
+                        verdict_ok = false;
+                    }
+                }
+                Err(e) => println!("  {label:<14} -> Err  {e}   [{ms} ms]"),
+            }
+        }
+        println!();
+    }
+
+    // The other untried primitive: a purpose-built window enumerator that does
+    // not go through selector matching at all.
+    println!("--- desktop.windows_for_application({browser_proc:?}) ---");
+    let started = std::time::Instant::now();
+    match desktop.windows_for_application(browser_proc).await {
+        Ok(ws) => {
+            println!("  -> {} window(s)   [{} ms]", ws.len(), started.elapsed().as_millis());
+            for (i, el) in ws.iter().take(8).enumerate() {
+                println!("      [{i}] name={:?}", el.name());
+            }
+        }
+        Err(e) => println!("  -> Err  {e}   [{} ms]", started.elapsed().as_millis()),
+    }
+
+    println!("\n--- what this decides ---");
+    println!("  A usable counter must report 2 for the duplicated title AND 1 for");
+    println!("  the unique one. Reporting 2 for both means it counts windows, not");
+    println!("  matches -- the same failure that closed Route 1, and unusable.");
+    if !verdict_ok {
+        println!("  NOTE: at least one result contained non-matching elements.");
+    }
+
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
@@ -3053,6 +3185,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "procname") {
         return procname_mode().await;
+    }
+    if std::env::args().any(|a| a == "rootcount") {
+        return rootcount_mode().await;
     }
     if std::env::args().any(|a| a == "ambiguity") {
         return ambiguity_mode().await;

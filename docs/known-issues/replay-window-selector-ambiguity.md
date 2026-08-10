@@ -344,6 +344,115 @@ They are kept because **any** future approach needs a stable process identity �
 including one that never calls `Locator::all()`. Rebuilding that plumbing is the
 expensive part; the three-line counting call that failed is not.
 
+## Route 3, in progress: count from a root element instead of a `process:` prefix (2026-08-10)
+
+**Status: promising on first evidence, and explicitly not established.** One
+probe run, no reproduction, and the decisive over-rejection test has not been
+run. Recorded so the finding is not lost — not as a result to build on.
+
+### What the library source actually says
+
+`.all()` rejecting desktop-wide selectors is **not a UI Automation limit**. It
+is a deliberate guard in `terminator-rs`, `platforms/windows/engine.rs:1006`:
+
+```rust
+// Enforce scoping: desktop-wide search requires process selector when root is None
+if root.is_none() && !selector_has_process_scope(selector) {
+    return Err(AutomationError::InvalidSelector(format!(
+        "Desktop-wide search not allowed. Selector must include 'process:' prefix …
+         Or use element.locator() to search within a specific element's tree.
+```
+
+The condition is `root.is_none() && !has_process_scope`, so there are **two**
+ways to satisfy it, and the error message names both. Route 1 took the
+`process:` prefix, which parses to a `Selector::Chain` and is handled by the
+chain arm — that arm applies each link as a *descendant* search, which is why
+its count came back as "every top-level window of the process" and ignored role
+and name. Supplying a **root element** instead (`Locator::within()`, and
+`Desktop::root()` is public) skips the chain and reaches `Selector::Role`, whose
+matcher does apply `control_type` and `contains_name`.
+
+That is a different code path, not a re-run of Route 1.
+
+### The measurement
+
+`text_capture_probe -- rootcount` opens two browser windows sharing a title and
+one with a unique title, then counts via `within(desktop.root())`. Verbatim:
+
+```
+selector "role:Window|name:RootCount Duplicated"
+  expected: 2  (genuine ambiguity)
+  depth 1        -> Err  Element not found: … Err: find element time out   [5044 ms]
+  depth 3        -> 2 candidate(s)   [288 ms]
+        [0] role="Window" name=Some("RootCount Duplicated - Personal - Microsoft Edge")
+        [1] role="Window" name=Some("RootCount Duplicated - Personal - Microsoft Edge")
+  depth default  -> 2 candidate(s)   [1733 ms]
+
+selector "role:Window|name:RootCount Unique"
+  expected: 1  (must NOT over-reject)
+  depth 1        -> Err  Element not found: … Err: find element time out   [5026 ms]
+  depth 3        -> 1 candidate(s)   [284 ms]
+        [0] role="Window" name=Some("RootCount Unique - Personal - Microsoft Edge")
+  depth default  -> 1 candidate(s)   [1849 ms]
+
+selector "role:Window|name:RootCount Absent Window"
+  depth 1/3/default -> Err  Element not found …   [~5 s each]
+
+selector "role:Edit|name:RootCountField"
+  depth 1        -> Err   [5027 ms]
+  depth 3        -> Err   [5194 ms]
+  depth default  -> 3 candidate(s)   [1756 ms]
+
+--- desktop.windows_for_application("msedge.exe") ---
+  -> 0 window(s)   [34 ms]
+```
+
+**2 for the duplicated title and 1 for the unique one** — the discrimination
+Route 1 could not produce. Role is respected too: the `Edit` selector returned
+three edits, not three windows.
+
+### Incidental findings worth keeping
+
+* **Depth matters and is not uniform.** `depth 1` never works — top-level
+  windows sit deeper than one level below the desktop root. `depth 3` suffices
+  for windows and is **6× faster** than the default (288 ms vs 1733 ms), but is
+  *not* enough for the `Edit` case, which needs the default depth. Any use of
+  this must pick a depth per role, and that is a tuning parameter with no
+  principled value yet.
+* **"No match" is an `Err`, not `Ok(0)`,** and it costs the full timeout (~5 s).
+  A counter placed before `first()` would add ~5 s to every genuinely-missing
+  element, so it would have to run *after* a successful `first()`.
+* **`desktop.windows_for_application()` is a dead end.** It takes an application
+  *name*, not a process name, and returned 0 windows for `"msedge.exe"` in 34 ms.
+  Internally it resolves one app element via `application(name)` and filters its
+  children, so it could not enumerate across processes even if named correctly.
+  Candidate 1 of this attempt's brief is closed on this evidence.
+
+### What is NOT established, and blocks any implementation
+
+1. **Reproducibility.** One run. Nothing here has been repeated.
+2. **The over-rejection test — the one that matters — was not run.** Names match
+   by *containment*, so an unrelated window whose title merely contains the
+   recorded name inflates the count and would report false ambiguity, refusing a
+   legitimate replay. That is precisely the failure that closed Routes 1 and 2,
+   and this route has not been shown to avoid it. The synthetic titles above were
+   chosen not to collide, so they do not test it.
+3. **The plausible mitigation is untested.** Filtering candidates through the
+   already-shipped `resolved_is_recorded_target` rule (equality, tolerating one
+   leading `*`) should drop containment-only matches, and would reuse a tested
+   predicate rather than re-implementing selector matching the way Route 2 would.
+   Untested.
+4. **Cost inside a real replay.** ~290 ms per navigate step is plausibly
+   acceptable against an 8 s budget; ~1.7 s per element step is not obviously so,
+   and neither has been measured inside an actual run.
+
+### Candidate 2, untouched
+
+Deferring the ambiguity question to the user — surfacing "this matched two
+windows, which did you mean?" instead of deciding silently — has not been
+investigated. Worth noting it depends on detection working first, so it is
+downstream of the above rather than an alternative to it.
+
 ## Pattern: a swallowed error produces a confident false conclusion
 
 Three times in one session, and worth naming because the shape repeats and each
@@ -410,8 +519,16 @@ generic-titled window in step 1.
 - [x] ~~**Unblock the fail-loud check by picking Route 1 or Route 2.**~~
       **Route 1 built and refuted** — see "Route 1 built, and refuted at the
       last layer". Its plumbing works and is kept; its counting mechanism does
-      not. **Route 2 remains the only unexplored option**, and was already
-      flagged as high-risk for rejecting legitimate replays.
+      not. Route 2 was then described as the only unexplored option; **that is
+      no longer true** — a third path exists (root-scoped counting, 2026-08-10)
+      and looks better than Route 2 on first evidence, because the library does
+      its own matching rather than us re-implementing it.
+- [ ] **Finish, or kill, Route 3.** See "Route 3, in progress". The next action
+      is not more design: it is the over-rejection test — a decoy window whose
+      title contains the recorded name — plus a repeat run. If root-scoped
+      counting inflates on containment and the target-name filter does not
+      rescue it, this dies the same way as Routes 1 and 2 and should be recorded
+      as such rather than tuned.
 - [ ] **Reconsider whether fail-loud-on-ambiguity is the right design at all.**
       This now deserves asking before a third counting mechanism is attempted.
       Two independent tries at "count candidates through the library's own API"
