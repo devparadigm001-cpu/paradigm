@@ -115,13 +115,23 @@ pub enum StepResult {
     FailedNotFound,
     /// The target was located but the action itself errored.
     FailedAction,
+    /// Something was located, but it is not what the recording targeted.
+    ///
+    /// Distinct from `FailedNotFound` on purpose: "found nothing" and "found the
+    /// wrong thing" are different problems with different causes, and conflating
+    /// them would hide exactly the failure this exists to surface. See
+    /// docs/known-issues/selector-matching-precision.md.
+    FailedWrongTarget,
 }
 
 impl StepResult {
     pub fn is_failure(&self) -> bool {
         matches!(
             self,
-            StepResult::HaltedRedacted | StepResult::FailedNotFound | StepResult::FailedAction
+            StepResult::HaltedRedacted
+                | StepResult::FailedNotFound
+                | StepResult::FailedAction
+                | StepResult::FailedWrongTarget
         )
     }
 
@@ -133,6 +143,7 @@ impl StepResult {
             StepResult::HaltedRedacted => "HALTED (redacted value unavailable)",
             StepResult::FailedNotFound => "FAILED (element not found)",
             StepResult::FailedAction => "FAILED (action errored)",
+            StepResult::FailedWrongTarget => "FAILED (resolved the wrong element)",
         }
     }
 }
@@ -252,6 +263,41 @@ fn parse_payload(raw: &str) -> StepPayload {
 //
 // `StepPayload::scoped_selector` is kept and tested for whatever counting path
 // a future attempt uses.
+
+/// Is the element we resolved the one the recording targeted?
+///
+/// Selectors match names by CONTAINMENT (`contains_name` in terminator), so
+/// `name:Paradigm` matches any element whose name contains "Paradigm" -- a real
+/// stored selector was measured resolving onto
+/// "Paradigm Text Capture Probe and 63 more pages - Personal - Microsoft Edge".
+/// Nothing in a successful `first()` distinguishes that from a correct match.
+/// See docs/known-issues/selector-matching-precision.md.
+///
+/// This compares for equality instead, with exactly one tolerance: a single
+/// leading `*`, the near-universal Windows marker for unsaved changes.
+///
+/// That tolerance is not a lenient default; it is the narrowest rule that covers
+/// a measured false positive. A window recorded as
+/// `"DriftProbe - Personal - Microsoft Edge"` becomes
+/// `"*DriftProbe - Personal - Microsoft Edge"` the moment its content is edited,
+/// and strict equality would reject that legitimate same-window match while
+/// containment accepts it. The tolerance still rejects the Paradigm collision,
+/// which is neither the recorded name nor the recorded name with a `*`.
+///
+/// Note what this can and cannot do. It only ever rejects matches that
+/// containment ACCEPTED -- any other drift already fails to resolve today, so
+/// this adds no new failure there. It also cannot detect two windows genuinely
+/// sharing a name; that needs a candidate count, which the library does not
+/// expose (see replay-window-selector-ambiguity.md).
+fn resolved_is_recorded_target(recorded: &str, resolved: &str) -> bool {
+    if recorded == resolved {
+        return true;
+    }
+    resolved
+        .strip_prefix('*')
+        .map(|undecorated| undecorated == recorded)
+        .unwrap_or(false)
+}
 
 /// Best-effort name of the foreground application, for `system_state_json`.
 fn foreground_app(desktop: &Desktop) -> String {
@@ -416,6 +462,24 @@ async fn execute_step(
         }
     };
 
+    // Confirm this is the recorded target BEFORE acting on it. Nothing has
+    // happened yet, so refusing here costs nothing; acting on the wrong element
+    // cannot be undone.
+    if let Some(recorded) = payload.target_name.as_deref() {
+        let resolved = element.name().unwrap_or_default();
+        if !resolved_is_recorded_target(recorded, &resolved) {
+            return mk(
+                StepResult::FailedWrongTarget,
+                format!(
+                    "selector {selector:?} resolved to the wrong element -- names match by \
+                     containment, not equality.\n  recorded: {recorded:?}\n  resolved: {resolved:?}\n\
+                     Refusing to act: this is how a replay writes to the wrong place while \
+                     reporting success."
+                ),
+            );
+        }
+    }
+
     match step.action_type.as_str() {
         "click" => click(desktop, &element, selector, &mk),
         "type" => type_text(&element, payload, &mk),
@@ -449,6 +513,22 @@ async fn navigate(
             .await
         {
             Ok(window) => {
+                // Same check as for elements, and this is the site where the
+                // measured collision happened: `role:Window|name:Paradigm`
+                // resolving onto a browser window.
+                if let Some(recorded) = payload.target_name.as_deref() {
+                    let resolved = window.name().unwrap_or_default();
+                    if !resolved_is_recorded_target(recorded, &resolved) {
+                        return mk(
+                            StepResult::FailedWrongTarget,
+                            format!(
+                                "window selector {selector:?} resolved to the wrong window -- \
+                                 names match by containment, not equality.\n  recorded: \
+                                 {recorded:?}\n  resolved: {resolved:?}\n Refusing to activate it."
+                            ),
+                        );
+                    }
+                }
                 return match window.activate_window() {
                     Ok(()) => mk(
                         StepResult::Executed,
@@ -601,6 +681,65 @@ mod tests {
         assert_eq!(p.selector.as_deref(), Some("role:Edit|name:Password"));
         assert_eq!(p.target_name.as_deref(), Some("Password"));
         assert_eq!(p.text.as_deref(), Some("[REDACTED]"));
+    }
+
+    #[test]
+    fn the_real_measured_collision_is_rejected() {
+        // The actual observed case: a stored selector `role:Window|name:Paradigm`
+        // resolving onto a browser window, from
+        // docs/known-issues/selector-matching-precision.md.
+        assert!(
+            !resolved_is_recorded_target(
+                "Paradigm",
+                "Paradigm Text Capture Probe and 63 more pages - Personal - Microsoft Edge"
+            ),
+            "the measured production collision must be rejected"
+        );
+    }
+
+    #[test]
+    fn an_exact_match_is_accepted() {
+        assert!(resolved_is_recorded_target("Text editor", "Text editor"));
+        assert!(resolved_is_recorded_target(
+            "Untitled - Notepad",
+            "Untitled - Notepad"
+        ));
+    }
+
+    #[test]
+    fn the_unsaved_changes_marker_is_tolerated() {
+        // Measured false positive: a window recorded before editing gains a
+        // leading '*' once its content changes. Strict equality would reject
+        // this legitimate same-window match.
+        assert!(resolved_is_recorded_target(
+            "DriftProbe - Personal - Microsoft Edge",
+            "*DriftProbe - Personal - Microsoft Edge"
+        ));
+        assert!(resolved_is_recorded_target(
+            "Untitled - Notepad",
+            "*Untitled - Notepad"
+        ));
+    }
+
+    #[test]
+    fn the_star_tolerance_does_not_open_the_containment_hole() {
+        // The tolerance is exactly one leading '*' and nothing more. It must not
+        // become a general prefix or substring allowance.
+        assert!(!resolved_is_recorded_target("Paradigm", "*Paradigm Extra"));
+        assert!(!resolved_is_recorded_target("Notepad", "Untitled - Notepad"));
+        assert!(!resolved_is_recorded_target("To", "Write your prompt to Claude"));
+    }
+
+    #[test]
+    fn identical_names_on_different_windows_are_not_detectable_here() {
+        // Documents a known limit rather than a behaviour: when two windows
+        // genuinely share a name, the resolved name equals the recorded one and
+        // this check cannot tell them apart. That needs a candidate count, which
+        // the library does not expose -- see replay-window-selector-ambiguity.md.
+        assert!(resolved_is_recorded_target(
+            "Untitled - Notepad",
+            "Untitled - Notepad"
+        ));
     }
 
     #[test]

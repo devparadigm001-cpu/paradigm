@@ -1,8 +1,11 @@
 # Selector names match by substring, so a selector can resolve onto the wrong element
 
 **Status:** confirmed at the source and reproduced with a real production
-selector on a real desktop. **Not fixed** — this session established whether the
-risk is real, deliberately without attempting a remedy.
+selector on a real desktop. **Mitigated at replay** (2026-08-09): replay now
+refuses to act when a resolved element's name does not equal the recorded one,
+tolerating only a leading `*`. The underlying containment matching is unchanged —
+this catches the consequence, not the cause. See
+`post-execution-verification-design.md`.
 **Affected:** every selector the product builds. `src/compile/mod.rs`
 (`selector_for`) constructs `role:…|name:…`, and `src/replay/mod.rs` resolves it.
 The matching itself is `terminator-rs`.

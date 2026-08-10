@@ -1437,6 +1437,327 @@ async fn windowid_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ----------------------------------------------------- replaycheck mode ----
+//
+// Does a LEGITIMATE replay still succeed with the target check in place?
+//
+// This is the over-caution risk, and it is the reason the ambiguity fix was
+// abandoned: a check that rejects correct replays is worse than the bug it
+// prevents. The existing suite does not cover it -- `replay_aborted`'s two tests
+// halt on redaction and on not-found respectively, so neither exercises a
+// successful resolve-then-act, and `ipc_pipeline` now fails before reaching
+// replay at all.
+//
+// So: record a small playbook against the probe's own page, store it in a
+// TEMPORARY database, replay it, and report every step outcome. Nothing touches
+// the real store, and the target is a page this probe wrote.
+
+async fn replaycheck_mode() -> ExitCode {
+    use paradigm_lib::compile::{compile, store, ReversibilityPolicy};
+    use paradigm_lib::labeling::RedactionPolicy;
+
+    println!("== does a legitimate replay still succeed? ==\n");
+    println!("Records a small playbook, stores it in a temp database, replays it.");
+    println!("WARNING: performs real clicks and typing. Hands off.\n");
+
+    let page = std::env::temp_dir().join("paradigm-text-capture-probe.html");
+    if let Err(e) = std::fs::write(&page, PAGE) {
+        eprintln!("could not write probe page: {e}");
+        return ExitCode::FAILURE;
+    }
+    let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+    for browser in browser_order() {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, &url])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("waiting 10s for the browser...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let field = match desktop
+        .locator("role:Edit|name:FieldA")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not find FieldA: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // ---- record -----------------------------------------------------------
+    let session = match CaptureSession::start_session(
+        "replaycheck",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    println!("-- recording: click FieldA, type, click Done --");
+    robust_click(&desktop, &field);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    for ch in "replaycheck".chars() {
+        let _ = field.type_text(&ch.to_string(), false);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    if let Ok(done) = desktop
+        .locator("role:Button|name:Done")
+        .first(Some(Duration::from_secs(8)))
+        .await
+    {
+        robust_click(&desktop, &done);
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("   captured {} action(s)", report.actions.len());
+    if report.actions.is_empty() {
+        eprintln!("   nothing captured -- cannot test replay. Inconclusive.");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- compile + store in a TEMP database -------------------------------
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("temp db failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let playbook = compile(
+        &report.actions,
+        "Replay Check",
+        &ReversibilityPolicy::placeholder(),
+        &RedactionPolicy::placeholder(),
+    );
+    if let Err(e) = store::store(&mut conn, &playbook) {
+        eprintln!("store failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("   stored {} step(s)", playbook.steps.len());
+
+    // ---- replay -----------------------------------------------------------
+    println!("\n-- replaying --");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let run = match paradigm_lib::replay::replay(&mut conn, &desktop, &playbook.id).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("replay failed to run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n================ RESULTS ================\n");
+    println!("  run status: {}", run.status);
+    println!("  steps: {} attempted of {}\n", run.steps_attempted(), run.steps_total);
+
+    let mut wrong_target = 0usize;
+    for o in &run.outcomes {
+        println!(
+            "  [{}] {:<9} {}",
+            o.step_order,
+            o.action_type,
+            o.result.label()
+        );
+        println!("       selector {:?}", o.selector.as_deref().unwrap_or("-"));
+        if o.result.label().contains("wrong element") {
+            wrong_target += 1;
+            println!("       {}", o.detail);
+        }
+    }
+
+    println!("\n--- verdict ---");
+    println!("  steps rejected as wrong-target : {wrong_target}");
+    if wrong_target == 0 && !run.outcomes.iter().any(|o| o.result.is_failure()) {
+        println!("\n  PASS: a legitimate replay still succeeds end to end. The target");
+        println!("  check did not reject any correct step -- no over-caution here.");
+    } else if wrong_target > 0 {
+        println!("\n  OVER-CAUTION: the check rejected a step of a replay that was");
+        println!("  recorded moments earlier against the same page. That is a false");
+        println!("  positive and the rule needs revisiting.");
+    } else {
+        println!("\n  Replay had failures, but none from the target check. Look at the");
+        println!("  outcomes above before drawing conclusions.");
+    }
+
+    ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------ titledrift mode ----
+//
+// Measures the false-positive risk of the target check BEFORE it is built.
+//
+// The check compares a resolved element's name against the recorded name for
+// EQUALITY, where matching is currently containment. That can only reject cases
+// containment ACCEPTED -- i.e. where the resolved name properly contains the
+// recorded one. Any other drift already fails to resolve today, so it is not a
+// new failure.
+//
+// That leaves exactly one worry: a window that gains decoration and is still the
+// same window. `*Untitled - Notepad` is the canonical case. This reproduces it
+// with a page that prepends `*` on input, because Notepad itself hands new
+// launches to an existing instance and cannot be targeted reliably.
+
+const DRIFT_PAGE: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>DriftProbe</title></head>
+<body style="font-family:sans-serif;padding:2rem">
+<h2>Title drift probe</h2>
+<p>Typing here prepends a "*" to the window title, the way an editor marks
+unsaved changes.</p>
+<input id="f" aria-label="DriftField" style="font-size:1.2rem;width:24rem"
+       oninput="document.title = this.value ? '*DriftProbe' : 'DriftProbe'">
+</body></html>
+"#;
+
+async fn titledrift_mode() -> ExitCode {
+    println!("== title drift: how risky is exact name matching? ==\n");
+
+    let page = std::env::temp_dir().join("paradigm-drift-probe.html");
+    if let Err(e) = std::fs::write(&page, DRIFT_PAGE) {
+        eprintln!("could not write probe page: {e}");
+        return ExitCode::FAILURE;
+    }
+    let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+    for browser in browser_order() {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "--new-window", &url])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("waiting 10s for the browser...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let field = match desktop
+        .locator("role:Edit|name:DriftField")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("could not find the drift field: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The window name as capture would record it.
+    // Read the window through a locator, not `field.window()`: the latter
+    // returns an element whose name is empty for browser windows, which made an
+    // earlier version of this test report "no drift" when it had measured
+    // nothing at all.
+    async fn read_window(desktop: &Desktop) -> String {
+        for sel in ["role:Window|name:DriftProbe", "role:Window|name:Drift"] {
+            if let Ok(w) = desktop
+                .locator(sel)
+                .first(Some(Duration::from_secs(3)))
+                .await
+            {
+                if let Some(n) = w.name() {
+                    if !n.is_empty() {
+                        return n;
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+
+    let window_before = read_window(&desktop).await;
+    println!("  window name BEFORE typing : {window_before:?}");
+    if window_before.is_empty() {
+        eprintln!("  could not read the window name -- cannot measure drift. Aborting.");
+        return ExitCode::FAILURE;
+    }
+
+    robust_click(&desktop, &field);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = field.type_text("x", false);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let window_after = read_window(&desktop).await;
+    println!("  window name AFTER typing  : {window_after:?}");
+    if window_after.is_empty() {
+        eprintln!("  could not read the window name after typing -- inconclusive.");
+        return ExitCode::FAILURE;
+    }
+
+    println!("\n--- what each rule would do ---");
+    let contains = window_after.contains(&window_before);
+    let exact = window_after == window_before;
+    let star_ok = window_after == format!("*{window_before}")
+        || window_after
+            .strip_prefix('*')
+            .map(|s| s == window_before)
+            .unwrap_or(false);
+
+    println!("  today (contains)        : {}", if contains { "resolves" } else { "does NOT resolve" });
+    println!("  strict exact            : {}", if exact { "accepts" } else { "REJECTS -- false positive" });
+    println!("  exact, allowing a '*'   : {}", if exact || star_ok { "accepts" } else { "REJECTS" });
+
+    println!("\n--- verdict ---");
+    if !contains {
+        println!("  The drifted title does not contain the recorded one, so this step");
+        println!("  ALREADY fails to resolve today. Exact matching makes it no worse --");
+        println!("  the false-positive worry does not apply to this kind of drift.");
+    } else if !exact && star_ok {
+        println!("  Real false positive for strict exact matching, and it is exactly the");
+        println!("  '*' decoration case. Allowing a single leading '*' covers it while");
+        println!("  still rejecting the Paradigm-style collision.");
+    } else if !exact {
+        println!("  Real false positive, and NOT covered by a '*' rule -- the drift is");
+        println!("  something else. Strict exact matching would need reconsidering.");
+    } else {
+        println!("  No drift observed; the title did not change.");
+    }
+
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------------- verify mode ----
 //
 // Prototype of post-execution verification for replay, tested against the four
@@ -2709,6 +3030,12 @@ async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "replaycheck") {
+        return replaycheck_mode().await;
+    }
+    if std::env::args().any(|a| a == "titledrift") {
+        return titledrift_mode().await;
+    }
     if std::env::args().any(|a| a == "verify") {
         return verify_mode().await;
     }

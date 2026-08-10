@@ -1,7 +1,8 @@
 # Replay verification: design, prototype, and what it would actually have caught
 
-**Status:** design + analytic prototype. **Nothing shipped**, and no change made
-to `replay/mod.rs` — deliberately, per the scope this was investigated under.
+**Status:** design + analytic prototype, and **the target check is now
+implemented** (2026-08-09) — see "The target check, implemented". The two
+outcome-based designs remain unbuilt.
 **Affected:** would touch `src/replay/mod.rs`, and for one of the three designs
 also `src/capture` and the stored payload shape.
 **Found / written:** 2026-08-09, motivated by four independently-discovered
@@ -180,15 +181,99 @@ boundable change — unlike Design B, which touches capture, storage, redaction 
 replay together, and which this project's history suggests would not land in one
 attempt.
 
+## The target check, implemented (2026-08-09)
+
+The one recommendation from this design is now in `replay/mod.rs`. Both
+resolution sites — the element path used by click/type, and the window path used
+by navigate — compare the resolved element's name against `payload.target_name`
+before acting, and refuse the step if they disagree.
+
+### The false-positive risk was measured first, and it is real
+
+Strict equality was not adopted blindly. The risk named in this doc —
+legitimate title drift such as `*Untitled - Notepad` — was tested before
+implementation, using a page that prepends `*` on input the way an editor marks
+unsaved changes (Notepad itself cannot be targeted reliably; it hands new
+launches to an existing instance):
+
+```
+  window name BEFORE typing : "DriftProbe - Personal - Microsoft Edge"
+  window name AFTER typing  : "*DriftProbe - Personal - Microsoft Edge"
+
+  today (contains)      : resolves
+  strict exact          : REJECTS -- false positive
+  exact, allowing a '*' : accepts
+```
+
+**Strict equality would have broken a working replay.** So the implemented rule
+is equality with exactly one tolerance: a single leading `*`.
+
+That tolerance is the narrowest rule covering the measured case, not a lenient
+default. It still rejects the collision this exists to catch —
+`"Paradigm Text Capture Probe and 63 more pages…"` is neither `"Paradigm"` nor
+`"*Paradigm"` — and a unit test pins that the tolerance cannot widen into a
+general prefix allowance.
+
+### Why the blast radius is smaller than it looks
+
+Worth stating because it is not obvious: **this check can only reject matches
+that containment already accepted.** If a title drifted in any other way, the
+recorded name is not a substring of the resolved one and the selector fails to
+resolve today, before this check runs. So the only behaviour that changes is the
+"resolved name properly contains recorded name" case — which is precisely the
+bug, plus the `*` decoration now tolerated.
+
+### Failure handling
+
+A new `StepResult::FailedWrongTarget`, deliberately distinct from
+`FailedNotFound`. "Found nothing" and "found the wrong thing" have different
+causes and different fixes, and conflating them would hide the very failure this
+surfaces. The step aborts before acting, following the redaction-halt precedent:
+nothing has happened yet, so refusing costs nothing, while acting on the wrong
+element cannot be undone.
+
+### Evidence
+
+| Check | Result |
+|---|---|
+| The real measured collision (`"Paradigm"` vs the browser title) | **rejected** |
+| Exact matches (`"Text editor"`, `"Untitled - Notepad"`) | accepted |
+| The `*` drift case, measured live | accepted |
+| Tolerance cannot widen (`"Paradigm"` vs `"*Paradigm Extra"`, `"To"` vs `"Write your prompt to Claude"`) | rejected |
+| Two windows sharing a name | **not detectable** — documented as a known limit |
+| **A legitimate replay, recorded and replayed live** | **4/4 steps executed, status completed, 0 rejections** |
+| Suite | 87 lib, 8 db_encryption, 15 ipc_commands, 2 replay_aborted pass |
+| A–D web trials, multi-line both exit paths, window-switch ordering | unchanged |
+
+The live replay is the one that mattered. Over-caution is what sank the
+ambiguity fix, and **the existing suite does not cover it**: `replay_aborted`'s
+two tests halt on redaction and on not-found respectively, so neither exercises a
+successful resolve-then-act, and `ipc_pipeline` now fails before reaching replay
+at all. A dedicated probe (`text_capture_probe -- replaycheck`) records a small
+playbook, stores it in a temporary database, replays it, and reports every step
+outcome. It passed 4/4 including a navigate step whose selector was a full
+browser window title.
+
+### What it does not cover
+
+* **Selector ambiguity** — two windows genuinely sharing a name. The resolved
+  name equals the recorded one, so this check passes against the wrong window.
+  Unchanged and still open.
+* **Steps with no recorded target name.** The check is skipped rather than
+  failing, so nothing regresses for older or unnamed steps.
+* **A tab-count change between record and replay.** The selector would not
+  resolve at all in that case, so the step fails as `FailedNotFound` exactly as
+  it does today — this check neither helps nor hurts there.
+* **False-positive rate in sustained real use.** One live replay is not a rate.
+  The check has been shown not to reject a correct replay once; that is weaker
+  than knowing how often it might.
+
 ## Next steps
 
-- [ ] **Prototype the target check against a live replay** and measure its false
-      positive rate on playbooks that currently work. That number decides
-      everything; without it this is a design, not a plan.
-- [ ] **Decide whether exact name equality is too strict**, given titles that
-      carry volatile suffixes (`*Untitled - Notepad`). Anchoring — the recorded
-      name matching the whole name or its start — may be the usable middle.
-      Overlaps with `selector-matching-precision.md`.
+- [x] ~~**Prototype the target check against a live replay.**~~ **Done and
+      shipped** — see "The target check, implemented".
+- [x] ~~**Decide whether exact name equality is too strict.**~~ **Done, and it
+      is** — measured, with a narrow tolerance chosen as a result. See below.
 - [ ] **Settle the redaction interaction before building Design B.** If recorded
       end-state must be redacted for sensitive fields, B cannot verify those
       fields at all, and it is worth knowing that before paying for the
