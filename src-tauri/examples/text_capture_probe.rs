@@ -1437,6 +1437,159 @@ async fn windowid_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ---------------------------------------------------------- verify mode ----
+//
+// Prototype of post-execution verification for replay, tested against the four
+// bugs found this project, using their REAL recorded values.
+//
+// Motivation: four independently-found defects share one shape -- replay reports
+// success while doing the wrong thing -- and nothing ever checks whether a
+// replayed action produced what the recording expected.
+//
+// Three candidate checks are implemented as pure predicates and run against the
+// actual data from each bug. Pure functions, because the pre-fix behaviour is
+// already captured in the known-issues docs and re-creating it live would add
+// nothing but risk.
+
+/// PRE-EXECUTION. Does the element the selector resolved to actually carry the
+/// name that was recorded? Cheap, and runs before anything is acted on.
+fn check_target(recorded_name: &str, resolved_name: &str) -> bool {
+    recorded_name == resolved_name
+}
+
+/// DESIGN A, post-execution. Did the action do what the payload said?
+/// For append-style typing: after == before + payload.
+///
+/// Note what this compares: replay's behaviour against the recording's
+/// instruction. It cannot see whether the instruction itself was right.
+fn check_action_a(before: &str, payload: &str, after: &str) -> bool {
+    let expected = format!("{before}{payload}");
+    norm_nl(&expected) == norm_nl(after)
+}
+
+/// DESIGN B, post-execution. Does the resulting state match the state the
+/// RECORDING ended in? Requires capture to store that state, which it does not
+/// today -- this is the prototype's proposal, not current behaviour.
+fn check_outcome_b(recorded_end_state: &str, actual_after: &str) -> bool {
+    norm_nl(recorded_end_state) == norm_nl(actual_after)
+}
+
+fn norm_nl(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn yn(b: bool) -> &'static str {
+    if b {
+        "passes"
+    } else {
+        "FLAGS IT"
+    }
+}
+
+async fn verify_mode() -> ExitCode {
+    println!("== post-execution verification: prototype against real bugs ==\n");
+    println!("Each case uses the values actually recorded when the bug was live.\n");
+
+    // ---- 1. multi-line duplication ---------------------------------------
+    //
+    // Pre-fix payloads (docs/known-issues/multiline-document-capture-duplicates.md):
+    // step 1 "alpha line", step 2 "alpha line\nbeta line". Replay types both at
+    // the caret, producing 30 characters for a 20 character field.
+    println!("---------------- 1. multi-line duplication (capture-time bug) ----------------");
+    {
+        let s1_before = "";
+        let s1_payload = "alpha line";
+        let s1_after = "alpha line";
+
+        let s2_before = "alpha line";
+        let s2_payload = "alpha line\nbeta line"; // the cumulative payload
+        let s2_after = "alpha linealpha line\nbeta line"; // what replay produces
+
+        // What the recording's own field actually held at capture time.
+        let recorded_end_state = "alpha line\nbeta line";
+
+        println!("  step 1  A: {}", yn(check_action_a(s1_before, s1_payload, s1_after)));
+        println!("  step 2  A: {}", yn(check_action_a(s2_before, s2_payload, s2_after)));
+        println!(
+            "  step 2  B: {}   (recorded end state {:?} vs actual {:?})",
+            yn(check_outcome_b(recorded_end_state, s2_after)),
+            recorded_end_state,
+            s2_after
+        );
+        println!("\n  Design A passes -- replay appended exactly what the payload said.");
+        println!("  The payload itself was wrong, which A cannot see.");
+        println!("  Design B catches it: the field ends up different from the recording's.");
+    }
+
+    // ---- 2. window-switch misattribution ---------------------------------
+    //
+    // Recorded order was click FieldA, navigate Calculator, type FieldA. Replay
+    // switches to Calculator and then types into the browser.
+    println!("\n---------------- 2. window-switch misattribution (capture-time bug) ----------------");
+    {
+        let payload = "switchtest0123456789";
+        let before = "";
+        let after = "switchtest0123456789";
+
+        println!("  type step  A: {}", yn(check_action_a(before, payload, after)));
+        println!("  type step  B (content only): {}", yn(check_outcome_b(after, after)));
+
+        // The only signal that distinguishes right from wrong here is context,
+        // not content: which application was in front when the step ran.
+        let foreground_at_capture = "msedge.exe";
+        let foreground_at_replay = "Calculator";
+        let context_ok = foreground_at_capture == foreground_at_replay;
+        println!(
+            "  type step  B (with foreground context): {}   ({foreground_at_capture:?} at capture vs {foreground_at_replay:?} at replay)",
+            yn(context_ok)
+        );
+        println!("\n  Content-only checks BOTH pass -- the right text reached the right field.");
+        println!("  Only a recorded-context check sees that it happened in the wrong place.");
+    }
+
+    // ---- 3 & 4. selector collision ---------------------------------------
+    //
+    // Real stored selector role:Window|name:Paradigm resolving onto a browser.
+    println!("\n---------------- 3. substring selector collision (replay-time bug) ----------------");
+    {
+        let recorded = "Paradigm";
+        let resolved = "Paradigm Text Capture Probe and 63 more pages - Personal - Microsoft Edge";
+        println!("  pre-execution target check: {}", yn(check_target(recorded, resolved)));
+        println!("      recorded {recorded:?}");
+        println!("      resolved {resolved:?}");
+        println!("\n  Caught BEFORE acting, by comparing names for equality rather than");
+        println!("  containment. The cheapest of the three checks, and the only one that");
+        println!("  prevents the wrong action instead of reporting it afterwards.");
+    }
+
+    // ---- 4. ambiguity ------------------------------------------------------
+    println!("\n---------------- 4. selector ambiguity (replay-time bug) ----------------");
+    {
+        let recorded = "Untitled - Notepad";
+        let resolved = "Untitled - Notepad"; // both candidate windows carry this name
+        println!("  pre-execution target check: {}", yn(check_target(recorded, resolved)));
+        println!("\n  NOT caught. Two windows genuinely share the name, so the resolved");
+        println!("  element's name equals the recorded one and every content check");
+        println!("  afterwards succeeds -- against the wrong window. Detecting this needs");
+        println!("  a candidate COUNT, which the library does not expose (see");
+        println!("  replay-window-selector-ambiguity.md).");
+    }
+
+    // ---- summary -----------------------------------------------------------
+    println!("\n================ COVERAGE ================\n");
+    println!("  bug                              A(action)  B(outcome)  B+context  target");
+    println!("  {}", "-".repeat(76));
+    println!("  multi-line duplication           no         YES         YES        no");
+    println!("  window-switch misattribution     no         no          YES        no");
+    println!("  substring selector collision     no         no          no         YES");
+    println!("  selector ambiguity               no         no          no         no");
+    println!("\n  1 of 4 by pre-execution target check (cheapest, prevents the action)");
+    println!("  2 of 4 by outcome + recorded context (needs capture to store state)");
+    println!("  3 of 4 combined. Ambiguity remains uncovered by any of these.");
+
+    ExitCode::SUCCESS
+}
+
 // ------------------------------------------------------- selectors mode ----
 //
 // Is substring name matching a real production risk, or a curiosity?
@@ -2556,6 +2709,9 @@ async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "verify") {
+        return verify_mode().await;
+    }
     if std::env::args().any(|a| a == "selectors") {
         return selectors_mode().await;
     }
