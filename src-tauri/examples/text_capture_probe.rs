@@ -1514,7 +1514,97 @@ async fn gmailpicker_mode() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("found Compose; clicking it once\n");
+    // ---- PRE-FLIGHT: guarantee a genuinely cold start ---------------------
+    //
+    // The previous run measured 19ms instead of 6743ms because a draft left
+    // open by the run before it meant Gmail restored the compose window, so the
+    // widget was already rendered. Reloading the page is not enough -- Gmail
+    // restores compose state.
+    //
+    // Anything found open here is closed with Escape, and ONLY after its body
+    // is read and confirmed empty. A draft with content, or one whose content
+    // cannot be read, aborts the probe rather than being touched.
+    println!("-- pre-flight: looking for a leftover compose window --");
+
+    let body_selectors = [
+        "role:Edit|name:Message Body",
+        "role:Document|name:Message Body",
+        "role:Edit|name:Message body",
+    ];
+
+    for round in 0..3 {
+        let still_open = desktop
+            .locator(PICKER_SELECTORS[0])
+            .first(Some(Duration::from_secs(2)))
+            .await
+            .is_ok();
+        if !still_open {
+            println!("  no compose window open{}", if round == 0 { "" } else { " (closed)" });
+            break;
+        }
+
+        // Confirm it is empty before touching it.
+        let mut body = None;
+        for sel in body_selectors {
+            if let Ok(b) = desktop
+                .locator(sel)
+                .first(Some(Duration::from_secs(2)))
+                .await
+            {
+                body = Some(b);
+                break;
+            }
+        }
+
+        let Some(body) = body else {
+            eprintln!(
+                "  REFUSING TO PROCEED: a compose window appears open but its body\n  \
+                 could not be read, so it cannot be confirmed empty. Not touching it."
+            );
+            return ExitCode::FAILURE;
+        };
+
+        match body.text(0) {
+            Ok(t) if t.trim().is_empty() => {
+                println!("  compose window open, body confirmed EMPTY -- closing with Escape");
+                let _ = body.press_key("{Escape}");
+            }
+            Ok(t) => {
+                eprintln!(
+                    "  REFUSING TO PROCEED: the open draft contains {} characters.\n  \
+                     That is not the empty draft this probe created. Leaving it alone.",
+                    t.chars().count()
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("  REFUSING TO PROCEED: could not read the draft body to confirm it is empty: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // Hard gate: the widget must be absent before this counts as cold.
+    let cold = desktop
+        .locator(PICKER_SELECTORS[0])
+        .first(Some(Duration::from_secs(3)))
+        .await
+        .is_err();
+    println!(
+        "  cold-start precondition (picker ABSENT before clicking Compose): {}",
+        if cold { "MET" } else { "NOT MET" }
+    );
+    if !cold {
+        eprintln!(
+            "\n  Cannot produce a cold start -- the picker is still present.\n  \
+             Any timing measured now would repeat the warm-widget mistake.\n  \
+             Reporting that rather than publishing a meaningless number."
+        );
+        return ExitCode::FAILURE;
+    }
+
+    println!("\nfound Compose; clicking it once\n");
 
     let opened_at = std::time::Instant::now();
     robust_click(&desktop, &compose);

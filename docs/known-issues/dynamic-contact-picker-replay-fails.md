@@ -5,9 +5,11 @@ isolates it. **Root cause measured** (2026-08-09): the element exists and the
 selector is correct — it simply arrives 6,743 ms after Compose, against an
 8,000 ms locate budget. A latency problem, not an accessibility one.
 **Fix applied** the same day: the locate budget is split, with elements now
-allowed 15s. **Verification is incomplete** — the post-fix run measured a warm
-widget rather than the cold start the fix exists for, and that is recorded as an
-open item rather than glossed. See "The fix".
+allowed 15s. **Verification is incomplete, and the 6,743 ms figure has since
+been corrected** — that is a cold-*application* cost, not the widget's render
+latency, which is ~12 ms once Gmail is warm. The fix is insurance against a
+condition that has been produced exactly once and never with the fix in place.
+See "The fix" and "Correction".
 **Affected:** replay of dynamic, JS-rendered widgets — observed on Gmail's
 compose "To" field (`role:group`, name `"To - Select contacts"`). Capture
 records it; `replay` cannot find it again.
@@ -300,7 +302,8 @@ That was predicted and then measured:
   went from **8.62s to 15.40s**.
 * A nonexistent selector against the 15s budget took **16.57s** — a ~10%
   overshoot, so the locator does not honour the deadline precisely. The real
-  cost of an honest failure is closer to 16.5s than 15s.
+  cost of an honest failure is closer to 16.5s than 15s. Reproduced at
+  **16.70s** on a later run, so the overshoot is consistent rather than noise.
 
 This is accepted because the opposite error is worse: failing a step whose
 element was merely slow fails the entire run and forces the user to re-record.
@@ -313,23 +316,62 @@ Waiting is an annoyance; a false failure destroys the work.
 ordering correct. (`ipc_pipeline` remains deliberately red on the unrelated
 no-settle race.)
 
-#### NOT yet verified: the cold-start case this fix exists for
+#### Correction: 6,743 ms is not the widget's render latency
 
-**The post-fix run did not reproduce the scenario.** The picker was found at
-**19 ms**, not 6,743 ms, because the empty draft left by the *previous* probe
-run was still open — Gmail restored the compose window, so the widget was
-already rendered before the click. The budget numbers from that run (721 ms,
-731 ms) measure a warm widget and prove nothing about the fix.
+Two follow-up runs were needed, and the second overturned the explanation above
+this section. Both are recorded because the correction is the useful part.
 
-That does clarify what the original 6,743 ms measured: **cold-start latency**,
-Gmail loading plus compose opening from scratch, which is the realistic replay
-case. So the fix is correctly *sized* against a real measurement — it is simply
-not yet *confirmed* end to end under those conditions.
+**Run 2 (warm, accidental).** The picker was found at **19 ms**. The empty draft
+from run 1 was still open, so Gmail restored the compose window and the widget
+was already rendered before the click. Measured a warm widget; proved nothing.
 
-Closing this gap needs Gmail in a cold state, which means closing the compose
-window first. The probe deliberately does not do that, having committed to
-clicking Compose and nothing else. **Recorded as an open verification, not
-claimed as done.**
+**Run 3 (widget-cold, deliberate).** The probe gained a pre-flight that closes
+any leftover compose window — only after reading its body and confirming it
+empty, aborting otherwise — and then *gates* on the picker being absent before
+clicking Compose:
+
+```
+  no compose window open
+  cold-start precondition (picker ABSENT before clicking Compose): MET
+
+  FOUND at     12ms  role:Group|name:To - Select contacts
+```
+
+**The precondition was met and the picker still appeared in 12 ms.** So 6,743 ms
+is not what this widget costs to render. Widget-cold, it is ~12 ms — a **560×
+difference** from the original measurement.
+
+What actually differed in run 1: Gmail itself had been loaded 20 seconds earlier
+and was still initialising. Runs 2 and 3 clicked Compose in an already-warm
+Gmail. **Widget-cold and app-cold are different things, and only the first was
+achieved.**
+
+#### What this means for the fix
+
+The fix stands, but its justification changes shape:
+
+* The 6,743 ms figure is real — it was measured — but it is a **first-interaction
+  cost of a cold Gmail application**, not a property of the picker.
+* In the ordinary warm case the picker resolves in ~12 ms, so the 15 s budget is
+  not routinely stressed. It is insurance against the cold-app case.
+* The observed spread is **12 ms to 6,743 ms**, and nothing establishes 6,743 ms
+  as the ceiling — it is one sample of one cold start. A budget sized at 2.2× a
+  single unbounded-looking sample is defensible insurance, not a calculated
+  bound, and should be described that way.
+
+#### Still not verified: an app-cold replay
+
+Reproducing 6,743 ms needs Gmail genuinely cold — the tab closed, or a fresh
+browser profile — not merely the compose window closed. That was not achieved,
+so **the fix has never been exercised against the condition it was written
+for.**
+
+What *is* established: the widget exists, the selector is correct, the warm path
+is fast, and the failure-cost of the longer budget is measured. What is not: that
+15 s actually covers a cold-app start, because that start has been produced
+exactly once, by accident, before the fix existed.
+
+**Recorded as an open verification. Not claimed as done.**
 
 ### Effect on the "two separate bugs" verdict: none
 
@@ -413,10 +455,16 @@ a large share of the obvious use cases for this product are unavailable.
 - [x] ~~**Decide what the locate budget should be.**~~ **Done** — split into
       `WINDOW_LOCATE_TIMEOUT` (8s) and `ELEMENT_LOCATE_TIMEOUT` (15s). See
       "The fix".
-- [ ] **Confirm the fix against a cold Gmail.** The post-fix run measured a warm
-      widget (19 ms) because the previous run's draft was still open, so the
-      6.7s cold-start case was never re-exercised with the new budget. Needs
-      Gmail with no compose window open.
+- [ ] **Confirm the fix against an app-cold Gmail.** Two attempts failed to
+      reproduce the condition. Closing the compose window is not enough — that
+      yields 12 ms, because the *application* is still warm. Reproducing
+      6,743 ms needs the Gmail tab closed entirely or a fresh browser profile.
+      Until then the fix has never been exercised against the case it was
+      written for.
+- [ ] **Establish whether 6,743 ms is anywhere near the ceiling.** It is one
+      sample of one cold start. The observed spread is 12 ms to 6,743 ms with no
+      upper bound established, so 15s is insurance rather than a calculated
+      bound. Several cold starts would say whether it is the right size.
 - [ ] **Consider a readiness signal instead of a deadline.** If failures recur
       at 15s, a larger number is the wrong answer. Waiting for the element to
       appear, with a generous ceiling, would decouple the common case from the
