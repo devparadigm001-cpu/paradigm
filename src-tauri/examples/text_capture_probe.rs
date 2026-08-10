@@ -1437,6 +1437,175 @@ async fn windowid_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------- selectors mode ----
+//
+// Is substring name matching a real production risk, or a curiosity?
+//
+// Terminator matches names with `contains_name`, not exact equality
+// (`platforms/windows/engine.rs:1204`, where the upstream comment says the
+// choice is "undetermined"). So `name:To` matches any element whose name
+// contains "to" -- which is how a Gmail selector resolved onto Claude Code's
+// prompt input and a Windows taskbar button.
+//
+// The question that decides whether this matters is not "can substring matching
+// collide" -- it obviously can -- but "does Paradigm's capture actually produce
+// names short or generic enough to collide in real use?"
+//
+// So this reads the REAL selectors out of the on-device database and resolves
+// each against the live desktop, reporting when a stored selector lands on an
+// element whose name is not the one that was recorded. Real selectors, real
+// multi-application desktop. Read-only: nothing is clicked or typed.
+//
+//     cargo run --example text_capture_probe -- selectors <app_data_dir>
+
+async fn selectors_mode() -> ExitCode {
+    let dir = match std::env::args().nth(2).map(std::path::PathBuf::from) {
+        Some(d) => d,
+        None => {
+            eprintln!("usage: cargo run --example text_capture_probe -- selectors <app_data_dir>");
+            eprintln!("  no default -- this reads a real database.");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("== selector precision: do real captured names collide? ==\n");
+
+    let (db_path, key_path) = paradigm_lib::db::paths_in(&dir);
+    let conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("could not open {}: {e}", db_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Every stored step's recorded target.
+    let mut stmt = match conn.prepare(
+        "SELECT action_type, action_payload_json FROM playbook_steps ORDER BY step_order",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("query failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rows: Vec<(String, String)> = match stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .and_then(|m| m.collect::<Result<Vec<_>, _>>())
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("read failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if rows.is_empty() {
+        println!("  no stored steps in this database -- nothing to survey.");
+        return ExitCode::SUCCESS;
+    }
+
+    // ---- 2. what does capture actually produce? ---------------------------
+    println!("================ WHAT CAPTURE ACTUALLY RECORDS ================\n");
+    println!("  {:<9} {:<44} {:>5}  selector", "action", "target name", "len");
+    println!("  {}", "-".repeat(100));
+
+    struct Recorded {
+        name: String,
+        selector: String,
+    }
+    let mut recorded = Vec::new();
+
+    for (action, raw) in &rows {
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+        let name = v["target"]["name"].as_str().unwrap_or("").to_string();
+        let selector = v["target"]["selector"].as_str().unwrap_or("").to_string();
+        println!(
+            "  {action:<9} {:<44} {:>5}  {selector}",
+            if name.is_empty() { "<none>" } else { &name },
+            name.chars().count()
+        );
+        if !selector.is_empty() {
+            recorded.push(Recorded { name, selector });
+        }
+    }
+
+    let short: Vec<&Recorded> = recorded
+        .iter()
+        .filter(|r| !r.name.is_empty() && r.name.chars().count() <= 6)
+        .collect();
+    println!(
+        "\n  {} step(s) with a selector; {} have a target name of 6 characters or fewer",
+        recorded.len(),
+        short.len()
+    );
+
+    // ---- 3. do those selectors collide on a real desktop? -----------------
+    println!("\n================ DO THEY COLLIDE ON THIS DESKTOP? ================\n");
+    println!("  Resolving each RECORDED selector against the live desktop and");
+    println!("  comparing what it lands on against what was captured.\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut collisions = 0usize;
+    let mut exact = 0usize;
+    let mut missing = 0usize;
+
+    for r in &recorded {
+        match desktop
+            .locator(r.selector.as_str())
+            .first(Some(Duration::from_secs(2)))
+            .await
+        {
+            Ok(el) => {
+                let got = el.name().unwrap_or_default();
+                if got == r.name {
+                    exact += 1;
+                    println!("  OK        {:<44} -> exact match", r.selector);
+                } else {
+                    collisions += 1;
+                    println!("  COLLISION {:<44}", r.selector);
+                    println!("            recorded name : {:?}", r.name);
+                    println!("            resolved to   : {:?} (role={:?})", got, el.role());
+                }
+            }
+            Err(_) => {
+                missing += 1;
+                println!("  absent    {:<44} -> not on screen now", r.selector);
+            }
+        }
+    }
+
+    println!("\n================ VERDICT ================\n");
+    println!("  selectors tested       : {}", recorded.len());
+    println!("  resolved exactly       : {exact}");
+    println!("  resolved to SOMETHING ELSE : {collisions}");
+    println!("  not present right now  : {missing}");
+
+    if collisions > 0 {
+        println!(
+            "\n  Real captured selectors resolve onto the wrong element on a real\n  \
+             desktop. Substring matching is a production risk, not a curiosity."
+        );
+    } else if exact > 0 {
+        println!(
+            "\n  Every selector that resolved landed on its recorded target. On this\n  \
+             evidence substring matching is a real mechanism that does NOT manifest,\n  \
+             because capture records full labels rather than fragments."
+        );
+    } else {
+        println!("\n  Nothing resolved -- inconclusive. Re-run with the captured apps open.");
+    }
+
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------- gmailcleanup mode ----
 //
 // Two jobs, and the first sets up a decisive test for the second.
@@ -2387,6 +2556,9 @@ async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "selectors") {
+        return selectors_mode().await;
+    }
     if std::env::args().any(|a| a == "gmailcleanup") {
         return gmailcleanup_mode().await;
     }

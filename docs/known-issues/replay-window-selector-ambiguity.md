@@ -79,6 +79,15 @@ Two consequences follow directly:
    lookups producing separate results, and the playbook has no way to express
    "the same window as before".
 
+## A compounding defect, filed separately
+
+Selector names match by **substring**, not exactly — `contains_name` in
+`terminator-rs`. So a selector can resolve onto an element that was never the
+target, even when only one thing matches. That is distinct from this bug, which
+is about several windows matching and replay picking one silently, but the two
+compound: substring matching enlarges the candidate pool that makes ambiguity
+likely in the first place. See `selector-matching-precision.md`.
+
 ## How this differs from the window-switch misattribution bug
 
 Worth stating plainly, because the two look similar and are filed next to each

@@ -304,9 +304,12 @@ faster route to the picker being ignored by capture, so capture is not choosing
 a slow selector when a fast one exists. The 15 s budget remains the right lever
 for this bug.
 
-Not investigated further here, but flagged: the same substring behaviour applies
-to every selector the product builds, and short element names are common. Whether
-that causes real mis-targeting elsewhere is untested.
+That broader question has since been investigated and the risk is **confirmed
+real** — a stored production selector (`role:Window|name:Paradigm`) was shown
+resolving onto a browser window on a live desktop. It also corrected the theory:
+the exposure is not short names but names that are substrings of longer on-screen
+text, which window titles produce constantly. Filed separately as
+`selector-matching-precision.md`.
 
 ### The fix: split the locate budget (2026-08-09)
 
