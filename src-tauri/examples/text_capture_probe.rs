@@ -1593,6 +1593,41 @@ async fn gmailpicker_mode() -> ExitCode {
         ),
     }
 
+    // ---- how the real budgets behave against this widget ------------------
+    //
+    // The point of the fix: 8s was barely wider than the widget's own latency.
+    // These are the two budgets replay now actually uses, measured end to end
+    // including the time the locator itself spends waiting.
+    println!("\n================ BUDGETS, MEASURED ================\n");
+
+    for (label, budget) in [("old 8s (window budget)", 8u64), ("new 15s (element budget)", 15)] {
+        let t = std::time::Instant::now();
+        let found = desktop
+            .locator(PICKER_SELECTORS[0])
+            .first(Some(Duration::from_secs(budget)))
+            .await
+            .is_ok();
+        println!(
+            "  {label:<26} -> {:<9} in {:?}",
+            if found { "FOUND" } else { "NOT FOUND" },
+            t.elapsed()
+        );
+    }
+
+    // A selector that cannot exist, to bound the cost of an honest failure.
+    let t = std::time::Instant::now();
+    let bogus = desktop
+        .locator("role:Group|name:ThisWidgetDoesNotExistAnywhere")
+        .first(Some(Duration::from_secs(15)))
+        .await
+        .is_ok();
+    println!(
+        "  {:<26} -> {:<9} in {:?}   <-- cost of an honest failure",
+        "nonexistent selector",
+        if bogus { "FOUND?!" } else { "NOT FOUND" },
+        t.elapsed()
+    );
+
     println!("\n  (an empty draft was created; nothing was typed or sent)");
     ExitCode::SUCCESS
 }

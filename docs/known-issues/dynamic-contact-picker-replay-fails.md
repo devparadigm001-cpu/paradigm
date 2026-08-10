@@ -1,10 +1,13 @@
 # Gmail's recipient picker captures but does not replay
 
 **Status:** confirmed by a real replay run, with a control recording that
-isolates it. **Root cause now measured** (2026-08-09): the element exists and
-the selector is correct — it simply arrives 6,743 ms after Compose, against an
-8,000 ms locate budget. A latency problem, not an accessibility one. See
-"Measured: the element exists, and arrives at 6.7s". Not fixed.
+isolates it. **Root cause measured** (2026-08-09): the element exists and the
+selector is correct — it simply arrives 6,743 ms after Compose, against an
+8,000 ms locate budget. A latency problem, not an accessibility one.
+**Fix applied** the same day: the locate budget is split, with elements now
+allowed 15s. **Verification is incomplete** — the post-fix run measured a warm
+widget rather than the cold start the fix exists for, and that is recorded as an
+open item rather than glossed. See "The fix".
 **Affected:** replay of dynamic, JS-rendered widgets — observed on Gmail's
 compose "To" field (`role:group`, name `"To - Select contacts"`). Capture
 records it; `replay` cannot find it again.
@@ -270,6 +273,64 @@ does address the same element, then capture choosing the slowest available one
 is the actual defect, and the remedy is in selector construction rather than in
 timeouts. **Recorded as an open question, not as evidence.**
 
+### The fix: split the locate budget (2026-08-09)
+
+`LOCATE_TIMEOUT` was one constant used for two different jobs. It is now two,
+because the jobs have different shapes:
+
+| Constant | Value | Used by | Why |
+|---|---|---|---|
+| `WINDOW_LOCATE_TIMEOUT` | 8s (unchanged) | `navigate` | A window either exists or it does not; waiting longer buys nothing, and `navigate` falls back to `activate_application`, so a miss is not fatal |
+| `ELEMENT_LOCATE_TIMEOUT` | **15s** (was 8s) | click / type | Elements in web applications render lazily. This is the path the picker failed on — `role:Group` is not a window |
+
+15s is ~2.2× the measured 6,743 ms. 3× was considered and rejected: the
+measurement came from a loaded machine (90+ browser tabs, three days' uptime),
+so 6.7s is likely near the slow end rather than the median.
+
+**A blanket increase was rejected deliberately.** Raising the window budget too
+would slow every honest "window not found" for no benefit, since window
+realisation was already shown to fit inside 5s.
+
+#### The cost, measured rather than asserted
+
+A longer budget means a genuinely wrong selector takes longer to fail honestly.
+That was predicted and then measured:
+
+* `tests/replay_aborted.rs`, which drives a deliberately-unfindable selector,
+  went from **8.62s to 15.40s**.
+* A nonexistent selector against the 15s budget took **16.57s** — a ~10%
+  overshoot, so the locator does not honour the deadline precisely. The real
+  cost of an honest failure is closer to 16.5s than 15s.
+
+This is accepted because the opposite error is worse: failing a step whose
+element was merely slow fails the entire run and forces the user to re-record.
+Waiting is an annoyance; a false failure destroys the work.
+
+#### Verified: no regression elsewhere
+
+82 lib, 8 `db_encryption`, 15 `ipc_commands`, 2 `replay_aborted` pass. A–D
+8/8 across two probe runs, both multi-line exit paths exact, window-switch
+ordering correct. (`ipc_pipeline` remains deliberately red on the unrelated
+no-settle race.)
+
+#### NOT yet verified: the cold-start case this fix exists for
+
+**The post-fix run did not reproduce the scenario.** The picker was found at
+**19 ms**, not 6,743 ms, because the empty draft left by the *previous* probe
+run was still open — Gmail restored the compose window, so the widget was
+already rendered before the click. The budget numbers from that run (721 ms,
+731 ms) measure a warm widget and prove nothing about the fix.
+
+That does clarify what the original 6,743 ms measured: **cold-start latency**,
+Gmail loading plus compose opening from scratch, which is the realistic replay
+case. So the fix is correctly *sized* against a real measurement — it is simply
+not yet *confirmed* end to end under those conditions.
+
+Closing this gap needs Gmail in a cold state, which means closing the compose
+window first. The probe deliberately does not do that, having committed to
+clicking Compose and nothing else. **Recorded as an open verification, not
+claimed as done.**
+
 ### Effect on the "two separate bugs" verdict: none
 
 The verdict stands. This sharpens Gmail's half rather than moving it:
@@ -349,12 +410,18 @@ a large share of the obvious use cases for this product are unavailable.
       19% margin. The note that it "would be embarrassing to redesign selector
       strategy over a timeout that was merely short" turned out to be the right
       instinct.
-- [ ] **Decide what the locate budget should be.** 8s is barely wider than one
-      real widget's render latency, and it is a fixed number applied to every
-      step. Options worth weighing: a larger constant, a budget that scales with
-      the target (web applications versus native controls), or waiting on a
-      readiness signal instead of a deadline. This is now the actual fix for
-      this bug.
+- [x] ~~**Decide what the locate budget should be.**~~ **Done** — split into
+      `WINDOW_LOCATE_TIMEOUT` (8s) and `ELEMENT_LOCATE_TIMEOUT` (15s). See
+      "The fix".
+- [ ] **Confirm the fix against a cold Gmail.** The post-fix run measured a warm
+      widget (19 ms) because the previous run's draft was still open, so the
+      6.7s cold-start case was never re-exercised with the new budget. Needs
+      Gmail with no compose window open.
+- [ ] **Consider a readiness signal instead of a deadline.** If failures recur
+      at 15s, a larger number is the wrong answer. Waiting for the element to
+      appear, with a generous ceiling, would decouple the common case from the
+      worst case — and would also fix the ~10% overshoot measured on the
+      deadline itself.
 - [ ] **Check whether the 16 ms selectors address the same element.** See
       "Unconfirmed" above. If they do, capture is choosing the slowest available
       selector and the remedy is in selector construction, not timeouts — which

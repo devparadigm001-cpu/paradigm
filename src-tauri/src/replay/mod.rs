@@ -58,9 +58,37 @@ use journal::{
     STATUS_FAILED,
 };
 
-/// How long to wait for each element. Step 2 proved 5s is enough for a
+/// How long to wait for a top-level WINDOW. Step 2 proved 5s is enough for a
 /// realized window; this allows margin without stalling a failed lookup.
-const LOCATE_TIMEOUT: Duration = Duration::from_secs(8);
+///
+/// Deliberately shorter than the element budget below. A window either exists
+/// or it does not — waiting longer buys nothing — and `navigate` falls back to
+/// `activate_application` when the selector misses, so a miss here is not fatal.
+const WINDOW_LOCATE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How long to wait for an ELEMENT inside an application.
+///
+/// Longer than the window budget because elements in modern web applications
+/// render lazily, and 8s turned out to be barely wider than one real widget's
+/// latency. Gmail's recipient picker (`role:Group|name:"To - Select contacts"`)
+/// was measured arriving **6,743ms** after Compose is clicked — a 19% margin
+/// against 8s, which normal variance closes. Run 7b99fae2 is what that looks
+/// like when it does: "element not found" for an element that was simply late.
+/// See docs/known-issues/dynamic-contact-picker-replay-fails.md.
+///
+/// 15s is ~2.2x the measured value. 3x was considered and rejected: the
+/// measurement came from a loaded machine (90+ browser tabs, three days
+/// uptime), so 6.7s is likely near the slow end rather than the median.
+///
+/// The cost is real and worth naming: a genuinely wrong selector now takes 15s
+/// to report an honest "not found" instead of 8s. That is accepted because the
+/// opposite error — failing a step whose element was merely slow — fails the
+/// whole run and forces the user to re-record, which is worse than waiting.
+///
+/// If real-world failures recur at 15s, the answer is not a larger number but a
+/// readiness signal: wait for the element to appear rather than for a deadline
+/// to expire.
+const ELEMENT_LOCATE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayError {
@@ -373,7 +401,7 @@ async fn execute_step(
 
     let element = match desktop
         .locator(selector)
-        .first(Some(LOCATE_TIMEOUT))
+        .first(Some(ELEMENT_LOCATE_TIMEOUT))
         .await
     {
         Ok(el) => el,
@@ -382,7 +410,7 @@ async fn execute_step(
                 StepResult::FailedNotFound,
                 format!(
                     "selector {selector:?} matched nothing within {:?}: {e}",
-                    LOCATE_TIMEOUT
+                    ELEMENT_LOCATE_TIMEOUT
                 ),
             )
         }
@@ -415,7 +443,11 @@ async fn navigate(
         // entirely, so a browser with three windows reports three matches for
         // any selector. Failing on that would break working playbooks.
         // See docs/known-issues/replay-window-selector-ambiguity.md.
-        match desktop.locator(selector).first(Some(LOCATE_TIMEOUT)).await {
+        match desktop
+            .locator(selector)
+            .first(Some(WINDOW_LOCATE_TIMEOUT))
+            .await
+        {
             Ok(window) => {
                 return match window.activate_window() {
                     Ok(()) => mk(
