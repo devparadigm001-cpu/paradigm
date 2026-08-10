@@ -262,18 +262,51 @@ This reframes the fix from "address the widget differently" to "the timeout is
 too tight for real web applications, and possibly should not be a fixed number
 at all".
 
-### Unconfirmed, and deliberately not claimed as a finding
+### The 16 ms selectors: confirmed false matches (2026-08-09)
 
-Three selectors reported found at **16 ms**, which is before the compose window
-could plausibly have rendered. The likely explanation is that they are **false
-matches on unrelated parts of the Gmail UI** — a search field, a column header —
-rather than faster routes to the same widget. What each resolved to was not
-captured, so this cannot be settled from the run above.
+Three selectors reported found at **16 ms**, before the compose window could
+plausibly have rendered. They were recorded as suspected false matches and left
+unresolved. **They have since been resolved, and they are false matches — but not
+on Gmail UI. They are not in the browser at all.**
 
-It matters, and deserves its own check: *if* a faster-appearing selector really
-does address the same element, then capture choosing the slowest available one
-is the actual defect, and the remedy is in selector construction rather than in
-timeouts. **Recorded as an open question, not as evidence.**
+Resolving each with no compose window open:
+
+```
+role:Edit|name:To
+    RESOLVED role="Edit"   name="Write your prompt to Claude"
+    bounds  x=679 y=881 917x26
+
+role:Button|name:To
+    RESOLVED role="Button" name="Microsoft Store pinned"
+    bounds  x=921 y=1020 56x61
+```
+
+The first is **Claude Code's own prompt input**. The second is a **Windows
+taskbar button**. Both still resolve with Gmail showing no compose window, which
+settles it: neither has anything to do with the recipient picker.
+
+`role:ComboBox|name:To recipients` did not resolve in either state, so this run
+cannot classify it.
+
+#### The mechanism, which matters beyond this bug
+
+**Name matching is substring-based.** `name:To` matched "Write your prompt **to**
+Claude" and "Microsoft S**to**re pinned". A two-character name will match almost
+anything on the desktop.
+
+That has a consequence worth stating plainly: **a selector can resolve quickly,
+confidently, and completely wrongly**, and nothing in the result distinguishes
+that from a correct match. A short `name:` fragment is not a selector so much as
+a substring search across every element on screen.
+
+It also disposes of the worry this check was raised to settle. There was no
+faster route to the picker being ignored by capture, so capture is not choosing
+a slow selector when a fast one exists. The 15 s budget remains the right lever
+for this bug.
+
+Not investigated further here, but flagged: the same substring behaviour applies
+to every selector the product builds, and short element names are common. Whether
+that causes real mis-targeting elsewhere is untested.
 
 ### The fix: split the locate budget (2026-08-09)
 
@@ -470,10 +503,16 @@ a large share of the obvious use cases for this product are unavailable.
       appear, with a generous ceiling, would decouple the common case from the
       worst case — and would also fix the ~10% overshoot measured on the
       deadline itself.
-- [ ] **Check whether the 16 ms selectors address the same element.** See
-      "Unconfirmed" above. If they do, capture is choosing the slowest available
-      selector and the remedy is in selector construction, not timeouts — which
-      would be a larger and more interesting finding than the timeout itself.
+- [x] ~~**Check whether the 16 ms selectors address the same element.**~~
+      **Answered: they do not.** `role:Edit|name:To` resolves to Claude Code's
+      prompt input and `role:Button|name:To` to a Windows taskbar button, both
+      outside the browser entirely. Capture is not ignoring a faster selector.
+- [ ] **Consider whether substring name matching is a liability elsewhere.**
+      Surfaced by the above: `name:To` matched "Write your prompt **to** Claude"
+      and "Microsoft S**to**re pinned". Every selector the product builds uses
+      the same matching, and short element names are common, so a selector can
+      resolve fast and confidently onto the wrong element with nothing in the
+      result to signal it. Untested beyond this instance; worth its own look.
 - [x] ~~**Decide whether the JS-widget pattern warrants a general
       investigation.**~~ **Done, and the answer is no** — see "That question was
       tested". The shared-cause theory was refuted; these are two independent

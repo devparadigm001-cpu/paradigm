@@ -1437,6 +1437,185 @@ async fn windowid_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ---------------------------------------------------- gmailcleanup mode ----
+//
+// Two jobs, and the first sets up a decisive test for the second.
+//
+//   1. Close leftover EMPTY drafts from earlier probe runs. Each is handled
+//      independently: read its body, confirm it is blank, then close with
+//      Escape. A draft with content, or one whose body cannot be read, is left
+//      strictly alone and aborts the sweep.
+//
+//   2. Settle whether the three selectors that resolved in ~16ms during the
+//      first gmailpicker run are part of the recipient picker or false matches
+//      on unrelated Gmail UI. Resolving them BEFORE and AFTER every compose
+//      window is closed answers it outright: anything still resolving with no
+//      compose open cannot be part of the picker.
+//
+// Read-only apart from closing confirmed-empty drafts. Nothing is typed, and
+// nothing is clicked.
+
+/// The selectors under suspicion, plus the recorded one for contrast.
+const SUSPECT_SELECTORS: &[&str] = &[
+    "role:Group|name:To - Select contacts",
+    "role:ComboBox|name:To recipients",
+    "role:Edit|name:To",
+    "role:Button|name:To",
+];
+
+async fn describe_suspects(desktop: &Desktop, phase: &str) -> Vec<bool> {
+    println!("\n  -- {phase} --");
+    let mut resolved = Vec::new();
+    for sel in SUSPECT_SELECTORS {
+        match desktop
+            .locator(*sel)
+            .first(Some(Duration::from_secs(2)))
+            .await
+        {
+            Ok(el) => {
+                let bounds = match el.bounds() {
+                    Ok((x, y, w, h)) => format!("x={x:.0} y={y:.0} {w:.0}x{h:.0}"),
+                    Err(e) => format!("<bounds failed: {e}>"),
+                };
+                println!("    {sel}");
+                println!("        RESOLVED role={:?} name={:?}", el.role(), el.name());
+                println!("        bounds  {bounds}");
+                resolved.push(true);
+            }
+            Err(_) => {
+                println!("    {sel}");
+                println!("        not found");
+                resolved.push(false);
+            }
+        }
+    }
+    resolved
+}
+
+async fn gmailcleanup_mode() -> ExitCode {
+    println!("== Gmail cleanup + selector identification ==\n");
+    println!("Closes leftover EMPTY drafts only, after confirming each is blank.");
+    println!("Then identifies the ~16ms selectors. Nothing typed, nothing clicked.\n");
+
+    for browser in browser_order() {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "https://mail.google.com/"])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("waiting 20s for Gmail to load...");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // ---- state BEFORE any cleanup ----------------------------------------
+    println!("\n================ 2a. SELECTORS, COMPOSE OPEN (IF ANY) ================");
+    let before = describe_suspects(&desktop, "before closing anything").await;
+
+    // ---- 1. close each confirmed-empty draft ------------------------------
+    println!("\n================ 1. LEFTOVER DRAFT CLEANUP ================");
+    let body_selectors = [
+        "role:Edit|name:Message Body",
+        "role:Document|name:Message Body",
+        "role:Edit|name:Message body",
+    ];
+
+    let mut closed = 0usize;
+    for round in 0..6 {
+        let mut body = None;
+        for sel in body_selectors {
+            if let Ok(b) = desktop
+                .locator(sel)
+                .first(Some(Duration::from_secs(2)))
+                .await
+            {
+                body = Some(b);
+                break;
+            }
+        }
+
+        let Some(body) = body else {
+            println!(
+                "  round {round}: no compose body found -- {} draft(s) closed in total",
+                closed
+            );
+            break;
+        };
+
+        match body.text(0) {
+            Ok(t) if t.trim().is_empty() => {
+                println!("  round {round}: body confirmed EMPTY (0 chars) -- closing with Escape");
+                let _ = body.press_key("{Escape}");
+                closed += 1;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            Ok(t) => {
+                println!(
+                    "  round {round}: STOPPING -- this draft contains {} character(s).\n\
+                     \x20            It is not one of ours. Left completely untouched.",
+                    t.chars().count()
+                );
+                break;
+            }
+            Err(e) => {
+                println!(
+                    "  round {round}: STOPPING -- could not read the body to confirm it is\n\
+                     \x20            empty ({e}). Left untouched."
+                );
+                break;
+            }
+        }
+    }
+
+    // ---- state AFTER cleanup ---------------------------------------------
+    println!("\n================ 2b. SELECTORS, NO COMPOSE OPEN ================");
+    let after = describe_suspects(&desktop, "after closing all empty drafts").await;
+
+    // ---- verdicts ---------------------------------------------------------
+    println!("\n================ VERDICT ================\n");
+    println!("  drafts closed: {closed}\n");
+
+    let compose_gone = !after[0]; // the recorded picker selector
+    println!(
+        "  compose window genuinely closed (recorded picker selector gone): {}",
+        if compose_gone { "yes" } else { "NO" }
+    );
+
+    if !compose_gone {
+        println!(
+            "\n  A compose window is still open, so this cannot distinguish the\n  \
+             suspects. Reporting that rather than a conclusion."
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    println!("\n  selector                                     open   closed   verdict");
+    println!("  {}", "-".repeat(76));
+    for (i, sel) in SUSPECT_SELECTORS.iter().enumerate() {
+        let verdict = match (before[i], after[i]) {
+            (_, true) => "FALSE MATCH -- resolves with no compose open",
+            (true, false) => "genuinely part of the compose UI",
+            (false, false) => "absent in both -- inconclusive",
+        };
+        println!(
+            "  {sel:<44} {:<6} {:<8} {verdict}",
+            if before[i] { "yes" } else { "no" },
+            if after[i] { "yes" } else { "no" }
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
 // ----------------------------------------------------- gmailpicker mode ----
 //
 // Answers one question from docs/known-issues/dynamic-contact-picker-replay-fails.md:
@@ -2208,6 +2387,9 @@ async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "gmailcleanup") {
+        return gmailcleanup_mode().await;
+    }
     if std::env::args().any(|a| a == "gmailpicker") {
         return gmailpicker_mode().await;
     }
