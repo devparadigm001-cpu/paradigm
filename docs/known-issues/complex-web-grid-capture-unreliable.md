@@ -267,6 +267,62 @@ Two things, recorded so they are not mistaken for settled:
    real cursor position, but that is a guess. It reproduces exactly, so it is
    not noise, and it is not understood.
 
+### Screen-reader support does not change the answer (2026-08-10)
+
+The one untested variable flagged above — Sheets has an accessibility mode, off by
+default — has now been checked. **It does not materialise cells.**
+
+`text_capture_probe -- sheetsa11y` measures the same document before and after
+toggling the mode, rather than comparing against the earlier session's numbers,
+so the comparison controls for document, window and machine state.
+
+The toggle needed confirmation that does not come from the thing being measured:
+if it silently failed, "the tree did not change" would look identical to "the
+mode changes nothing", and those are opposite findings. Sheets announces the
+change itself, and that announcement is the independent evidence:
+
+```
+  sending {ctrl}{alt}z
+  confirmed by Sheets: "Screen reader support enabled."  (after 676 ms)
+```
+
+With the mode confirmed on:
+
+```
+  measure                              before    after
+  accessible nodes                        110      113
+  role DataItem                             0        0
+  role Table                                0        0
+  role Grid                                 0        0
+  role Cell                                 0        0
+  role DataGrid                             0        0
+  cell-reference-looking names              0        0
+  distinct focused ids over 4 cells         1        1
+  distinct focused names over 4 cells       1        1
+```
+
+Three nodes appeared, none of them a grid role. No element anywhere is named
+like a cell reference. Focus still does not move between cells.
+
+The mode is not inert — it swaps *which* hidden element receives focus:
+
+| | focus host |
+|---|---|
+| mode off | `Edit` id `152289`, bounds `(0,0,1,1)` |
+| mode on | `Group` id `176391`, bounds `(2014,-9878,5,3)` |
+
+An offscreen 5×3 group at y = −9878 replaces the 1×1 input. Still one static
+element for the whole grid, still no per-cell identity. That the focus host
+changed at all is further evidence the toggle genuinely took effect.
+
+**Canvas rendering persists regardless of the accessibility setting.** The
+constraint below is therefore not a default-settings artifact that a user could
+opt out of — it is the shape of the problem.
+
+The setting was returned to its original state at the end of the run
+(`"Screen reader support disabled."`), since it is a persistent per-account Docs
+preference.
+
 ### What this means for a fix
 
 Not a fix, but the constraints any fix inherits:
@@ -277,9 +333,9 @@ Not a fix, but the constraints any fix inherits:
 * **The Name Box is a usable, fast source of cell identity** — via `text()` on
   the child `Edit` of the `"Name box (Ctrl + J)"` group. It was the suspect;
   it turns out to be the most reliable signal measured here.
-* **Sheets has a screen-reader mode** that is off by default and was not enabled
-  for these runs. Whether it materialises a real cell tree is untested and is
-  the obvious next question, because it would change every constraint above.
+* **Sheets' screen-reader mode does not help.** Tested with the mode confirmed
+  on: no grid roles, no cell-reference names, focus still static. The
+  no-per-cell-element constraint is not something a setting can lift.
 
 ## Not the same bug as the Gmail picker (tested 2026-08-09)
 
@@ -359,11 +415,12 @@ immediately. Probe coverage has been measuring the environment it was built for.
       (U+FEFF seeding versus a transient editor element). Note the finding that
       reframes both — the `combobox` "cells" are the **cell editor overlay**,
       which exists only while a cell is being edited.
-- [ ] **Test Sheets' screen-reader mode.** Off by default, not enabled for the
-      measured runs, and the single change most likely to alter every constraint
-      above: if it materialises a real per-cell accessibility tree, targeting
-      cells becomes possible and the fix looks completely different. Ask this
-      before designing anything.
+- [x] ~~**Test Sheets' screen-reader mode.**~~ **Tested; it changes nothing that
+      matters.** With the mode confirmed on by Sheets' own announcement, the tree
+      gains 3 nodes, none of them grid roles, and focus still never moves between
+      cells. It swaps the hidden focus host from a 1×1 `Edit` to an offscreen
+      `Group`, and that is all. See "Screen-reader support does not change the
+      answer". The absence of per-cell elements is not a settings artifact.
 - [ ] **Establish whether a committed cell value is readable at all.** The probe
       could not verify the typed text after Enter, and could not distinguish "the
       commit did not happen" from "committed values are invisible to UIA". That

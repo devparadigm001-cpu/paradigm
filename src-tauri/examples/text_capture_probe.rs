@@ -4781,11 +4781,663 @@ async fn sheets_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ----------------------------------------------------- sheetstrash mode ----
+// Cleanup for the throwaway spreadsheets the `sheets` probe creates.
+//
+// This is a destructive action against a real Google account, so it is built to
+// be incapable of touching the wrong document: it navigates by exact document
+// ID and refuses to act unless the window's own address bar contains that ID.
+// A window that does not match is skipped and reported, never guessed at.
+//
+// "Move to trash" is deliberately the action rather than permanent deletion --
+// Drive keeps trashed items for 30 days, so a mistake here is recoverable.
+
+/// Is this open document in the trash?
+///
+/// The exact strings matter and were measured, not guessed. A trashed document
+/// shows the Text "File is in trash" and a Button "Take out of trash", and has
+/// no File menu. An earlier version of this check looked for "in the trash" and
+/// a "Restore" button -- neither of which Sheets uses -- and so reported
+/// confirmed-trashed documents as untrashed.
+async fn is_trashed(desktop: &Desktop, window: &UIElement) -> (bool, String) {
+    let button = find_named(desktop, window, &["role:Button"], |n| {
+        n.to_lowercase().contains("take out of trash")
+    })
+    .await;
+    let banner = find_named(desktop, window, &["role:Text"], |n| {
+        let n = n.to_lowercase();
+        n.contains("is in trash") || n.contains("in the trash")
+    })
+    .await;
+    let evidence = banner
+        .and_then(|b| b.name())
+        .or_else(|| button.as_ref().and_then(|b| b.name()))
+        .unwrap_or_default();
+    (button.is_some() || !evidence.is_empty(), evidence)
+}
+
+/// Find the open Sheets window whose address bar contains `id`.
+async fn window_for_doc(desktop: &Desktop, id: &str) -> Option<UIElement> {
+    let windows = desktop
+        .locator("role:Window|name:Google Sheets")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), None)
+        .await
+        .ok()?;
+    for w in windows {
+        if let Ok(bars) = desktop
+            .locator("role:Edit|name:Address and search bar")
+            .within(w.clone())
+            .all(Some(Duration::from_secs(4)), None)
+            .await
+        {
+            for bar in &bars {
+                if bar.text(0).unwrap_or_default().contains(id) {
+                    return Some(w);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// First element inside `window` with the given role whose name matches.
+async fn find_named(
+    desktop: &Desktop,
+    window: &UIElement,
+    roles: &[&str],
+    pred: impl Fn(&str) -> bool,
+) -> Option<UIElement> {
+    for role in roles {
+        if let Ok(all) = desktop
+            .locator(*role)
+            .within(window.clone())
+            .all(Some(Duration::from_secs(5)), None)
+            .await
+        {
+            for el in all {
+                if pred(&el.name().unwrap_or_default()) {
+                    return Some(el);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn sheetstrash_mode() -> ExitCode {
+    let ids: Vec<String> = std::env::args()
+        .filter(|a| {
+            a.len() >= 40
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .collect();
+    if ids.is_empty() {
+        eprintln!("pass one or more Google Drive document IDs as arguments");
+        return ExitCode::FAILURE;
+    }
+
+    println!("== move throwaway spreadsheets to trash ==\n");
+    println!("Acts only on a window whose address bar contains the exact target ID.");
+    println!("Uses 'Move to trash', which Drive keeps recoverable for 30 days.\n");
+    println!("targets:");
+    for id in &ids {
+        println!("  {id}");
+    }
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let browser = browser_order()[0];
+
+    let mut results: Vec<(String, String)> = Vec::new();
+    for id in &ids {
+        println!("\n================ {id} ================");
+        let url = format!("https://docs.google.com/spreadsheets/d/{id}/edit");
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "--new-window", &url])
+            .spawn()
+        {
+            let _ = c.wait();
+        }
+        tokio::time::sleep(Duration::from_secs(22)).await;
+
+        let Some(window) = window_for_doc(&desktop, id).await else {
+            println!("  SKIPPED: no open window's address bar contains this ID.");
+            results.push((id.clone(), "skipped (window not found)".into()));
+            continue;
+        };
+        let title = window.name().unwrap_or_default();
+        println!("  window: {title:?}");
+        if !title.contains("Untitled spreadsheet") {
+            println!("  SKIPPED: title is not 'Untitled spreadsheet'. Refusing to trash a");
+            println!("  document that is not one of the blank throwaways.");
+            results.push((id.clone(), format!("skipped (title {title:?})")));
+            continue;
+        }
+
+        // Already trashed? A trashed document opens with a banner and a Restore
+        // button. Checking first makes this idempotent, so a partial run can be
+        // finished without re-acting on documents that are already done -- and
+        // it is how "clicked, but no confirmation seen" gets resolved into a
+        // fact rather than left as a guess.
+        let (already, evidence) = is_trashed(&desktop, &window).await;
+        if already {
+            println!("  ALREADY TRASHED -- {evidence:?}");
+            results.push((id.clone(), "already in trash (verified)".into()));
+            let _ = window.close();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+        println!("  not trashed yet");
+
+        let Some(file_menu) =
+            find_named(&desktop, &window, &["role:MenuItem", "role:Button"], |n| n == "File").await
+        else {
+            println!("  could not locate the File menu; leaving this document alone.");
+            results.push((id.clone(), "failed (no File menu)".into()));
+            continue;
+        };
+        println!("  found File menu (role={})", file_menu.role());
+
+        // The dropdown only opens if the window is actually foreground -- a click
+        // into a background window activates it and is swallowed. Measured: the
+        // first document worked because its window happened to be frontmost, and
+        // three later ones failed with only the nine menu-bar items visible.
+        let mut trash_item = None;
+        for attempt in 1..=3 {
+            let _ = window.activate_window();
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            robust_click(&desktop, &file_menu);
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+
+            trash_item = find_named(&desktop, &window, &["role:MenuItem"], |n| {
+                let n = n.to_lowercase();
+                n.contains("move to trash") || n.contains("move to bin")
+            })
+            .await;
+            if trash_item.is_some() {
+                println!("  menu opened on attempt {attempt}");
+                break;
+            }
+            println!("  attempt {attempt}: dropdown did not open");
+        }
+        let Some(item) = trash_item else {
+            println!("  File menu opened but no 'Move to trash' item was found.");
+            if let Ok(items) = desktop
+                .locator("role:MenuItem")
+                .within(window.clone())
+                .all(Some(Duration::from_secs(5)), None)
+                .await
+            {
+                println!("  menu items visible ({}):", items.len());
+                for el in items.iter().take(30) {
+                    println!("    {:?}", el.name().unwrap_or_default());
+                }
+            }
+            results.push((id.clone(), "failed (no trash item)".into()));
+            continue;
+        };
+        // The item is named "Move to trash t" -- the trailing letter is its
+        // keyboard accelerator. Coordinate-clicking it activated the item on
+        // three documents and silently did nothing on two others, so prefer the
+        // keystroke, which does not depend on hit-testing a menu popup.
+        let iname = item.name().unwrap_or_default();
+        let accel = iname.rsplit(' ').next().unwrap_or("").to_string();
+        if accel.chars().count() == 1 {
+            println!("  activating {iname:?} via accelerator {accel:?}");
+            if let Ok(f) = desktop.focused_element() {
+                let _ = f.press_key(&accel);
+            }
+        } else {
+            println!("  clicking {iname:?}");
+            robust_click(&desktop, &item);
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        // Verify by RELOADING, not by catching the toast. The "File moved to
+        // trash" toast fades within a few seconds, so its absence proved
+        // nothing and produced two false "UNCONFIRMED" results earlier. A fresh
+        // load either shows the trash banner or it does not.
+        let _ = window.close();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "--new-window", &url])
+            .spawn()
+        {
+            let _ = c.wait();
+        }
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        match window_for_doc(&desktop, id).await {
+            Some(w2) => {
+                let (trashed, evidence) = is_trashed(&desktop, &w2).await;
+                println!("  on reload: trashed={trashed} {evidence:?}");
+                results.push((
+                    id.clone(),
+                    if trashed {
+                        format!("TRASHED (verified on reload: {evidence:?})")
+                    } else {
+                        "STILL PRESENT -- the click did not take".into()
+                    },
+                ));
+                let _ = w2.close();
+            }
+            None => {
+                println!("  could not reopen to verify");
+                results.push((id.clone(), "UNVERIFIED (could not reopen)".into()));
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    println!("\n================ RESULT ================\n");
+    for (id, outcome) in &results {
+        println!("  {id}  {outcome}");
+    }
+
+    // Close anything still open from the investigation.
+    println!("\n--- closing remaining Sheets windows ---");
+    if let Ok(all) = desktop
+        .locator("role:Window|name:Google Sheets")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(6)), None)
+        .await
+    {
+        let mut closed = 0;
+        for el in &all {
+            let name = el.name().unwrap_or_default();
+            if name.contains("more pages") {
+                println!("  SPARED (shared multi-tab window) {name:?}");
+                continue;
+            }
+            if el.close().is_ok() {
+                closed += 1;
+                println!("  closed {name:?}");
+            }
+        }
+        println!("  {closed} window(s) closed");
+    } else {
+        println!("  none found");
+    }
+
+    ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------ sheetsa11y mode ----
+// The one untested variable from the Sheets investigation: does Google Sheets'
+// screen-reader support mode materialise a real per-cell accessibility tree?
+//
+// Measured BEFORE and AFTER in the SAME document, so the comparison controls for
+// document, window, machine and browser state. Comparing against the numbers
+// from the earlier session would not.
+//
+// The trap this has to avoid: if the toggle silently fails, "the tree did not
+// change" looks identical to "screen reader mode does not change the tree", and
+// they are opposite findings. So the toggle needs confirmation that does not
+// come from the thing being measured -- Sheets' own on-screen announcement.
+
+struct GridSnapshot {
+    nodes: usize,
+    roles: std::collections::BTreeMap<String, usize>,
+    cell_named: Vec<(String, String)>,
+    focus_ids: std::collections::BTreeSet<String>,
+    focus_names: std::collections::BTreeSet<String>,
+    focus_lines: Vec<String>,
+}
+
+async fn measure_grid(desktop: &Desktop, window: &UIElement, label: &str) -> GridSnapshot {
+    println!("\n---------------- {label} ----------------");
+    let mut roles = std::collections::BTreeMap::new();
+    let mut cell_named = Vec::new();
+    let mut budget = 8000usize;
+    census(window, 0, 14, &mut roles, &mut cell_named, &mut budget);
+    let nodes = 8000 - budget;
+    println!("  nodes walked (depth 14): {nodes}");
+    let mut by_count: Vec<_> = roles.iter().collect();
+    by_count.sort_by(|a, b| b.1.cmp(a.1));
+    println!("  roles:");
+    for (role, n) in by_count.iter().take(14) {
+        println!("    {n:>5}  {role}");
+    }
+    // The roles a real grid would have to use.
+    for role in ["DataItem", "Table", "Grid", "Cell", "DataGrid", "ListItem", "Custom"] {
+        println!("    grid-role {role:<9}: {}", roles.get(role).copied().unwrap_or(0));
+    }
+    println!("  names that look like cell references: {}", cell_named.len());
+    for (role, name) in cell_named.iter().take(10) {
+        println!("    role={role:<10} name={name:?}");
+    }
+
+    let mut focus_ids = std::collections::BTreeSet::new();
+    let mut focus_names = std::collections::BTreeSet::new();
+    let mut focus_lines = Vec::new();
+    println!("  focused element across cell moves:");
+    for (i, key) in [None, Some("{Right}"), Some("{Right}"), Some("{Down}")]
+        .into_iter()
+        .enumerate()
+    {
+        if let Some(k) = key {
+            if let Ok(el) = desktop.focused_element() {
+                let _ = el.press_key(k);
+            }
+            tokio::time::sleep(Duration::from_millis(800)).await;
+        }
+        if let Ok(el) = desktop.focused_element() {
+            let line = snap(&el);
+            println!("    [{i}] {line}");
+            focus_ids.insert(el.id().unwrap_or_default());
+            focus_names.insert(el.name().unwrap_or_default());
+            focus_lines.push(line);
+        }
+    }
+    println!(
+        "  distinct focused ids={} names={}",
+        focus_ids.len(),
+        focus_names.len()
+    );
+
+    GridSnapshot {
+        nodes,
+        roles,
+        cell_named,
+        focus_ids,
+        focus_names,
+        focus_lines,
+    }
+}
+
+async fn sheetsa11y_mode() -> ExitCode {
+    println!("== does Sheets' screen-reader mode materialise real cells? ==\n");
+    println!("Measures the same document before and after toggling the mode.\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = desktop
+        .locator("role:Window|name:Untitled spreadsheet")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        println!("\n  INCONCLUSIVE: no 'Untitled spreadsheet' window found. Not signed in,");
+        println!("  or the document did not load. Nothing below would be measuring Sheets.");
+        return ExitCode::FAILURE;
+    };
+    println!("  window: {:?}", window.name().unwrap_or_default());
+
+    // Print the document id so it can be cleaned up afterwards.
+    if let Ok(bars) = desktop
+        .locator("role:Edit|name:Address and search bar")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for b in &bars {
+            let t = b.text(0).unwrap_or_default();
+            if let Some(rest) = t.split("/d/").nth(1) {
+                println!("  DOCUMENT ID: {}", rest.split('/').next().unwrap_or(""));
+            }
+        }
+    }
+
+    let before = measure_grid(&desktop, &window, "BEFORE: screen reader mode OFF").await;
+
+    // ---- toggle, and prove it took ------------------------------------------
+    println!("\n================ enabling screen reader support ================\n");
+    println!("  sending {{ctrl}}{{alt}}z");
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{ctrl}{alt}z");
+    }
+
+    // Sheets announces this on screen. That announcement is the independent
+    // confirmation -- it is not part of the grid tree being measured.
+    let mut confirmation = String::new();
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < Duration::from_secs(8) {
+        if let Ok(texts) = desktop
+            .locator("role:Text")
+            .within(window.clone())
+            .all(Some(Duration::from_secs(2)), None)
+            .await
+        {
+            for t in &texts {
+                let n = t.name().unwrap_or_default();
+                let low = n.to_lowercase();
+                if low.contains("screen reader") || low.contains("braille") {
+                    confirmation = n;
+                    break;
+                }
+            }
+        }
+        if !confirmation.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    if confirmation.is_empty() {
+        println!("  NO CONFIRMATION SEEN within 8s.");
+    } else {
+        println!("  confirmed by Sheets: {confirmation:?}  (after {} ms)", t0.elapsed().as_millis());
+    }
+
+    println!("  waiting 8s for the tree to rebuild...");
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let after = measure_grid(&desktop, &window, "AFTER: screen reader mode ON").await;
+
+    // ---- verdict ------------------------------------------------------------
+    println!("\n================ VERDICT ================\n");
+    println!("  {:<34} {:>8} {:>8}", "measure", "before", "after");
+    println!("  {:<34} {:>8} {:>8}", "accessible nodes", before.nodes, after.nodes);
+    for role in ["DataItem", "Table", "Grid", "Cell", "DataGrid", "ListItem", "Custom", "Edit"] {
+        println!(
+            "  {:<34} {:>8} {:>8}",
+            format!("role {role}"),
+            before.roles.get(role).copied().unwrap_or(0),
+            after.roles.get(role).copied().unwrap_or(0)
+        );
+    }
+    println!(
+        "  {:<34} {:>8} {:>8}",
+        "cell-reference-looking names",
+        before.cell_named.len(),
+        after.cell_named.len()
+    );
+    println!(
+        "  {:<34} {:>8} {:>8}",
+        "distinct focused ids over 4 cells",
+        before.focus_ids.len(),
+        after.focus_ids.len()
+    );
+    println!(
+        "  {:<34} {:>8} {:>8}",
+        "distinct focused names over 4 cells",
+        before.focus_names.len(),
+        after.focus_names.len()
+    );
+
+    let materialised = after.focus_ids.len() > before.focus_ids.len()
+        || after.focus_names.len() > before.focus_names.len()
+        || after.cell_named.len() > before.cell_named.len()
+        || ["DataItem", "Table", "Grid", "Cell", "DataGrid"].iter().any(|r| {
+            after.roles.get(*r).copied().unwrap_or(0) > before.roles.get(*r).copied().unwrap_or(0)
+        });
+
+    println!();
+    if confirmation.is_empty() {
+        println!("  INCONCLUSIVE. The toggle was never confirmed, so an unchanged tree");
+        println!("  cannot be told apart from a toggle that did not take. These are");
+        println!("  opposite findings and this run does not distinguish them.");
+    } else if materialised {
+        println!("  SCREEN READER MODE CHANGES THE TREE. Cells, or per-cell focus, appear");
+        println!("  that were not there before. Targeting individual cells may be possible");
+        println!("  with the mode enabled -- see the numbers above for what exactly changed.");
+    } else {
+        println!("  NO CHANGE. Screen reader support is confirmed on, and the grid is still");
+        println!("  absent from the accessibility tree: same node count, no grid roles, no");
+        println!("  cell-reference names, and focus still does not move between cells.");
+        println!("  Canvas rendering persists regardless of the accessibility setting.");
+    }
+
+    println!("\n  focus detail after (verbatim):");
+    for line in &after.focus_lines {
+        println!("    {line}");
+    }
+
+    // ---- restore the account setting ----------------------------------------
+    // Screen reader support is a persistent per-account Docs preference. Leave it
+    // as it was found.
+    println!("\n--- restoring the setting ---");
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{ctrl}{alt}z");
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut off_confirm = String::new();
+    if let Ok(texts) = desktop
+        .locator("role:Text")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(3)), None)
+        .await
+    {
+        for t in &texts {
+            let n = t.name().unwrap_or_default();
+            if n.to_lowercase().contains("screen reader") {
+                off_confirm = n;
+                break;
+            }
+        }
+    }
+    println!("  toggled back off; Sheets says {off_confirm:?}");
+
+    ExitCode::SUCCESS
+}
+
+// ----------------------------------------------------- sheetsstate mode ----
+// Read-only. Reports what a document's page actually looks like, so "is it in
+// the trash" can be answered from evidence instead of from a toast that may
+// already have faded. Touches nothing.
+async fn sheetsstate_mode() -> ExitCode {
+    let ids: Vec<String> = std::env::args()
+        .filter(|a| {
+            a.len() >= 40
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .collect();
+    if ids.is_empty() {
+        eprintln!("pass one or more document IDs");
+        return ExitCode::FAILURE;
+    }
+
+    println!("== document state (read-only) ==\n");
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let browser = browser_order()[0];
+
+    for id in &ids {
+        println!("\n================ {id} ================");
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "start",
+                "",
+                browser,
+                "--new-window",
+                &format!("https://docs.google.com/spreadsheets/d/{id}/edit"),
+            ])
+            .spawn()
+        {
+            let _ = c.wait();
+        }
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let Some(window) = window_for_doc(&desktop, id).await else {
+            println!("  window not found");
+            continue;
+        };
+        println!("  title: {:?}", window.name().unwrap_or_default());
+
+        let has_file_menu = find_named(&desktop, &window, &["role:MenuItem"], |n| n == "File")
+            .await
+            .is_some();
+        println!("  has File menu: {has_file_menu}");
+
+        if let Ok(texts) = desktop
+            .locator("role:Text")
+            .within(window.clone())
+            .all(Some(Duration::from_secs(5)), None)
+            .await
+        {
+            println!("  Text elements ({}):", texts.len());
+            for t in texts.iter().take(20) {
+                let n = t.name().unwrap_or_default();
+                if !n.trim().is_empty() {
+                    println!("    {n:?}");
+                }
+            }
+        }
+        if let Ok(btns) = desktop
+            .locator("role:Button")
+            .within(window.clone())
+            .all(Some(Duration::from_secs(5)), None)
+            .await
+        {
+            let names: Vec<String> = btns
+                .iter()
+                .filter_map(|b| b.name())
+                .filter(|n| !n.trim().is_empty())
+                .take(25)
+                .collect();
+            println!("  Buttons: {names:?}");
+        }
+        let _ = window.close();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "sheetsstate") {
+        return sheetsstate_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsa11y") {
+        return sheetsa11y_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetstrash") {
+        return sheetstrash_mode().await;
+    }
     if std::env::args().any(|a| a == "sheets") {
         return sheets_mode().await;
     }
