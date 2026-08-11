@@ -645,12 +645,11 @@ the enumeration is already paid for, the exact match is right there:
 That last branch matters: "could not check" is carried into the step detail
 rather than dropped, so it stays distinguishable from "checked, and it was fine".
 
-**Evidence level, stated here so it is not read off the counting mechanism's.**
-This change has **one** end-to-end validation run — trial 2 below. The counting
-mechanism it sits next to has three runs and nine rounds behind it. One run
-demonstrates that this works; it is not the same standard, and this is the half
-of the fix that changes previously shipped behaviour. Recorded as an open item
-in "Next steps".
+**Evidence level: confirmed in both directions** (2026-08-10, later the same
+day). This section previously carried a caveat that the change had one
+validation run, all of it in the direction where `first()` picks wrong and the
+change rescues the step — the direction that makes it look good. That gap is now
+closed; see "Both directions of constructive resolution" below.
 
 ### `FailedAmbiguous` is a separate result from `FailedWrongTarget`
 
@@ -711,6 +710,65 @@ meant cannot be determined.
 Refusing to activate any of them: activating the wrong one sends every later
 step to the wrong window while the run still reports success.
 ```
+
+### Both directions of constructive resolution
+
+The five trials above all exercised one direction: `first()` picks a containment
+decoy, and constructive resolution rescues the step. The reverse — `first()`
+already returning the correct element — was never tested, so the change had only
+been observed where it *changes* the outcome, never where it should leave one
+alone.
+
+`text_capture_probe -- resolveorder` closes that. Window z-order drives traversal
+order, so each trial activates three windows (target plus two containment decoys,
+`"Draft …"` and `"Copy of …"`) in a chosen sequence, records what `first()`
+actually returns under that ordering, then replays.
+
+**What counts as correct here is not "the run completed".** A run can complete
+having typed into the wrong window — that is the entire bug. So every trial reads
+all three fields before and after, and resolution is judged by *the decoy fields
+staying empty*.
+
+Six orderings, three runs, 18 trials:
+
+```
+  ordering                 first():W first():F  status     resolution   text
+  target front, A then B     correct   correct  completed          ok     ok
+  target front, B then A     correct   correct  completed          ok     ok
+  decoy A frontmost            WRONG     WRONG  completed          ok     ok
+  decoy B frontmost            WRONG     WRONG  completed          ok     ok
+  target middle, A front       WRONG     WRONG  completed          ok     ok
+  target middle, B front       WRONG     WRONG  completed          ok     ok
+```
+
+Identical across all three runs. Two orderings per run put `first()` on the
+correct element unaided (6 samples of the previously untested direction) and four
+put it on a decoy (12 samples of the previously tested one). In every trial the
+text landed in the target's field and neither decoy was touched.
+
+So the change is not merely harmless when `first()` is already right — it is
+inert. Where `first()` was correct, the uniquely-matching candidate *is* what
+`first()` returned, and the outcome is unchanged.
+
+#### One anomaly, recorded rather than smoothed over
+
+An earlier run of this probe (a five-ordering version) produced one trial where
+the target field received `"can cordra"` instead of `"ordr"`. It did not
+reproduce in five subsequent runs — 28 trials in total, one occurrence.
+
+It is worth being precise about what it was and was not. The text went into the
+**target's** field; both decoy fields stayed empty. So resolution was correct and
+the disturbance was in the keystrokes themselves — real typing into a real
+browser, where anything that steals focus mid-step can interleave characters.
+That is orthogonal to the resolution logic and is not evidence about it.
+
+It did, however, expose a fault in the probe: the original verdict collapsed
+"text arrived intact" and "text arrived in the right place" into one flag, and so
+announced *"constructive resolution does not behave identically across traversal
+orders"* — a resolution failure that had not happened. The probe now reports the
+two separately, and only calls a resolution failure when a decoy field changes.
+This is the same lesson as the swallowed-error pattern below, in a new costume: a
+diagnostic that cannot separate two causes will eventually name the wrong one.
 
 ### Cost: 576 ms per step, measured against a trivial page
 
@@ -882,19 +940,17 @@ generic-titled window in step 1.
       failures, not design failures. Both over-counted, and over-counting refuses
       working playbooks. Filtering the count through `resolved_is_recorded_target`
       is what made the mechanism usable.
-- [ ] **Repeat the end-to-end validation of the constructive-resolution
-      change.** The two halves of this fix do **not** rest on equally strong
-      evidence, and the difference should not be lost by their sitting in one
-      commit. The counting mechanism was confirmed across three separate runs and
-      nine measurement rounds, with identical results every time. Acting on the
-      uniquely-matching candidate instead of `first()`'s pick — the change that
-      makes trial 2 complete rather than be refused — has **one** end-to-end
-      validation run. That is enough to show it works; it is not the repeated
-      confirmation the counting mechanism received, and it is the part of the fix
-      that alters previously shipped behaviour. Worth a repeat run, under varied
-      conditions (different traversal orders, more than one decoy, a decoy that
-      sorts *after* the target, an element step whose window is not the
-      foreground one), before it is trusted to the same degree.
+- [x] ~~**Repeat the end-to-end validation of the constructive-resolution
+      change.**~~ **Done — confirmed in both directions.** The gap was that the
+      change had only been tested where `first()` picks wrong and it rescues the
+      step. `text_capture_probe -- resolveorder` varies window z-order across six
+      orderings, three runs, 18 trials, with two containment decoys present: 6
+      trials had `first()` already correct and 12 had it landing on a decoy. All
+      18 completed, wrote to the target field, and left both decoy fields empty.
+      Where `first()` was already right the change is inert. The two halves of
+      the fix now rest on comparable evidence. See "Both directions of
+      constructive resolution", including the one non-reproducing typing anomaly
+      and the probe fault it exposed.
 - [ ] **Measure the cost on a real workload.** ~576 ms/step is measured only
       against a trivial local page — see "Cost". Acceptable on that evidence, not
       settled. If a real playbook shows otherwise, the fix is scoping element

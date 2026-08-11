@@ -3606,6 +3606,76 @@ async fn show_candidates(desktop: &Desktop, selector: &str, recorded: &str) -> u
     exact
 }
 
+// ----------------------------------------------------- resolveorder mode ----
+// The gap the ambigreplay run left open.
+//
+// Constructive resolution -- acting on the uniquely-matching candidate rather
+// than on `first()`'s pick -- was only ever tested in the direction where
+// `first()` picks WRONG and the change rescues the step. That is the direction
+// that makes it look good. The reverse was never exercised: when `first()` would
+// already have returned the correct element, does the change leave it alone, or
+// does it quietly substitute something else?
+//
+// Traversal order is the lever, and window z-order is what moves it. Each trial
+// activates the three windows in a chosen sequence, records what `first()`
+// actually returns under that ordering, then replays.
+//
+// The check is not "did the run complete". A run can complete having typed into
+// the wrong window -- that is the entire bug this fix exists for. So each trial
+// reads all three fields before and after and confirms the text landed in the
+// target's field and nowhere else.
+
+/// Bring the window whose title starts with `needle` to the front.
+async fn activate_by_title(desktop: &Desktop, needle: &str) -> bool {
+    let sel = format!("role:Window|name:{needle}");
+    match desktop
+        .locator(sel.as_str())
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        // `contains_name` also reaches "Draft <needle>", so match on the prefix.
+        Ok(all) => all
+            .iter()
+            .find(|el| el.name().unwrap_or_default().starts_with(needle))
+            .map(|el| el.activate_window().is_ok())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// Current contents of every field reachable as `OrderField`, keyed by name.
+async fn read_order_fields(desktop: &Desktop) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if let Ok(all) = desktop
+        .locator("role:Edit|name:OrderField")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for el in &all {
+            out.insert(
+                el.name().unwrap_or_default(),
+                el.text(0).unwrap_or_default(),
+            );
+        }
+    }
+    out
+}
+
+/// Name of whatever `first()` returns for `selector` right now -- i.e. what
+/// replay would have acted on before the constructive-resolution change.
+async fn first_pick(desktop: &Desktop, selector: &str) -> String {
+    match desktop
+        .locator(selector)
+        .first(Some(Duration::from_secs(5)))
+        .await
+    {
+        Ok(el) => el.name().unwrap_or_default(),
+        Err(e) => format!("<Err {e}>"),
+    }
+}
+
 /// Replay one stored playbook, time it, and print every step outcome.
 async fn run_trial(
     conn: &mut rusqlite::Connection,
@@ -3929,11 +3999,325 @@ async fn ambigreplay_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+async fn resolveorder_mode() -> ExitCode {
+    use paradigm_lib::capture::stream::{ActionCandidate, CapturedStream};
+    use paradigm_lib::capture::ExclusionList;
+    use paradigm_lib::compile::{compile, store, ReversibilityPolicy};
+    use paradigm_lib::labeling::RedactionPolicy;
+
+    println!("== constructive resolution under varied traversal order ==\n");
+    println!("WARNING: performs real clicks and typing. Hands off.\n");
+
+    // Two decoys, so orderings can put the target first, last, or in the middle.
+    // Both window titles contain the target's whole title once the browser
+    // appends its suffix; both field names contain the target's field name.
+    let pages = [
+        ("warmup", ambig_page("ResolveOrder Warmup", "WarmupField")),
+        ("target", ambig_page("ResolveOrder Invoice", "OrderField")),
+        ("decoya", ambig_page("Draft ResolveOrder Invoice", "Draft OrderField")),
+        ("decoyb", ambig_page("Copy of ResolveOrder Invoice", "Copy of OrderField")),
+    ];
+    let mut paths = std::collections::HashMap::new();
+    for (key, html) in &pages {
+        let p = std::env::temp_dir().join(format!("paradigm-resolveorder-{key}.html"));
+        if std::fs::write(&p, html).is_err() {
+            eprintln!("could not write probe page {key}");
+            return ExitCode::FAILURE;
+        }
+        paths.insert(*key, p);
+    }
+    let as_url =
+        |p: &std::path::Path| format!("file:///{}", p.to_string_lossy().replace('\\', "/"));
+    let browser = browser_order()[0];
+    let open = |path: &std::path::Path| {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "--new-window", &as_url(path)])
+            .spawn()
+        {
+            let _ = c.wait();
+        }
+    };
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    for key in ["warmup", "target", "decoya", "decoyb"] {
+        println!("opening {key} window...");
+        open(&paths[key]);
+        tokio::time::sleep(Duration::from_secs(8)).await;
+    }
+
+    let recorded_window = match desktop
+        .locator("role:Window|name:ResolveOrder Invoice")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .ok()
+        .and_then(|all| {
+            all.iter()
+                .map(|w| w.name().unwrap_or_default())
+                .find(|n| n.starts_with("ResolveOrder Invoice") && !n.contains("more pages"))
+        }) {
+        Some(n) => n,
+        None => {
+            eprintln!("no single-tab target window; cannot build a usable recorded name");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("\n  recorded window name: {recorded_window:?}");
+
+    let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
+    for (kind, role, name, payload) in [
+        (
+            paradigm_lib::capture::ActionKind::Navigate,
+            "Window",
+            recorded_window.as_str(),
+            None,
+        ),
+        (
+            paradigm_lib::capture::ActionKind::Click,
+            "Edit",
+            "OrderField",
+            None,
+        ),
+        (
+            paradigm_lib::capture::ActionKind::Type,
+            "Edit",
+            "OrderField",
+            Some("ordr"),
+        ),
+    ] {
+        stream.admit(ActionCandidate {
+            kind,
+            identifiers: vec![recorded_window.clone()],
+            process_name: Some(format!("{browser}.exe")),
+            element_role: Some(role.to_string()),
+            element_name: Some(name.to_string()),
+            payload: payload.map(str::to_string),
+            detail: None,
+            timestamp_ms: 0,
+        });
+    }
+
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("temp db failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let playbook = compile(
+        &stream.actions().to_vec(),
+        "Resolve Order",
+        &ReversibilityPolicy::placeholder(),
+        &RedactionPolicy::placeholder(),
+    );
+    if let Err(e) = store::store(&mut conn, &playbook) {
+        eprintln!("store failed: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let win_sel = format!("role:Window|name:{recorded_window}");
+    let fld_sel = "role:Edit|name:OrderField";
+
+    // Activation sequences. The LAST window activated ends up frontmost, which
+    // is what moves it earlier in the desktop's traversal order.
+    let orderings: [(&str, [&str; 3]); 6] = [
+        ("target front, A then B", ["Draft ResolveOrder", "Copy of ResolveOrder", "ResolveOrder Invoice"]),
+        ("target front, B then A", ["Copy of ResolveOrder", "Draft ResolveOrder", "ResolveOrder Invoice"]),
+        ("decoy A frontmost", ["ResolveOrder Invoice", "Copy of ResolveOrder", "Draft ResolveOrder"]),
+        ("decoy B frontmost", ["ResolveOrder Invoice", "Draft ResolveOrder", "Copy of ResolveOrder"]),
+        ("target middle, A front", ["Copy of ResolveOrder", "ResolveOrder Invoice", "Draft ResolveOrder"]),
+        ("target middle, B front", ["Draft ResolveOrder", "ResolveOrder Invoice", "Copy of ResolveOrder"]),
+    ];
+
+    struct Row {
+        label: String,
+        first_win_ok: bool,
+        first_fld_ok: bool,
+        status: String,
+        resolution_ok: bool,
+        text_exact: bool,
+    }
+    let mut rows: Vec<Row> = Vec::new();
+
+    for (label, sequence) in orderings {
+        println!("\n================ ordering: {label} ================");
+        for needle in sequence {
+            let ok = activate_by_title(&desktop, needle).await;
+            println!("  activate {needle:?} -> {ok}");
+            tokio::time::sleep(Duration::from_millis(900)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // What would replay have acted on WITHOUT the constructive change?
+        let fw = first_pick(&desktop, &win_sel).await;
+        let ff = first_pick(&desktop, fld_sel).await;
+        let first_win_ok = fw == recorded_window;
+        let first_fld_ok = ff == "OrderField";
+        println!("  first() window -> {fw:?}   correct on its own: {first_win_ok}");
+        println!("  first() field  -> {ff:?}   correct on its own: {first_fld_ok}");
+
+        let before = read_order_fields(&desktop).await;
+        let mut trial_rows = Vec::new();
+        run_trial(
+            &mut conn,
+            &desktop,
+            &playbook.id,
+            label,
+            "completed, and the text lands in the target field only",
+            &mut trial_rows,
+        )
+        .await;
+        let status = trial_rows
+            .first()
+            .map(|r| r.1.clone())
+            .unwrap_or_else(|| "?".to_string());
+        let after = read_order_fields(&desktop).await;
+
+        let get = |m: &std::collections::HashMap<String, String>, k: &str| {
+            m.get(k).cloned().unwrap_or_default()
+        };
+        // Two different questions, deliberately not collapsed into one flag.
+        //
+        // Resolution is about WHERE the text went: the target field changed and
+        // neither decoy did. Text fidelity is about WHAT arrived, which depends
+        // on real keystrokes reaching a real browser and can be disturbed by
+        // anything holding focus. A run that types the wrong characters into the
+        // RIGHT field says nothing about the resolution logic, and reporting it
+        // as a resolution failure would be exactly the kind of diagnostic that
+        // cannot tell two causes apart.
+        let target_changed = get(&after, "OrderField") != get(&before, "OrderField");
+        let decoys_clean = get(&after, "Draft OrderField") == get(&before, "Draft OrderField")
+            && get(&after, "Copy of OrderField") == get(&before, "Copy of OrderField");
+        let resolution_ok = target_changed && decoys_clean;
+        let text_exact = get(&after, "OrderField")
+            == format!("{}{}", get(&before, "OrderField"), "ordr");
+
+        println!("  field readback:");
+        for name in ["OrderField", "Draft OrderField", "Copy of OrderField"] {
+            println!(
+                "    {name:<20} {:?} -> {:?}",
+                get(&before, name),
+                get(&after, name)
+            );
+        }
+        println!("  resolution -- target changed, decoys untouched: {resolution_ok}");
+        println!("  text fidelity -- exactly \"ordr\" appended      : {text_exact}");
+        if resolution_ok && !text_exact {
+            println!("      (right field, wrong characters: a typing disturbance, not a");
+            println!("       resolution fault -- resolution is the decoys staying clean)");
+        }
+
+        rows.push(Row {
+            label: label.to_string(),
+            first_win_ok,
+            first_fld_ok,
+            status,
+            resolution_ok,
+            text_exact,
+        });
+    }
+
+    // ---- summary ------------------------------------------------------------
+    println!("\n================ SUMMARY ================\n");
+    println!(
+        "  {:<24} {:>9} {:>9}  {:<10} {:>10} {:>6}",
+        "ordering", "first():W", "first():F", "status", "resolution", "text"
+    );
+    for r in &rows {
+        println!(
+            "  {:<24} {:>9} {:>9}  {:<10} {:>10} {:>6}",
+            r.label,
+            if r.first_win_ok { "correct" } else { "WRONG" },
+            if r.first_fld_ok { "correct" } else { "WRONG" },
+            r.status,
+            if r.resolution_ok { "ok" } else { "WRONG" },
+            if r.text_exact { "ok" } else { "off" }
+        );
+    }
+
+    let all_completed = rows.iter().all(|r| r.status == "completed");
+    let all_resolved = rows.iter().all(|r| r.resolution_ok);
+    let text_off = rows.iter().filter(|r| !r.text_exact).count();
+    let reverse: Vec<&Row> = rows
+        .iter()
+        .filter(|r| r.first_win_ok && r.first_fld_ok)
+        .collect();
+    let forward = rows.len() - reverse.len();
+
+    println!("\n--- what this covers ---");
+    println!("  orderings where first() was already correct    : {}", reverse.len());
+    println!("  orderings where first() would have picked wrong: {forward}");
+
+    if reverse.is_empty() {
+        println!("\n  INCONCLUSIVE for the gap being tested: no ordering put first() on");
+        println!("  the correct element, so the reverse direction was never exercised.");
+    } else if !all_resolved {
+        println!("\n  RESOLUTION FAILURE: some ordering sent the text somewhere other than");
+        println!("  the target field. This is a genuine defect in constructive resolution.");
+    } else {
+        let reverse_ok = reverse.iter().all(|r| r.resolution_ok && r.status == "completed");
+        println!(
+            "\n  Reverse direction (first() already correct): {} of {} completed and",
+            reverse.iter().filter(|r| r.status == "completed" && r.resolution_ok).count(),
+            reverse.len()
+        );
+        println!("  resolved to the target -- the change left a correct pick alone.");
+        if reverse_ok && all_completed {
+            println!("\n  PASS in both directions across every ordering tried.");
+        }
+        if text_off > 0 {
+            println!(
+                "\n  NOTE: {text_off} run(s) put the right text in the wrong shape -- correct"
+            );
+            println!("  field, disturbed characters. Real keystrokes into a real browser are");
+            println!("  not deterministic; this is orthogonal to resolution, which is judged");
+            println!("  by the decoy fields staying empty. Reported rather than smoothed over.");
+        }
+    }
+
+    println!("\n--- cleanup ---");
+    for needle in ["ResolveOrder", "Draft ResolveOrder", "Copy of ResolveOrder"] {
+        if let Ok(all) = desktop
+            .locator(format!("role:Window|name:{needle}").as_str())
+            .within(desktop.root())
+            .all(Some(Duration::from_secs(5)), None)
+            .await
+        {
+            for el in &all {
+                if !el.name().unwrap_or_default().contains("more pages") {
+                    let _ = el.close();
+                }
+            }
+        }
+    }
+    println!("  probe windows closed");
+
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "resolveorder") {
+        return resolveorder_mode().await;
+    }
     if std::env::args().any(|a| a == "ambigreplay") {
         return ambigreplay_mode().await;
     }
