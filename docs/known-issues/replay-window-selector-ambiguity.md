@@ -645,6 +645,13 @@ the enumeration is already paid for, the exact match is right there:
 That last branch matters: "could not check" is carried into the step detail
 rather than dropped, so it stays distinguishable from "checked, and it was fine".
 
+**Evidence level, stated here so it is not read off the counting mechanism's.**
+This change has **one** end-to-end validation run — trial 2 below. The counting
+mechanism it sits next to has three runs and nine rounds behind it. One run
+demonstrates that this works; it is not the same standard, and this is the half
+of the fix that changes previously shipped behaviour. Recorded as an open item
+in "Next steps".
+
 ### `FailedAmbiguous` is a separate result from `FailedWrongTarget`
 
 They are easy to conflate and were deliberately kept apart. `FailedWrongTarget`
@@ -875,6 +882,19 @@ generic-titled window in step 1.
       failures, not design failures. Both over-counted, and over-counting refuses
       working playbooks. Filtering the count through `resolved_is_recorded_target`
       is what made the mechanism usable.
+- [ ] **Repeat the end-to-end validation of the constructive-resolution
+      change.** The two halves of this fix do **not** rest on equally strong
+      evidence, and the difference should not be lost by their sitting in one
+      commit. The counting mechanism was confirmed across three separate runs and
+      nine measurement rounds, with identical results every time. Acting on the
+      uniquely-matching candidate instead of `first()`'s pick — the change that
+      makes trial 2 complete rather than be refused — has **one** end-to-end
+      validation run. That is enough to show it works; it is not the repeated
+      confirmation the counting mechanism received, and it is the part of the fix
+      that alters previously shipped behaviour. Worth a repeat run, under varied
+      conditions (different traversal orders, more than one decoy, a decoy that
+      sorts *after* the target, an element step whose window is not the
+      foreground one), before it is trusted to the same degree.
 - [ ] **Measure the cost on a real workload.** ~576 ms/step is measured only
       against a trivial local page — see "Cost". Acceptable on that evidence, not
       settled. If a real playbook shows otherwise, the fix is scoping element
