@@ -5424,11 +5424,537 @@ async fn sheetsstate_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------ sheetsedit mode ----
+// Part 2: can capture read the transient cell editor while it exists?
+//
+// Established: Sheets has no persistent cell elements. Typing creates a
+// ComboBox overlay named after the cell, carrying the typed text, destroyed on
+// commit. So the design question is not "how do we read a cell" but "can the
+// editor be observed during its lifetime, and is what it reports correct".
+//
+// Four things get measured, in order of how much they decide:
+//
+//   1. LIFECYCLE   -- when the editor appears and dies, sampled at 25 ms, so we
+//                     know whether there is a window to read in at all.
+//   2. PIPELINE    -- what the REAL CaptureSession records for the same edits.
+//                     This is the actual question: not "is the data reachable"
+//                     but "does the existing event-driven capture see it".
+//   3. GROUND TRUTH-- what the spreadsheet actually saved, via Sheets' own CSV
+//                     export, not via the UI that produced the reading.
+//   4. Z3          -- the reproducible position artifact.
+
+/// Strip the U+FEFF that Sheets seeds its editor with, plus trailing newline.
+fn clean_cell_text(raw: &str) -> String {
+    raw.replace('\u{feff}', "").trim_end_matches('\n').to_string()
+}
+
+/// Newest .csv in the Downloads folder, with its modified time.
+fn newest_csv() -> Option<(std::path::PathBuf, std::time::SystemTime)> {
+    let dir = dirs_downloads()?;
+    let mut best: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("csv") {
+            continue;
+        }
+        let m = entry.metadata().ok()?.modified().ok()?;
+        if best.as_ref().map(|(_, bm)| m > *bm).unwrap_or(true) {
+            best = Some((p, m));
+        }
+    }
+    best
+}
+
+fn dirs_downloads() -> Option<std::path::PathBuf> {
+    std::env::var("USERPROFILE")
+        .ok()
+        .map(|p| std::path::PathBuf::from(p).join("Downloads"))
+}
+
+async fn sheetsedit_mode() -> ExitCode {
+    use paradigm_lib::capture::{CaptureSession, ExclusionList};
+
+    println!("== capturing Sheets cell edits from the transient editor ==\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = desktop
+        .locator("role:Window|name:Untitled spreadsheet")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        println!("\n  INCONCLUSIVE: no 'Untitled spreadsheet' window. Not signed in, or the");
+        println!("  document did not load.");
+        return ExitCode::FAILURE;
+    };
+    println!("  window: {:?}", window.name().unwrap_or_default());
+    let mut doc_id = String::new();
+    if let Ok(bars) = desktop
+        .locator("role:Edit|name:Address and search bar")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for b in &bars {
+            let t = b.text(0).unwrap_or_default();
+            if let Some(rest) = t.split("/d/").nth(1) {
+                doc_id = rest.split('/').next().unwrap_or("").to_string();
+            }
+        }
+    }
+    println!("  DOCUMENT ID: {doc_id}");
+
+    // ---- 1. lifecycle -------------------------------------------------------
+    println!("\n================ 1. editor lifecycle (25 ms sampling) ================\n");
+    println!("  typing '111' into the current cell, then Enter\n");
+
+    let mut timeline: Vec<(u128, String, String, String)> = Vec::new();
+    let mut record = |t: u128, desktop: &Desktop, timeline: &mut Vec<_>| {
+        if let Ok(el) = desktop.focused_element() {
+            let role = el.role();
+            let name = el.name().unwrap_or_default();
+            let text = el.text(0).unwrap_or_default();
+            let last_differs = timeline
+                .last()
+                .map(|(_, r, n, x): &(u128, String, String, String)| {
+                    *r != role || *n != name || *x != text
+                })
+                .unwrap_or(true);
+            if last_differs {
+                timeline.push((t, role, name, text));
+            }
+        }
+    };
+
+    let t0 = std::time::Instant::now();
+    record(0, &desktop, &mut timeline);
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.type_text("111", false);
+    }
+    while t0.elapsed() < Duration::from_millis(1200) {
+        record(t0.elapsed().as_millis(), &desktop, &mut timeline);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{Enter}");
+    }
+    let commit_at = t0.elapsed().as_millis();
+    while t0.elapsed() < Duration::from_millis(3000) {
+        record(t0.elapsed().as_millis(), &desktop, &mut timeline);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    println!("  state transitions (Enter sent at +{commit_at} ms):");
+    for (t, role, name, text) in &timeline {
+        println!("    +{t:<5}ms  role={role:<10} name={name:?} text={text:?}");
+    }
+    let editor_alive: Vec<&(u128, String, String, String)> = timeline
+        .iter()
+        .filter(|(_, r, n, _)| r == "ComboBox" && looks_like_cell_ref(n))
+        .collect();
+    println!(
+        "\n  editor observed in {} of {} transitions",
+        editor_alive.len(),
+        timeline.len()
+    );
+    if let (Some(first), Some(last)) = (editor_alive.first(), editor_alive.last()) {
+        println!("  editor first seen +{} ms, last seen +{} ms", first.0, last.0);
+        println!("  -> a read window of ~{} ms exists", last.0.saturating_sub(first.0));
+    } else {
+        println!("  editor NEVER observed as a focused ComboBox -- the read window this");
+        println!("  design depends on was not seen in this run.");
+    }
+
+    // ---- 2. what the real pipeline records ----------------------------------
+    println!("\n================ 2. what CaptureSession actually records ================\n");
+    let intended = [("A1", "alpha"), ("A2", "beta"), ("A3", "gamma")];
+    println!("  driving three edits, then reading back what capture produced");
+
+    let session = match CaptureSession::start_session(
+        "sheetsedit",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Ctrl+Home to A1, then type down the column.
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{ctrl}{home}");
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let mut observed_at_edit: Vec<(String, String)> = Vec::new();
+    for (cell, value) in intended {
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.type_text(value, false);
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        // Read the editor at the moment it is alive -- the proposed mechanism.
+        if let Ok(el) = desktop.focused_element() {
+            let n = el.name().unwrap_or_default();
+            let raw = el.text(0).unwrap_or_default();
+            if el.role() == "ComboBox" && looks_like_cell_ref(&n) {
+                observed_at_edit.push((n.clone(), clean_cell_text(&raw)));
+                println!("    at edit of {cell}: editor name={n:?} text={:?}", clean_cell_text(&raw));
+            } else {
+                println!("    at edit of {cell}: focus is role={} name={n:?}", el.role());
+            }
+        }
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{Enter}");
+        }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+    }
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "\n  capture produced {} action(s), {} unmapped event(s)",
+        report.actions.len(),
+        report.unmapped_events
+    );
+    for a in &report.actions {
+        println!(
+            "    {:<9} role={:?} name={:?} payload={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-"),
+            a.payload.as_deref().unwrap_or("-")
+        );
+    }
+
+    println!("\n  read directly from the editor at edit time (the proposed mechanism):");
+    for (cell, text) in &observed_at_edit {
+        println!("    {cell} = {text:?}");
+    }
+    let direct_ok = intended
+        .iter()
+        .zip(observed_at_edit.iter())
+        .filter(|((_, want), (_, got))| want == got)
+        .count();
+    println!(
+        "  direct reads matching intent: {}/{}",
+        direct_ok,
+        intended.len()
+    );
+
+    // ---- 3. ground truth ----------------------------------------------------
+    println!("\n================ 3. did it actually commit? (CSV export) ================\n");
+    let before_csv = newest_csv().map(|(p, _)| p);
+    let export = format!("https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv&gid=0");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, &export])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("  requested {export}");
+    let mut found: Option<std::path::PathBuf> = None;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some((p, _)) = newest_csv() {
+            if Some(&p) != before_csv.as_ref() {
+                found = Some(p);
+                break;
+            }
+        }
+    }
+    match found {
+        Some(path) => {
+            println!("  downloaded {}", path.display());
+            match std::fs::read_to_string(&path) {
+                Ok(body) => {
+                    println!("  --- saved spreadsheet contents ---");
+                    for line in body.lines().take(10) {
+                        println!("    {line:?}");
+                    }
+                    let mut committed = 0;
+                    for (_, v) in intended {
+                        if body.contains(v) {
+                            committed += 1;
+                        }
+                    }
+                    println!(
+                        "  values present in the SAVED file: {committed}/{}",
+                        intended.len()
+                    );
+                    if body.contains("111") {
+                        println!("  the lifecycle test's '111' is also present");
+                    }
+                }
+                Err(e) => println!("  could not read it: {e}"),
+            }
+        }
+        None => println!("  no new CSV appeared -- commit could not be verified this way"),
+    }
+
+    // ---- 4. the Z3 artifact -------------------------------------------------
+    println!("\n================ 4. the Z3 artifact ================\n");
+    if let Ok(all) = desktop
+        .locator("role:ComboBox")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        println!("  ComboBoxes in the window: {}", all.len());
+        for el in &all {
+            let n = el.name().unwrap_or_default();
+            println!(
+                "    id={:<10} name={n:?} text={:?} bounds={:?}",
+                el.id().unwrap_or_default(),
+                el.text(0).unwrap_or_default(),
+                el.bounds().ok().map(|(x, y, w, h)| (x as i64, y as i64, w as i64, h as i64))
+            );
+        }
+    }
+
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
+// ----------------------------------------------------- sheetswatch mode ----
+// Prototype of the proposed capture mechanism, validated against ground truth.
+//
+// The rule under test, in full:
+//
+//   while focus is on a ComboBox whose name parses as a cell reference,
+//   remember (name, text); when that stops being true, emit one Type action
+//   carrying the LAST remembered pair, with U+FEFF stripped.
+//
+// "Last remembered before it stops being true" is the whole design. Reading
+// after the editor is recycled yields U+FEFF and a different cell, which is
+// precisely the corruption the original recordings showed.
+//
+// Cells are navigated via the Name Box rather than arrow keys, so the target
+// cell is deterministic and the check is against a known intent.
+async fn sheetswatch_mode() -> ExitCode {
+    println!("== prototype: derive cell edits from the transient editor ==\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = desktop
+        .locator("role:Window|name:Untitled spreadsheet")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    let mut doc_id = String::new();
+    if let Ok(bars) = desktop
+        .locator("role:Edit|name:Address and search bar")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for b in &bars {
+            let t = b.text(0).unwrap_or_default();
+            if let Some(rest) = t.split("/d/").nth(1) {
+                doc_id = rest.split('/').next().unwrap_or("").to_string();
+            }
+        }
+    }
+    println!("  DOCUMENT ID: {doc_id}");
+
+    // The Name Box input is the Edit child of the "Name box" group.
+    let name_box_input = match desktop
+        .locator("name:Name box")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    {
+        Some(group) => group.children().ok().and_then(|c| {
+            c.into_iter().find(|e| e.role() == "Edit")
+        }),
+        None => None,
+    };
+    if name_box_input.is_none() {
+        println!("  could not find the Name Box input; cannot target cells deterministically.");
+        return ExitCode::FAILURE;
+    }
+    let name_box_input = name_box_input.unwrap();
+
+    let plan = [("B2", "apple"), ("D5", "banana"), ("C9", "cherry")];
+    let mut derived: Vec<(String, String)> = Vec::new();
+
+    for (cell, value) in plan {
+        println!("\n---- intent: {cell} = {value:?} ----");
+        // Navigate deterministically.
+        let _ = name_box_input.type_text(cell, true);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = name_box_input.press_key("{Enter}");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // Type, then run the watcher over the editor's lifetime.
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.type_text(value, false);
+        }
+        let mut last_seen: Option<(String, String)> = None;
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_millis(900) {
+            if let Ok(el) = desktop.focused_element() {
+                let n = el.name().unwrap_or_default();
+                if el.role() == "ComboBox" && looks_like_cell_ref(&n) {
+                    let text = clean_cell_text(&el.text(0).unwrap_or_default());
+                    if !text.is_empty() {
+                        last_seen = Some((n, text));
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Commit. Everything after this point reads as U+FEFF at a stale cell,
+        // which is why the emitted value is the one remembered above.
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{Enter}");
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+
+        let after = desktop
+            .focused_element()
+            .ok()
+            .map(|el| {
+                (
+                    el.name().unwrap_or_default(),
+                    el.text(0).unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        match &last_seen {
+            Some((c, v)) => {
+                println!("  watcher emitted: {c} = {v:?}");
+                derived.push((c.clone(), v.clone()));
+            }
+            None => println!("  watcher emitted NOTHING -- editor never observed"),
+        }
+        println!("  (post-commit read would have been: {:?})", after);
+    }
+
+    // ---- ground truth -------------------------------------------------------
+    println!("\n================ ground truth (CSV export) ================\n");
+    let before_csv = newest_csv().map(|(p, _)| p);
+    let export = format!("https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, &export])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    let mut found = None;
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some((p, _)) = newest_csv() {
+            if Some(&p) != before_csv.as_ref() {
+                found = Some(p);
+                break;
+            }
+        }
+    }
+    let mut saved = String::new();
+    match found {
+        Some(path) => {
+            println!("  downloaded {}", path.display());
+            saved = std::fs::read_to_string(&path).unwrap_or_default();
+            for (i, line) in saved.lines().enumerate().take(12) {
+                println!("    row {:<3} {line:?}", i + 1);
+            }
+        }
+        None => println!("  no CSV appeared; cannot verify against saved state"),
+    }
+
+    println!("\n================ VERDICT ================\n");
+    println!("  {:<10} {:<10} {:<12} {}", "intent", "value", "watcher saw", "in saved file");
+    let mut right_cell = 0;
+    let mut value_saved = 0;
+    for (i, (cell, value)) in plan.iter().enumerate() {
+        let got = derived.get(i);
+        let got_cell = got.map(|(c, _)| c.clone()).unwrap_or_else(|| "-".into());
+        let got_val = got.map(|(_, v)| v.clone()).unwrap_or_else(|| "-".into());
+        let in_file = saved.contains(value);
+        if got_cell == *cell {
+            right_cell += 1;
+        }
+        if in_file {
+            value_saved += 1;
+        }
+        println!(
+            "  {:<10} {:<10} {:<12} {}",
+            cell,
+            value,
+            format!("{got_cell}={got_val}"),
+            in_file
+        );
+    }
+    println!(
+        "\n  watcher reported the intended cell: {right_cell}/{}",
+        plan.len()
+    );
+    println!("  value present in saved file       : {value_saved}/{}", plan.len());
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "sheetswatch") {
+        return sheetswatch_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsedit") {
+        return sheetsedit_mode().await;
+    }
     if std::env::args().any(|a| a == "sheetsstate") {
         return sheetsstate_mode().await;
     }

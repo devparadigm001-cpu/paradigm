@@ -323,6 +323,141 @@ The setting was returned to its original state at the end of the run
 (`"Screen reader support disabled."`), since it is a persistent per-account Docs
 preference.
 
+## Part 2: prototyping capture from the transient editor (2026-08-10)
+
+Given that no persistent cell exists, the design question is whether the editor
+overlay can be read *during its lifetime*. Prototyped with
+`text_capture_probe -- sheetsedit` and `-- sheetswatch`, and validated against
+Sheets' own CSV export rather than against the UI that produced the reading.
+
+**Result: the mechanism is plausible and NOT validated.** One run read the editor
+correctly 3/3 against the saved file; a second read it correctly 1/3. Both open
+anomalies from Part 1 are resolved, and one of them turns out to have been
+sabotaging every measurement in this investigation.
+
+### The editor's lifetime, measured
+
+Sampling the focused element every 25 ms through one edit:
+
+```
+  +0    ms  role=Edit       name=""   text="\n\n"
+  +75   ms  role=ComboBox   name="A1" text="111"
+  +245  ms  role=ComboBox   name="A1" text="111\n"
+  (Enter sent at +1295 ms)
+  +1340 ms  role=ComboBox   name="Z1" text="﻿\n"
+```
+
+The editor appears **75 ms** after typing begins, already carrying the correct
+cell name and clean text, and survives until commit — a read window of roughly
+1.2 s. That is ample.
+
+**The U+FEFF is a post-commit artifact, not a property of the text.** During
+editing the text is clean `"111"`. Only after commit does the element read
+`"﻿\n"` — *and* report a different cell. So a read taken slightly too late
+produces a garbled payload **and** a wrong cell attribution, from one mistake.
+Part 1 treated those as possibly two problems; this suggests a single cause,
+which is a lead worth carrying rather than a proven claim.
+
+### The decisive negative: the existing pipeline sees none of it
+
+A real `CaptureSession` was run across three cell edits:
+
+```
+  capture produced 1 action(s), 52 unmapped event(s)
+    navigate  role="Window" name="Untitled spreadsheet - Google Sheets …"
+```
+
+**Zero `type` actions.** Fifty-two events arrived and none mapped to a cell edit.
+So this is not a matter of tuning when capture reads — the event-driven pipeline
+does not currently surface the editor at all. Any fix has to add a mechanism, not
+adjust an existing one.
+
+### Anomaly 1 resolved: the values do commit
+
+Verified against the CSV export, which is the saved document rather than the UI:
+
+```
+  "111,,,,,,,,,,,,,,,,,,,,,,,,,alpha"
+  ",,,,,,,,,,,,,,,,,,,,,,,,,betagamma"
+```
+
+All typed values were present in the saved file, in both runs. Part 1 could not
+distinguish "the commit did not happen" from "committed values are invisible to
+UIA". It is the second: **commits work; UIA simply cannot see cell contents.**
+
+### Anomaly 2 resolved: `Z3` was a real position, and we caused it
+
+The CSV settles it. `alpha` really is in column 26 of row 1, `cherry` really is in
+column 26 of row 3. The `Z` readings were **not** a phantom element reporting a
+fake position — the data physically landed in column Z. Part 1's guess that a
+stable runtime id implied a fixed sentinel element was wrong.
+
+The cause is in the automation, not in Sheets. `terminator-rs`
+`platforms/windows/element.rs:1163` — every `press_key` whose key contains
+`ENTER` sends two keystrokes first:
+
+```rust
+if key_upper.contains("ENTER") || key_upper.contains("RETURN") {
+    let _ = self.element.0.send_keys("{LEFT}", 10);
+    let _ = self.element.0.send_keys("{END}", 10);
+}
+```
+
+An inline-autocomplete workaround for browser address bars. In a spreadsheet,
+**`{END}` moves the cursor toward the last column of the data region** — column Z
+once anything is out there. So every `press_key("{Enter}")` in these probes was
+silently relocating the cursor before committing.
+
+Two consequences worth separating:
+
+* **For this investigation:** every Sheets probe that pressed Enter had its cell
+  navigation sabotaged. That is why intended cells were never reached, and it
+  contaminates the attribution measurements below.
+* **For the product:** `press_key` with Enter is not safe against grid targets in
+  general. Worth checking wherever replay sends Enter, since the same two
+  keystrokes would be injected into a user's spreadsheet.
+
+### The prototype, and why it is not validated
+
+The rule tested: while focus is on a ComboBox whose name parses as a cell
+reference, remember `(name, text)`; when that stops holding, emit one action with
+the last remembered pair, U+FEFF stripped.
+
+Against ground truth it did not hold up consistently:
+
+| run | navigation | editor reads matching the saved file |
+|---|---|---|
+| `sheetsedit` | arrow keys | **3/3** |
+| `sheetswatch` | Name Box | **1/3** |
+
+In the second run the Name Box navigation demonstrably failed — the intended
+cells `B2`, `D5`, `C9` were never reached — and one reading came back as
+`"\nbanana"`, a stray newline leaking in from the navigation keystrokes. So the
+disagreement is confounded: it does not separate "the editor's name is an
+unreliable attribution" from "the probe's own key driving was too chaotic for the
+editor to be reporting anything stable".
+
+That confound is the `{END}` defect above. **The prototype needs re-running with
+an Enter that does not inject extra keystrokes** before any conclusion is drawn
+about the mechanism itself. Until then:
+
+* reading the editor while alive is clearly *possible* — the data is there, clean,
+  for over a second
+* whether its `name` is a trustworthy cell attribution is **open**, with one run
+  for and one against
+
+### What a fix would need, on current evidence
+
+* **A new capture path.** The existing pipeline emits nothing for cell edits, so
+  detection has to be added.
+* **A commit-edge trigger.** The value must be taken from the last observation
+  *before* the editor is recycled; one read too late yields U+FEFF at the wrong
+  cell.
+* **U+FEFF stripping**, which is cheap and already prototyped
+  (`clean_cell_text`).
+* **An Enter that does not send `{LEFT}{END}`**, or grid targets will keep moving
+  under the automation.
+
 ### What this means for a fix
 
 Not a fix, but the constraints any fix inherits:
@@ -421,15 +556,30 @@ immediately. Probe coverage has been measuring the environment it was built for.
       cells. It swaps the hidden focus host from a 1×1 `Edit` to an offscreen
       `Group`, and that is all. See "Screen-reader support does not change the
       answer". The absence of per-cell elements is not a settings artifact.
-- [ ] **Establish whether a committed cell value is readable at all.** The probe
-      could not verify the typed text after Enter, and could not distinguish "the
-      commit did not happen" from "committed values are invisible to UIA". That
-      distinction decides whether replay can ever verify what it wrote into a
-      grid.
-- [ ] **Explain the `Z3` element (runtime id `461295`).** Reported as the cell
-      position after commit instead of the expected `D4`, identically across two
-      runs and two documents. Reproducible, so not noise, and currently not
-      understood.
+- [x] ~~**Establish whether a committed cell value is readable at all.**~~
+      **Commits work; UIA cannot see cell contents.** Verified against Sheets'
+      CSV export — every typed value was present in the saved document. Replay
+      cannot verify a grid write through the accessibility tree, but it can
+      through an export.
+- [x] ~~**Explain the `Z3` element.**~~ **Not a phantom — a real position we
+      caused.** The CSV proves the data physically landed in column Z.
+      `terminator-rs` sends `{LEFT}` then `{END}` before every Enter as a browser
+      autocomplete workaround, and in a grid `{END}` jumps to the last column of
+      the data region.
+- [ ] **Re-run the editor-watcher prototype with a clean Enter.** The mechanism
+      read correctly 3/3 in one run and 1/3 in another, and the disagreement is
+      confounded by the `{END}` defect corrupting cell navigation. Send Enter
+      without the injected keystrokes, then re-measure attribution against the
+      CSV. This is the single experiment standing between "plausible" and
+      "established".
+- [ ] **Audit `press_key` with Enter across replay.** The `{LEFT}{END}` preamble
+      is injected into whatever has focus. Harmless in a text box, not harmless
+      in a spreadsheet, where it moves the cursor before the commit lands.
+- [ ] **Add a capture path for the transient editor.** The existing event-driven
+      pipeline produced zero `type` actions across three real cell edits, so this
+      is new mechanism rather than tuning. The editor is readable for ~1.2 s
+      carrying a clean value and a cell name; the value must be taken from the
+      last observation before commit.
 - [ ] **Confirm the accessor mismatch on the recorder side.** Cell identity lives
       in `text()` on the Name Box input and in `name` on the editor, never in
       `value`. Capture reads `e.element_text` for clicks and `watched.name` for
