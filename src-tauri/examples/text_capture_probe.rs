@@ -1767,15 +1767,38 @@ async fn titledrift_mode() -> ExitCode {
 // success while doing the wrong thing -- and nothing ever checks whether a
 // replayed action produced what the recording expected.
 //
-// Three candidate checks are implemented as pure predicates and run against the
+// Four candidate checks are implemented as pure predicates and run against the
 // actual data from each bug. Pure functions, because the pre-fix behaviour is
 // already captured in the known-issues docs and re-creating it live would add
 // nothing but risk.
+//
+// Two of the four are no longer candidates: the target-name check and the
+// ambiguity count are both shipped in `replay/mod.rs`. They are kept here
+// because this mode's purpose is the coverage table -- which bug each check
+// does and does not catch -- and dropping the shipped ones would leave that
+// table unable to say what is actually covered today.
 
 /// PRE-EXECUTION. Does the element the selector resolved to actually carry the
 /// name that was recorded? Cheap, and runs before anything is acted on.
 fn check_target(recorded_name: &str, resolved_name: &str) -> bool {
     recorded_name == resolved_name
+}
+
+/// PRE-EXECUTION. Of the candidates the selector reaches, how many actually
+/// carry the recorded name? More than one and the step is not decidable.
+///
+/// This is the shipped `replay::resolve_recorded` rule applied to a fixed
+/// candidate list rather than a live desktop, and it calls the same predicate
+/// the real code does. Note the two filters: the candidate list is what
+/// `contains_name` reaches, and the count is of EXACT matches -- counting raw
+/// candidates would flag the containment decoy below and refuse a replay that
+/// is not ambiguous at all.
+fn check_ambiguity(recorded: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .filter(|n| paradigm_lib::replay::resolved_is_recorded_target(recorded, n))
+        .count()
+        <= 1
 }
 
 /// DESIGN A, post-execution. Did the action do what the payload said?
@@ -1889,24 +1912,49 @@ async fn verify_mode() -> ExitCode {
         let recorded = "Untitled - Notepad";
         let resolved = "Untitled - Notepad"; // both candidate windows carry this name
         println!("  pre-execution target check: {}", yn(check_target(recorded, resolved)));
-        println!("\n  NOT caught. Two windows genuinely share the name, so the resolved");
-        println!("  element's name equals the recorded one and every content check");
-        println!("  afterwards succeeds -- against the wrong window. Detecting this needs");
-        println!("  a candidate COUNT, which the library does not expose (see");
-        println!("  replay-window-selector-ambiguity.md).");
+        println!("\n  The target check cannot see it. Two windows genuinely share the");
+        println!("  name, so the resolved element's name equals the recorded one and");
+        println!("  every content check afterwards succeeds -- against the wrong window.");
+
+        // Two windows, both genuinely named "Untitled - Notepad".
+        let ambiguous = ["Untitled - Notepad", "Untitled - Notepad"];
+        println!(
+            "\n  pre-execution ambiguity count: {}",
+            yn(check_ambiguity(recorded, &ambiguous))
+        );
+        println!("      candidates: {ambiguous:?}");
+        println!("  Caught BEFORE acting, by counting how many candidates carry the");
+        println!("  recorded name rather than checking only the one `first()` returned.");
+
+        // The control that decides whether the count is usable at all: a decoy
+        // whose title merely CONTAINS the recorded one must not be counted.
+        let decoy = ["Untitled - Notepad", "Copy of Untitled - Notepad"];
+        println!(
+            "\n  same count, containment decoy present: {}",
+            yn(check_ambiguity(recorded, &decoy))
+        );
+        println!("      candidates: {decoy:?}");
+        println!("  Passes, correctly. Both candidates reach the selector by containment");
+        println!("  but only one IS the recorded window, so this replay is unambiguous.");
+        println!("  Counting raw candidates here would refuse it -- the over-rejection");
+        println!("  that closed two earlier attempts. See");
+        println!("  replay-window-selector-ambiguity.md.");
     }
 
     // ---- summary -----------------------------------------------------------
     println!("\n================ COVERAGE ================\n");
-    println!("  bug                              A(action)  B(outcome)  B+context  target");
-    println!("  {}", "-".repeat(76));
-    println!("  multi-line duplication           no         YES         YES        no");
-    println!("  window-switch misattribution     no         no          YES        no");
-    println!("  substring selector collision     no         no          no         YES");
-    println!("  selector ambiguity               no         no          no         no");
-    println!("\n  1 of 4 by pre-execution target check (cheapest, prevents the action)");
-    println!("  2 of 4 by outcome + recorded context (needs capture to store state)");
-    println!("  3 of 4 combined. Ambiguity remains uncovered by any of these.");
+    println!("  bug                              A(action)  B(outcome)  B+context  target  ambig");
+    println!("  {}", "-".repeat(84));
+    println!("  multi-line duplication           no         YES         YES        no      no");
+    println!("  window-switch misattribution     no         no          YES        no      no");
+    println!("  substring selector collision     no         no          no         YES     no");
+    println!("  selector ambiguity               no         no          no         no      YES");
+    println!("\n  2 of 4 by pre-execution checks that are SHIPPED -- the target-name");
+    println!("    check and the ambiguity count. The cheapest of the four, and the only");
+    println!("    ones that prevent the wrong action instead of reporting it afterwards.");
+    println!("  2 of 4 by outcome + recorded context, which capture does not store yet,");
+    println!("    so those two remain uncovered in the product as it stands.");
+    println!("  4 of 4 combined, but only once the outcome check is built.");
 
     ExitCode::SUCCESS
 }
@@ -3157,10 +3205,741 @@ async fn rootcount_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------ decoycount mode ----
+// The decisive test for Route 3, per
+// docs/known-issues/replay-window-selector-ambiguity.md.
+//
+// `rootcount` established that root-scoped counting discriminates: 2 for a
+// duplicated title, 1 for a unique one. But its synthetic titles were chosen
+// NOT to collide, so it never tested the failure that closed Routes 1 and 2 --
+// OVER-REJECTION. Names match by containment, so an unrelated window whose
+// title merely contains the recorded name inflates the count and would refuse
+// a legitimate, unambiguous replay.
+//
+// The decoy here is a natural shape, not a contrived one. Browser windows are
+// titled "<page> - <profile> - <browser>", so a page titled "Draft X" produces
+// a window title that ENDS WITH, and therefore contains, the whole window title
+// of a page titled "X". A leading extension collides; a trailing one does not.
+// Both are measured.
+//
+// The mitigation under test is the already-shipped `resolved_is_recorded_target`
+// (equality, tolerating one leading `*`) used as a filter before counting. It is
+// called here directly -- not reimplemented -- so the test exercises the real
+// predicate.
+//
+// Two things must both hold for Route 3 to survive:
+//   * the filter drops the decoy, leaving 1 for the genuinely unambiguous case
+//   * the filter still reports 2 for two genuinely identical windows
+// A filter that rescues the first by suppressing the second is worthless.
+
+/// Root-scoped count for `selector`, returned as (raw, filtered, names).
+async fn root_count(
+    desktop: &Desktop,
+    selector: &str,
+    recorded: &str,
+    depth: Option<usize>,
+) -> Result<(usize, usize, Vec<String>), String> {
+    let all = desktop
+        .locator(selector)
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), depth)
+        .await
+        .map_err(|e| e.to_string())?;
+    let names: Vec<String> = all.iter().map(|el| el.name().unwrap_or_default()).collect();
+    let filtered = names
+        .iter()
+        .filter(|n| paradigm_lib::replay::resolved_is_recorded_target(recorded, n))
+        .count();
+    Ok((all.len(), filtered, names))
+}
+
+/// Name of a target window that has a window to itself.
+///
+/// A title containing "and N more pages" is a shared, multi-tab window: its name
+/// depends on tabs that are not ours, so it is not a usable recorded name.
+async fn clean_target_name(desktop: &Desktop) -> Option<String> {
+    desktop
+        .locator("role:Window|name:DecoyCount Invoice")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), Some(3))
+        .await
+        .ok()
+        .and_then(|all| {
+            all.iter()
+                .map(|w| w.name().unwrap_or_default())
+                .find(|n| !n.contains("more pages"))
+        })
+}
+
+async fn decoycount_mode() -> ExitCode {
+    println!("== over-rejection test for root-scoped candidate counting ==\n");
+
+    let page = |title: &str| {
+        format!(
+            "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{title}</title></head>\n\
+             <body style=\"font-family:sans-serif;padding:2rem\"><h2>{title}</h2></body></html>\n"
+        )
+    };
+    // Page titles. TARGET is what a recording would have captured; DECOY is an
+    // unrelated window whose full title will contain TARGET's full title;
+    // NEARMISS extends the title on the other side and must NOT collide.
+    let specs = [
+        ("warmup", "DecoyCount Warmup"),
+        ("target", "DecoyCount Invoice"),
+        ("decoy", "Draft DecoyCount Invoice"),
+        ("nearmiss", "DecoyCount Invoice Notes"),
+        ("twin", "DecoyCount Twin"),
+    ];
+    let mut paths = std::collections::HashMap::new();
+    for (key, title) in specs {
+        let p = std::env::temp_dir().join(format!("paradigm-decoycount-{key}.html"));
+        if std::fs::write(&p, page(title)).is_err() {
+            eprintln!("could not write probe page {key}");
+            return ExitCode::FAILURE;
+        }
+        paths.insert(key, p);
+    }
+    let as_url =
+        |p: &std::path::Path| format!("file:///{}", p.to_string_lossy().replace('\\', "/"));
+
+    let browser = browser_order()[0];
+    let open = |path: &std::path::Path| {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "--new-window", &as_url(path)])
+            .spawn()
+        {
+            let _ = c.wait();
+        }
+    };
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A first `--new-window` against an already-running Edge can land the URL as
+    // a TAB in an existing window instead of creating one. Measured: the target
+    // came back as "DecoyCount Invoice and 39 more pages - …", a title carrying
+    // 39 unrelated tabs. The warm-up window absorbs that so the target gets a
+    // window of its own.
+    println!("opening warm-up window (absorbs Edge's merge-into-existing behaviour)...");
+    open(&paths["warmup"]);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // The target opens ALONE and its real title is read before anything that
+    // could collide exists, so `recorded` is what capture would have stored.
+    println!("opening target window...");
+    open(&paths["target"]);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let mut recorded_target = clean_target_name(&desktop).await;
+    if recorded_target.is_none() {
+        println!("  target merged into a multi-tab window; opening one more...");
+        open(&paths["target"]);
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        recorded_target = clean_target_name(&desktop).await;
+    }
+    let Some(recorded_target) = recorded_target else {
+        eprintln!(
+            "could not obtain a single-tab target window, so no usable recorded name exists"
+        );
+        return ExitCode::FAILURE;
+    };
+    println!("  recorded target name: {recorded_target:?}\n");
+
+    for key in ["decoy", "nearmiss", "twin", "twin"] {
+        println!("opening {key} window...");
+        open(&paths[key]);
+        tokio::time::sleep(Duration::from_secs(8)).await;
+    }
+
+    let recorded_twin = match desktop
+        .locator("role:Window|name:DecoyCount Twin")
+        .first(Some(Duration::from_secs(5)))
+        .await
+    {
+        Ok(w) => w.name().unwrap_or_default(),
+        Err(e) => {
+            eprintln!("could not resolve a twin window: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  recorded twin name:   {recorded_twin:?}\n");
+
+    // ---- precondition -------------------------------------------------------
+    // If the decoy does not actually contain the recorded name, the containment
+    // collision this test exists to measure was never built, and any "filter
+    // works" verdict below would be meaningless. Prove it before trusting it.
+    println!("================ PRECONDITION ================\n");
+    let live: Vec<String> = match desktop
+        .locator("role:Window|name:DecoyCount")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), Some(3))
+        .await
+    {
+        Ok(all) => all.iter().map(|e| e.name().unwrap_or_default()).collect(),
+        Err(e) => {
+            eprintln!("could not enumerate probe windows: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for (i, n) in live.iter().enumerate() {
+        println!("  window[{i}] {n:?}");
+    }
+    let decoy_name = live
+        .iter()
+        .find(|n| n.starts_with("Draft DecoyCount Invoice"))
+        .cloned();
+    let nearmiss_name = live
+        .iter()
+        .find(|n| n.starts_with("DecoyCount Invoice Notes"))
+        .cloned();
+    let decoy_collides = decoy_name
+        .as_deref()
+        .map(|n| n.contains(&recorded_target))
+        .unwrap_or(false);
+    let nearmiss_collides = nearmiss_name
+        .as_deref()
+        .map(|n| n.contains(&recorded_target))
+        .unwrap_or(false);
+    println!("\n  decoy    present={}  contains recorded name={decoy_collides}", decoy_name.is_some());
+    println!("  nearmiss present={}  contains recorded name={nearmiss_collides}", nearmiss_name.is_some());
+    if !decoy_collides {
+        println!("\n  !! PRECONDITION FAILED: no containment collision was built.");
+        println!("     Everything below is measuring a scenario that does not exist.");
+    }
+
+    // ---- repeated measurement ----------------------------------------------
+    println!("\n================ MEASUREMENTS ================");
+    let target_sel = format!("role:Window|name:{recorded_target}");
+    let twin_sel = format!("role:Window|name:{recorded_twin}");
+
+    let mut target_raw = Vec::new();
+    let mut target_filtered = Vec::new();
+    let mut twin_raw = Vec::new();
+    let mut twin_filtered = Vec::new();
+
+    for round in 1..=3 {
+        println!("\n--- round {round} ---");
+        for (label, selector, recorded, raws, filts, want) in [
+            (
+                "TARGET (must not over-reject)",
+                &target_sel,
+                &recorded_target,
+                &mut target_raw,
+                &mut target_filtered,
+                1usize,
+            ),
+            (
+                "TWIN   (must still catch ambiguity)",
+                &twin_sel,
+                &recorded_twin,
+                &mut twin_raw,
+                &mut twin_filtered,
+                2usize,
+            ),
+        ] {
+            let started = std::time::Instant::now();
+            match root_count(&desktop, selector, recorded, Some(3)).await {
+                Ok((raw, filtered, names)) => {
+                    let ms = started.elapsed().as_millis();
+                    println!(
+                        "{label}\n  raw={raw}  filtered={filtered}  (want filtered={want})  [{ms} ms]"
+                    );
+                    for (i, n) in names.iter().enumerate() {
+                        let kept =
+                            paradigm_lib::replay::resolved_is_recorded_target(recorded, n);
+                        println!("      [{i}] {} {n:?}", if kept { "KEEP" } else { "drop" });
+                    }
+                    raws.push(raw);
+                    filts.push(filtered);
+                }
+                Err(e) => {
+                    println!("{label}\n  -> Err {e}");
+                    raws.push(usize::MAX);
+                    filts.push(usize::MAX);
+                }
+            }
+        }
+    }
+
+    // Reconfirm the depth finding from the previous run, once, on the target.
+    println!("\n--- depth default, target, once (reconfirms the depth-3 finding) ---");
+    let started = std::time::Instant::now();
+    match root_count(&desktop, &target_sel, &recorded_target, None).await {
+        Ok((raw, filtered, _)) => println!(
+            "  raw={raw}  filtered={filtered}   [{} ms]",
+            started.elapsed().as_millis()
+        ),
+        Err(e) => println!("  -> Err {e}   [{} ms]", started.elapsed().as_millis()),
+    }
+
+    // ---- verdict ------------------------------------------------------------
+    println!("\n================ VERDICT ================\n");
+    println!("  target   raw={target_raw:?}  filtered={target_filtered:?}");
+    println!("  twin     raw={twin_raw:?}  filtered={twin_filtered:?}");
+
+    let inflated = target_raw.iter().all(|&n| n >= 2);
+    let rescued = target_filtered.iter().all(|&n| n == 1);
+    let still_catches = twin_filtered.iter().all(|&n| n == 2);
+
+    println!("\n  containment inflates the raw count : {inflated}");
+    println!("  filter rescues the unambiguous case: {rescued}");
+    println!("  filter still catches real ambiguity: {still_catches}");
+    println!();
+    if !decoy_collides {
+        println!("  INVALID -- the decoy never collided; this run decides nothing.");
+    } else if !inflated {
+        println!("  Containment did NOT inflate the count, so the over-rejection");
+        println!("  risk did not reproduce here. The filter was not exercised.");
+    } else if rescued && still_catches {
+        println!("  Route 3 SURVIVES this test: containment does inflate the raw");
+        println!("  count, the shipped filter removes exactly the containment-only");
+        println!("  match, and genuine ambiguity is still reported as 2.");
+    } else {
+        println!("  Route 3 DIES the same way as Routes 1 and 2: the count cannot");
+        println!("  separate a legitimate replay from an ambiguous one.");
+    }
+
+    // ---- cleanup ------------------------------------------------------------
+    // Leftover windows would poison a repeat run's counts, which is the whole
+    // point of repeating it.
+    println!("\nclosing probe windows...");
+    if let Ok(all) = desktop
+        .locator("role:Window|name:DecoyCount")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), Some(3))
+        .await
+    {
+        // NEVER close a window whose title says "and N more pages". That is a
+        // shared, multi-tab window: our page is one tab in it and the rest are
+        // the user's. An earlier run of this probe closed one such window and
+        // took 39 unrelated tabs with it.
+        let mut closed = 0;
+        let mut spared = 0;
+        for el in &all {
+            let name = el.name().unwrap_or_default();
+            if name.contains("more pages") {
+                println!("  SPARED (shared multi-tab window) {name:?}");
+                spared += 1;
+                continue;
+            }
+            if el.close().is_ok() {
+                closed += 1;
+            }
+        }
+        println!("  closed {closed}, spared {spared}, of {} matched", all.len());
+    }
+
+    ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------ ambigreplay mode ----
+// End-to-end verification of the wired-in ambiguity check, through the REAL
+// `replay::replay` -> `navigate()` / element path. `decoycount` measured the
+// mechanism in isolation; this measures the shipped behaviour.
+//
+// Four trials against one stored playbook, each adding a window to the desktop:
+//
+//   1. clean          only the target is open      -> must COMPLETE
+//   2. + containment  a window and a field whose
+//      decoy          names CONTAIN the recorded
+//                     ones                          -> must still COMPLETE
+//   3. + field twin   a differently-titled window
+//                     holding a field with the
+//                     EXACT recorded field name     -> click must refuse
+//   4. + window twin  a window with the EXACT
+//                     recorded title                -> navigate must refuse
+//
+// Trials 3 and 4 hit the two resolution sites separately, which is why the
+// field twin has a different window title: a window-level refusal stops the run
+// before any element step is reached.
+//
+// The playbook is constructed from live-observed values -- the real window title
+// read off the desktop, the real field name -- rather than driven through OS
+// capture. Capture is not what changed and has its own probes; routing through
+// `compile` + `store` + `replay` exercises everything that did.
+
+/// Page with a static title, so nothing drifts between the four replays.
+fn ambig_page(title: &str, field: &str) -> String {
+    format!(
+        "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{title}</title></head>\n\
+         <body style=\"font-family:sans-serif;padding:2rem\"><h2>{title}</h2>\n\
+         <input id=\"f\" aria-label=\"{field}\" style=\"font-size:1.2rem;width:24rem\">\n\
+         </body></html>\n"
+    )
+}
+
+/// Print what actually matches a selector right now, and how many carry the
+/// recorded name exactly.
+///
+/// Every trial below asserts something about a count, so the count has to be
+/// shown before the trial is believed. The previous probe in this investigation
+/// reported a clean pass against a decoy that had never been created.
+async fn show_candidates(desktop: &Desktop, selector: &str, recorded: &str) -> usize {
+    let all = match desktop
+        .locator(selector)
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        Ok(all) => all,
+        Err(e) => {
+            println!("  premise: {selector:?} -> Err {e}");
+            return 0;
+        }
+    };
+    let mut exact = 0;
+    println!("  premise: {selector:?} -> {} raw candidate(s)", all.len());
+    for el in &all {
+        let name = el.name().unwrap_or_default();
+        let is_exact = paradigm_lib::replay::resolved_is_recorded_target(recorded, &name);
+        if is_exact {
+            exact += 1;
+        }
+        println!("      {} {name:?}", if is_exact { "EXACT" } else { "  ~  " });
+    }
+    println!("  premise: {exact} candidate(s) carry the recorded name exactly");
+    exact
+}
+
+/// Replay one stored playbook, time it, and print every step outcome.
+async fn run_trial(
+    conn: &mut rusqlite::Connection,
+    desktop: &Desktop,
+    playbook_id: &str,
+    label: &str,
+    expect: &str,
+    rows: &mut Vec<(String, String, u128, String)>,
+) {
+    println!("\n--- {label} ---");
+    println!("  expect: {expect}");
+    let started = std::time::Instant::now();
+    let run = paradigm_lib::replay::replay(conn, desktop, playbook_id).await;
+    let ms = started.elapsed().as_millis();
+    match run {
+        Ok(r) => {
+            println!("  status: {}   [{ms} ms]", r.status);
+            let mut worst = String::from("(none)");
+            for o in &r.outcomes {
+                println!(
+                    "    [{}] {:<9} {}",
+                    o.step_order,
+                    o.action_type,
+                    o.result.label()
+                );
+                if o.result.is_failure() {
+                    worst = format!("{} @ {}", o.result.label(), o.action_type);
+                    for line in o.detail.lines() {
+                        println!("         {line}");
+                    }
+                }
+            }
+            rows.push((label.to_string(), r.status.clone(), ms, worst));
+        }
+        Err(e) => {
+            println!("  replay errored: {e}");
+            rows.push((label.to_string(), format!("ERROR {e}"), ms, String::new()));
+        }
+    }
+}
+
+async fn ambigreplay_mode() -> ExitCode {
+    use paradigm_lib::capture::stream::{ActionCandidate, CapturedStream};
+    use paradigm_lib::capture::ExclusionList;
+    use paradigm_lib::compile::{compile, store, ReversibilityPolicy};
+    use paradigm_lib::labeling::RedactionPolicy;
+
+    println!("== ambiguity check, end to end through a real replay ==\n");
+    println!("WARNING: performs real clicks and typing. Hands off.\n");
+
+    let pages = [
+        ("warmup", ambig_page("AmbigReplay Warmup", "WarmupField")),
+        ("target", ambig_page("AmbigReplay Invoice", "AmbigField")),
+        // Contains the recorded window title AND the recorded field name.
+        ("decoy", ambig_page("Draft AmbigReplay Invoice", "Draft AmbigField")),
+        // Different title, EXACT field name -> element-level ambiguity only.
+        ("fieldtwin", ambig_page("AmbigReplay Ledger", "AmbigField")),
+    ];
+    let mut paths = std::collections::HashMap::new();
+    for (key, html) in &pages {
+        let p = std::env::temp_dir().join(format!("paradigm-ambigreplay-{key}.html"));
+        if std::fs::write(&p, html).is_err() {
+            eprintln!("could not write probe page {key}");
+            return ExitCode::FAILURE;
+        }
+        paths.insert(*key, p);
+    }
+    let as_url =
+        |p: &std::path::Path| format!("file:///{}", p.to_string_lossy().replace('\\', "/"));
+    let browser = browser_order()[0];
+    let open = |path: &std::path::Path| {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "--new-window", &as_url(path)])
+            .spawn()
+        {
+            let _ = c.wait();
+        }
+    };
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("opening warm-up window...");
+    open(&paths["warmup"]);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    println!("opening target window...");
+    open(&paths["target"]);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Read the real title off the desktop. A multi-tab window's title depends on
+    // tabs that are not ours, so it is not a usable recorded name.
+    let recorded_window = match desktop
+        .locator("role:Window|name:AmbigReplay Invoice")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .ok()
+        .and_then(|all| {
+            all.iter()
+                .map(|w| w.name().unwrap_or_default())
+                .find(|n| !n.contains("more pages"))
+        }) {
+        Some(n) => n,
+        None => {
+            eprintln!("no single-tab target window; cannot build a usable recorded name");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  recorded window name: {recorded_window:?}\n");
+
+    // ---- build the playbook through the real compile + store path -----------
+    let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
+    for (kind, role, name, payload) in [
+        (ActionKind::Navigate, "Window", recorded_window.as_str(), None),
+        (ActionKind::Click, "Edit", "AmbigField", None),
+        (ActionKind::Type, "Edit", "AmbigField", Some("ambig")),
+    ] {
+        stream.admit(ActionCandidate {
+            kind,
+            identifiers: vec![recorded_window.clone()],
+            process_name: Some(format!("{browser}.exe")),
+            element_role: Some(role.to_string()),
+            element_name: Some(name.to_string()),
+            payload: payload.map(str::to_string),
+            detail: None,
+            timestamp_ms: 0,
+        });
+    }
+    let actions = stream.actions().to_vec();
+    println!("  built {} action(s)", actions.len());
+
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("temp db failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let checked = compile(
+        &actions,
+        "Ambiguity Check",
+        &ReversibilityPolicy::placeholder(),
+        &RedactionPolicy::placeholder(),
+    );
+
+    // The same playbook as an OLD one: `target.name` absent, so both the target
+    // check and the ambiguity check skip. Same selectors, same steps, same UI --
+    // so the difference in wall-clock IS the cost of the checks, and replaying it
+    // also proves old playbooks still behave exactly as they did.
+    let mut unchecked = compile(
+        &actions,
+        "Ambiguity Check (old playbook, no target name)",
+        &ReversibilityPolicy::placeholder(),
+        &RedactionPolicy::placeholder(),
+    );
+    for step in &mut unchecked.steps {
+        let mut v: serde_json::Value = match serde_json::from_str(&step.action_payload_json) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("could not parse compiled payload: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Some(target) = v.get_mut("target").and_then(|t| t.as_object_mut()) {
+            target.remove("name");
+        }
+        step.action_payload_json = v.to_string();
+    }
+
+    for pb in [&checked, &unchecked] {
+        if let Err(e) = store::store(&mut conn, pb) {
+            eprintln!("store failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // ---- trials -------------------------------------------------------------
+    let mut rows: Vec<(String, String, u128, String)> = Vec::new();
+
+    // Trial 1 + the timing A/B, both in the clean state.
+    run_trial(
+        &mut conn,
+        &desktop,
+        &checked.id,
+        "1. clean, checks ON",
+        "completed",
+        &mut rows,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    run_trial(
+        &mut conn,
+        &desktop,
+        &unchecked.id,
+        "1b. clean, old playbook (checks OFF)",
+        "completed",
+        &mut rows,
+    )
+    .await;
+
+    println!("\nopening the containment decoy...");
+    open(&paths["decoy"]);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let win_sel = format!("role:Window|name:{recorded_window}");
+    let w2 = show_candidates(&desktop, &win_sel, &recorded_window).await;
+    let f2 = show_candidates(&desktop, "role:Edit|name:AmbigField", "AmbigField").await;
+    if w2 != 1 || f2 != 1 {
+        println!("  !! trial 2 premise broken: expected exactly 1 exact match at each level");
+    }
+    run_trial(
+        &mut conn,
+        &desktop,
+        &checked.id,
+        "2. containment decoy present",
+        "completed -- decoy must NOT be counted",
+        &mut rows,
+    )
+    .await;
+
+    println!("\nopening the field twin (same field name, different window title)...");
+    open(&paths["fieldtwin"]);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let w3 = show_candidates(&desktop, &win_sel, &recorded_window).await;
+    let f3 = show_candidates(&desktop, "role:Edit|name:AmbigField", "AmbigField").await;
+    if w3 != 1 || f3 < 2 {
+        println!("  !! trial 3 premise broken: need 1 exact window and >=2 exact fields");
+    }
+    run_trial(
+        &mut conn,
+        &desktop,
+        &checked.id,
+        "3. element-level ambiguity",
+        "failed -- click refuses, navigate is still fine",
+        &mut rows,
+    )
+    .await;
+
+    println!("\nopening the window twin (identical title)...");
+    open(&paths["target"]);
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let w4 = show_candidates(&desktop, &win_sel, &recorded_window).await;
+    if w4 < 2 {
+        println!("  !! trial 4 premise broken: Edge did not create a second window with the");
+        println!("     recorded title, so there is no window-level ambiguity to detect");
+    }
+    run_trial(
+        &mut conn,
+        &desktop,
+        &checked.id,
+        "4. window-level ambiguity",
+        "failed -- navigate refuses",
+        &mut rows,
+    )
+    .await;
+
+    // ---- summary ------------------------------------------------------------
+    println!("\n================ SUMMARY ================\n");
+    println!("  {:<38} {:<10} {:>8}  {}", "trial", "status", "ms", "failure");
+    for (label, status, ms, worst) in &rows {
+        println!("  {label:<38} {status:<10} {ms:>8}  {worst}");
+    }
+
+    if rows.len() >= 2 {
+        let on = rows[0].2 as i128;
+        let off = rows[1].2 as i128;
+        println!("\n--- cost of the check, same steps, same UI ---");
+        println!("  checks ON : {on} ms");
+        println!("  checks OFF: {off} ms");
+        println!("  added     : {} ms over 3 steps ({} ms/step)", on - off, (on - off) / 3);
+    }
+
+    println!("\n--- cleanup ---");
+    if let Ok(all) = desktop
+        .locator("role:Window|name:AmbigReplay")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        let mut closed = 0;
+        for el in &all {
+            let name = el.name().unwrap_or_default();
+            // Never close a shared multi-tab window: only one tab is ours.
+            if name.contains("more pages") {
+                println!("  SPARED {name:?}");
+                continue;
+            }
+            if el.close().is_ok() {
+                closed += 1;
+            }
+        }
+        println!("  closed {closed} probe window(s)");
+    }
+    // The decoy's title does not start with "AmbigReplay", so it needs its own sweep.
+    if let Ok(all) = desktop
+        .locator("role:Window|name:Draft AmbigReplay")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for el in &all {
+            if !el.name().unwrap_or_default().contains("more pages") {
+                let _ = el.close();
+            }
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
+
+    if std::env::args().any(|a| a == "ambigreplay") {
+        return ambigreplay_mode().await;
+    }
+    if std::env::args().any(|a| a == "decoycount") {
+        return decoycount_mode().await;
+    }
 
     if std::env::args().any(|a| a == "replaycheck") {
         return replaycheck_mode().await;

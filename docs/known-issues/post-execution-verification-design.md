@@ -111,12 +111,25 @@ resolved "Paradigm Text Capture Probe and 63 more pages - Personal - Microsoft E
 Cheapest of the three, needs no new stored data, and is the only one that
 **prevents the wrong action instead of reporting it afterwards.**
 
-### Nothing catches selector ambiguity
+### Selector ambiguity needs a fourth check, and now has one
 
 Two windows genuinely share the name, so the resolved element's name *equals* the
 recorded one and every subsequent content check succeeds — against the wrong
-window. Detecting it needs a candidate count, which the library does not expose;
-that was established separately and remains true.
+window. None of the three checks above sees it.
+
+**Superseded, 2026-08-10.** This section previously concluded that detecting it
+"needs a candidate count, which the library does not expose". That was true of
+the two mechanisms tried at the time and is no longer true in general: supplying
+a root element via `Locator::within()` reaches a matcher that does apply the
+role and name filters, and filtering those candidates by exact recorded name
+distinguishes genuine ambiguity from containment collisions. It is implemented
+and shipped as `replay::resolve_recorded` / `StepResult::FailedAmbiguous`. See
+`replay-window-selector-ambiguity.md`.
+
+The consequence for this document: ambiguity is now caught **pre-execution**,
+alongside the target-name check, so the four bugs split two/two — two prevented
+before the action, two still needing the post-execution outcome check proposed
+here.
 
 ## Tradeoffs, honestly
 

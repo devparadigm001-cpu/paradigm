@@ -1,7 +1,12 @@
 # Replay resolves each window selector independently, so steps drift between windows
 
-**Status:** confirmed from a real recording and replay. Root cause identified in
-the replay code. **Not fixed.**
+**Status: FIXED, 2026-08-10.** Replay now refuses any step whose selector matches
+more than one element carrying the recorded name, as
+`StepResult::FailedAmbiguous`, at both resolution sites. Verified end to end
+through the real compile → store → replay pipeline — see **"The fix"**. Two
+earlier attempts were built and refuted before this one worked; their
+post-mortems are kept below because they explain why the shipped design looks
+the way it does.
 **Affected:** `src-tauri/src/replay/mod.rs` — `navigate`, and target resolution
 generally. Any playbook whose steps address a window by a generic,
 content-dependent title.
@@ -344,11 +349,15 @@ They are kept because **any** future approach needs a stable process identity �
 including one that never calls `Locator::all()`. Rebuilding that plumbing is the
 expensive part; the three-line counting call that failed is not.
 
-## Route 3, in progress: count from a root element instead of a `process:` prefix (2026-08-10)
+## Route 3: count from a root element instead of a `process:` prefix (2026-08-10)
 
-**Status: promising on first evidence, and explicitly not established.** One
-probe run, no reproduction, and the decisive over-rejection test has not been
-run. Recorded so the finding is not lost — not as a result to build on.
+**Status: survives the decisive test. The first counting mechanism of the three
+that works.** Root-scoped counting *does* inflate on containment, exactly as
+feared — but filtering candidates through the already-shipped
+`resolved_is_recorded_target` removes the containment-only match while still
+reporting genuine ambiguity. Measured three separate runs, nine rounds, no
+variation. **Still not implemented in `replay/mod.rs`** — see "What is still not
+established" below for what an implementation would have to settle first.
 
 ### What the library source actually says
 
@@ -428,30 +437,338 @@ three edits, not three windows.
   children, so it could not enumerate across processes even if named correctly.
   Candidate 1 of this attempt's brief is closed on this evidence.
 
-### What is NOT established, and blocks any implementation
+### The over-rejection test (2026-08-10, later the same day)
 
-1. **Reproducibility.** One run. Nothing here has been repeated.
-2. **The over-rejection test — the one that matters — was not run.** Names match
-   by *containment*, so an unrelated window whose title merely contains the
-   recorded name inflates the count and would report false ambiguity, refusing a
-   legitimate replay. That is precisely the failure that closed Routes 1 and 2,
-   and this route has not been shown to avoid it. The synthetic titles above were
-   chosen not to collide, so they do not test it.
-3. **The plausible mitigation is untested.** Filtering candidates through the
-   already-shipped `resolved_is_recorded_target` rule (equality, tolerating one
-   leading `*`) should drop containment-only matches, and would reuse a tested
-   predicate rather than re-implementing selector matching the way Route 2 would.
-   Untested.
-4. **Cost inside a real replay.** ~290 ms per navigate step is plausibly
-   acceptable against an 8 s budget; ~1.7 s per element step is not obviously so,
-   and neither has been measured inside an actual run.
+The gap above — "the decisive test was not run" — is now closed.
+`text_capture_probe -- decoycount` builds a genuine containment collision and
+counts with and without the filter.
+
+**The decoy is a natural shape, not a contrived one.** Browser windows are
+titled `<page> - <profile> - <browser>`, so a page titled `Draft X` produces a
+window title that *ends with*, and therefore contains, the entire window title
+of a page titled `X`. No engineering of the string was needed:
+
+| Window | Full title | Contains the recorded name? |
+|---|---|---|
+| target | `DecoyCount Invoice - Personal - Microsoft​ Edge` | — (it *is* the recorded name) |
+| decoy | `Draft DecoyCount Invoice - Personal - Microsoft​ Edge` | **yes** |
+| near-miss | `DecoyCount Invoice Notes - Personal - Microsoft​ Edge` | no |
+| twin ×2 | `DecoyCount Twin - Personal - Microsoft​ Edge` | yes, and identical to each other |
+
+The near-miss is the informative control: extending the title on the *trailing*
+side does not collide, because the browser's own suffix falls between. Only a
+*leading* extension collides. That bounds the real-world exposure — the decoy
+has to be a window whose title ends with the recorded title — but does not
+remove it.
+
+The filter is the shipped `replay::resolved_is_recorded_target`, called
+directly rather than reimplemented, so the test exercises the real predicate.
+Its visibility was widened from private to `pub` for this; no behaviour changed.
+
+#### Result, three runs × three rounds
+
+```
+  target   raw=[2, 2, 2]  filtered=[1, 1, 1]      run 1
+  twin     raw=[2, 2, 2]  filtered=[2, 2, 2]
+  target   raw=[2, 2, 2]  filtered=[1, 1, 1]      run 2
+  twin     raw=[2, 2, 2]  filtered=[2, 2, 2]
+  target   raw=[2, 2, 2]  filtered=[1, 1, 1]      run 3
+  twin     raw=[2, 2, 2]  filtered=[2, 2, 2]
+```
+
+with the per-candidate decisions printed verbatim:
+
+```
+TARGET (must not over-reject)
+  raw=2  filtered=1   [164 ms]
+      [0] drop "Draft DecoyCount Invoice - Personal - Microsoft​ Edge"
+      [1] KEEP "DecoyCount Invoice - Personal - Microsoft​ Edge"
+TWIN   (must still catch ambiguity)
+  raw=2  filtered=2   [161 ms]
+      [0] KEEP "DecoyCount Twin - Personal - Microsoft​ Edge"
+      [1] KEEP "DecoyCount Twin - Personal - Microsoft​ Edge"
+```
+
+Three things follow, and the first is as important as the other two:
+
+1. **The feared over-rejection is real.** Raw root-scoped counting reports **2
+   for a completely unambiguous replay**. Had the check been wired to the raw
+   count — which is what "Route 3 looks promising" meant before this test — it
+   would have refused a legitimate playbook. Route 3 would have died exactly
+   like Routes 1 and 2, and the earlier `rootcount` evidence could not have
+   shown it, because those titles were chosen not to collide.
+2. **The filter rescues it.** The decoy is dropped, the count falls to 1, and
+   the replay proceeds.
+3. **The filter does not paper over real ambiguity.** Two genuinely identical
+   windows still count 2 after filtering, so the check keeps the ability it
+   exists for.
+
+Timing at depth 3 was 153–265 ms across all nine rounds; the default depth cost
+775–956 ms for the same answer, reconfirming the earlier depth finding on
+independent runs.
+
+#### The run that decided nothing, and why it was allowed to
+
+The first execution of this probe reported a clean pass on every line that
+mattered — target filtered=1, twin filtered=2, "filter rescues the unambiguous
+case: **true**" — and was **invalid**. Its explicit precondition check said so:
+
+```
+  decoy    present=true  contains recorded name=false
+  !! PRECONDITION FAILED: no containment collision was built.
+```
+
+Edge had opened the target page as a **tab in an existing 40-tab window** rather
+than a new one, so the recorded name came back as
+`"DecoyCount Invoice and 39 more pages - Personal - Microsoft​ Edge"`. The decoy
+title could not contain *that*, so no collision existed and the filter was never
+exercised. The "pass" was the trivial one: nothing to reject, so nothing
+rejected.
+
+This is the fourth instance of the pattern named at the bottom of this document,
+in its "cannot tell no-signal from matching-signal" form — and the first one
+caught at the moment it happened rather than hours later, because the probe was
+built to prove its own premise before reporting a verdict. **A probe that tests a
+mitigation must first prove the thing being mitigated is present.** The fix was a
+warm-up window that absorbs Edge's merge-into-an-existing-window behaviour.
+
+That run also caused real collateral damage worth recording: cleanup closed the
+matched window, and with it 39 unrelated tabs belonging to the user. The probe
+now refuses to close any window whose title says `and N more pages`, since such a
+window is shared and only one tab in it is the probe's.
 
 ### Candidate 2, untouched
 
 Deferring the ambiguity question to the user — surfacing "this matched two
 windows, which did you mean?" instead of deciding silently — has not been
-investigated. Worth noting it depends on detection working first, so it is
-downstream of the above rather than an alternative to it.
+investigated. It depends on detection working first, so it is downstream of the
+fix below rather than an alternative to it.
+
+## The fix (2026-08-10)
+
+Route 3 is implemented in `replay/mod.rs` as `resolve_recorded`, called at both
+resolution sites: `navigate` and the shared click/type element path. A step whose
+selector matches more than one element carrying the recorded name fails as
+`StepResult::FailedAmbiguous` instead of acting on a silent pick.
+
+### Search depth: why the default is required, not a shortcut
+
+This was the one open question blocking implementation, recorded above as
+"enumeration completeness … a tuning parameter, not a guarantee". It turned out
+to be answerable from the library source, and the answer is *derived* rather than
+tuned. Reading `terminator-rs` 0.23.35 `platforms/windows/engine.rs`:
+
+**The requirement is not "enumerate every window on the desktop".** It is "cover
+everything `first()` could have returned", because the question the check asks is
+whether `first()` had more than one candidate to choose from. That reframing is
+what makes a guarantee possible at all — absolute completeness is unverifiable,
+relative coverage is not.
+
+Three facts establish the coverage:
+
+1. **Both calls start from the same node.** `find_element` (behind `first()`)
+   with `root: None` resolves its root via `get_root_element_with_retry()`.
+   `Desktop::root()`, which the counter passes to `within()`, returns
+   `get_root_element()`. The same desktop node.
+2. **Both bottom out in the same matcher.** `Selector::Role` in both
+   `find_element` and `find_elements`, with the same `control_type` and
+   `contains_name` filters.
+3. **The resolver's depth is bounded by 50.** `find_element` computes it with
+   `calculate_search_depth(role, name, None, None)`, which returns **5** for a
+   *named container* role (`pane`/`window`/`application`) and
+   `default_depth.unwrap_or(50)` = **50** otherwise. Because it always passes
+   `None`, 50 is the deepest search `find_element` can ever perform.
+
+Meanwhile `should_use_shallow_search` returns false whenever a root is supplied,
+so the counter's depth is exactly what we pass: `depth.unwrap_or(50)`. Passing
+`None` therefore gives the counter a traversal that is a superset of the
+resolver's, for every role. **50 is not a guess — it is the library's own maximum
+resolver depth.**
+
+**Why the fast option is unsafe.** Depth 3 measured 6× faster for windows
+(153–265 ms vs 775–956 ms) and is what an optimisation pass would reach for. It
+is below the resolver's 5 for exactly the named-window selectors this bug is
+about. A counter at depth 3 audits a search by examining *less* of the tree than
+the search covered, so it could report "one candidate, unambiguous" for a
+selector `first()` had two to choose from — the original silent-wrong-window bug,
+reintroduced by the check built to prevent it.
+
+**Why per-role depth was rejected too.** Mirroring the library's own rule (5 for
+containers, 50 otherwise) would be fast and correct *today*. It requires
+replicating `should_use_shallow_search`'s undocumented predicate, and if that
+drifts in a future version our depth silently drops below the resolver's.
+
+**The asymmetry settles it.** Under-counting is silent and writes to the wrong
+window. Over-counting is loud and refuses a step the user can see. Only one of
+those is recoverable, so the check errs toward over-enumeration.
+
+**No truncation signal exists.** For the record, since the alternative would have
+been to detect truncation rather than reason about depth: `UIMatcher::search` in
+`uiautomation` recurses while `depth < self.depth` and returns `Ok(())` either
+way. No flag, no counter, no error. A chosen depth cannot be checked for
+completeness at runtime, which is why the coverage argument above had to be made
+from the source instead.
+
+### The constructive-resolution change to the target check
+
+The end-to-end test exposed a defect in the *existing* target check, and fixing
+it was necessary to make the ambiguity check reachable at all.
+
+On the first end-to-end run, the containment-decoy trial failed with
+`FAILED (resolved the wrong element)` at the navigate step:
+
+```
+  recorded: "AmbigReplay Invoice - Personal - Microsoft​ Edge"
+  resolved: "Draft AmbigReplay Invoice - Personal - Microsoft​ Edge"
+```
+
+`first()` returns whichever containment match it reaches first in traversal
+order, and that is **not necessarily the recorded one**. The target check then
+vetoed the whole step. So a legitimate, unambiguous replay was refused — the
+correct window was open, uniquely identifiable by exact name, and sitting in the
+candidate list — because the resolver guessed and the checker could only veto.
+
+This was pre-existing behaviour, not a regression from the ambiguity work: the
+new code was never reached, because the target check returns first.
+
+The fix is that resolution is now **constructive rather than defensive**. Since
+the enumeration is already paid for, the exact match is right there:
+
+* exactly one candidate carries the recorded name → **act on that element**,
+  which may not be the one `first()` returned
+* several do → `FailedAmbiguous`
+* none do, or the enumeration failed → fall back to checking `first()`'s own
+  pick, which distinguishes "the target is genuinely gone" (`FailedWrongTarget`,
+  as before) from "the enumeration did not see it" (proceed, with the reason
+  recorded in the step detail — never silently)
+
+That last branch matters: "could not check" is carried into the step detail
+rather than dropped, so it stays distinguishable from "checked, and it was fine".
+
+### `FailedAmbiguous` is a separate result from `FailedWrongTarget`
+
+They are easy to conflate and were deliberately kept apart. `FailedWrongTarget`
+is a *proven mismatch* — the element found is demonstrably not the recorded one.
+`FailedAmbiguous` is *unproven identity* — the element found may well be correct,
+but an equally good candidate exists. The remedies differ (a drifted selector
+versus a duplicate window), and collapsing them would make a log read "resolved
+the wrong element" for an element that is probably right. For a bug whose whole
+nature is plausible-but-wrong reporting, that is the wrong trade.
+
+### End-to-end evidence: five trials
+
+`text_capture_probe -- ambigreplay` builds a playbook from live-observed values,
+pushes it through the real `CapturedStream::admit` → `compile` → `store` →
+`replay` path, and replays it against a desktop that gains one window per trial.
+Every trial prints its own premise before the verdict, because the previous probe
+in this investigation once reported a clean pass against a decoy that had never
+been created.
+
+```
+  trial                                  status           ms  failure
+  1. clean, checks ON                    completed      2185  (none)
+  1b. clean, old playbook (checks OFF)   completed       455  (none)
+  2. containment decoy present           completed      2447  (none)
+  3. element-level ambiguity             failed         1614  FAILED (selector is ambiguous) @ click
+  4. window-level ambiguity              failed          834  FAILED (selector is ambiguous) @ navigate
+```
+
+| # | Desktop state | Required | Result |
+|---|---|---|---|
+| 1 | target only | complete | completed, 3/3 |
+| 1b | target only, `target.name` stripped | complete, checks skipped | completed, 3/3 |
+| 2 | + window *and* field whose names CONTAIN the recorded ones | still complete | completed, 3/3 |
+| 3 | + different window title, EXACT recorded field name | click refuses | `FailedAmbiguous` @ click, navigate still executed |
+| 4 | + EXACT recorded window title | navigate refuses | `FailedAmbiguous` @ navigate |
+
+Four things this establishes that the isolated `decoycount` measurement could
+not:
+
+* **Both sites work, independently.** Trial 3's field twin has a *different*
+  window title on purpose — a window-level refusal would stop the run before any
+  element step is reached, so the element site would never be exercised.
+* **No over-rejection through the real path.** Trial 2 has containment decoys at
+  *both* levels (`"Draft AmbigReplay Invoice…"` and `"Draft AmbigField"`) and
+  completes. Raw candidate counts there were 2 and 2; exact counts were 1 and 1.
+* **Old playbooks are untouched.** Trial 1b is the same playbook with
+  `target.name` removed, which is exactly what a playbook recorded before these
+  fields existed looks like. Both checks skip and it completes — the same
+  strictly-additive property `scoped_selector()` was given.
+* **The refusals name the problem.** Verbatim from trial 4:
+
+```
+window selector "role:Window|name:AmbigReplay Invoice - Personal - Microsoft​ Edge"
+matches 2 windows that all carry the recorded name
+"AmbigReplay Invoice - Personal - Microsoft​ Edge", so which one the recording
+meant cannot be determined.
+Refusing to activate any of them: activating the wrong one sends every later
+step to the wrong window while the run still reports success.
+```
+
+### Cost: 576 ms per step, measured against a trivial page
+
+Trials 1 and 1b are a true A/B — the same playbook, the same three steps, the
+same UI, differing only in whether `target.name` is present to trigger the
+checks:
+
+```
+  checks ON : 2185 ms
+  checks OFF:  455 ms
+  added     : 1730 ms over 3 steps (576 ms/step)
+```
+
+Per-enumeration cost is ~700–800 ms, consistent with `decoycount`'s standalone
+775–956 ms at depth 50.
+
+**The honest caveat: the baseline is a trivial local HTML page, and that is the
+only workload this has been measured against.** The 4.8× multiplier is an
+artifact of an unusually fast best case and will not transfer. The number that
+does transfer is the absolute ~0.7 s/step — roughly 9% of the 8 s window budget
+and 5% of the 15 s element budget, and small against latencies already measured
+in this project, where a *single* Gmail element took 6,743 ms to appear (the
+reason `ELEMENT_LOCATE_TIMEOUT` is 15 s). On a 12-step playbook it adds ~7 s.
+
+Shipped on that basis: acceptable on the evidence available, **not settled**. It
+has not been measured on a real workload.
+
+**If it does need addressing, restricting the check to navigate steps is the
+wrong answer.** Trial 3 is the direct evidence: element resolution is
+desktop-wide, so a correctly-resolved navigate does not make the following click
+safe — it can still land in another window. Checking only navigate closes the
+window-level hole and leaves the element-level one open, which is the same silent
+wrong-write at finer granularity. The two real options, in order of preference:
+
+1. **Scope element resolution to the window the preceding navigate resolved.**
+   Cuts the enumeration to a small subtree *and* shrinks the ambiguity surface
+   itself. It changes which elements are findable, so it needs its own evidence.
+2. **Reuse the verdict across consecutive steps sharing an identical selector.**
+   Trial 1's click and type both used `role:Edit|name:AmbigField` back to back;
+   caching removes about a third of the added cost. It assumes the UI did not
+   change between two adjacent steps — an assumption worth testing rather than
+   presuming.
+
+There is no cheaper condition that preserves the guarantee: you need the
+enumeration to know whether there is ambiguity.
+
+### Regression evidence
+
+The fourth change to land at these same two resolution sites, so this was checked
+deliberately rather than assumed.
+
+| Check | Result |
+|---|---|
+| `cargo test` (89 unit + 23 integration) | pass |
+| `cargo clippy --all-targets` | 0 errors |
+| `replaycheck` — a real recorded playbook still replays | **completed 4/4, 0 wrong-target rejections** |
+| `multiline` — multi-line flush fix | pass, replay reproduces text exactly |
+| `windowswitch` — window-switch attribution fix | pass, type ordered before the switch |
+| `verify` — A–E coverage trials | pass; section 4 updated, ambiguity now covered |
+| `ipc_pipeline::full_pipeline_over_ipc` | **fails — pre-existing** |
+
+The `ipc_pipeline` failure was verified as pre-existing by stashing this work and
+re-running against HEAD: identical failure, no `type` action captured. It is the
+deliberately-visible test tracking `text-input-capture-truncation.md`, a capture
+defect unrelated to replay.
 
 ## Pattern: a swallowed error produces a confident false conclusion
 
@@ -478,10 +795,22 @@ channel, or a diagnostic cannot tell "no signal" from "matching signal", and the
 absence is read as data.** Every instance produced a confident, wrong conclusion
 that survived until something forced a re-check.
 
+4. **The collision that was never built.** The `decoycount` probe's first run
+   reported the mitigation working on every line — and the collision it was
+   meant to mitigate did not exist, because Edge had opened the target as a tab
+   in an existing window. Recorded above.
+
 The practical rule for anyone working in this area: when a probe reports zero,
 empty, or equal, prove the call *succeeded* before drawing anything from the
 value. `.ok()` and `unwrap_or_default()` in diagnostic code are where these
 originate.
+
+Instance 4 adds a second rule, and it is the one that saved this session's
+result: **a probe testing a mitigation must assert that the condition being
+mitigated is actually present**, and report *invalid* rather than *pass* when it
+is not. Every earlier instance in this list cost hours because nothing forced
+that check; this one cost one run, because the check was written before the
+verdict was believed.
 
 A related but distinct variant, worth one line rather than a section: during the
 Route 1 work an edit that *deleted* the ambiguity check read as contradictory,
@@ -493,6 +822,9 @@ what the actual state was. Stating "this removes X" in prose alongside a
 deletion avoids it.
 
 ## Why it matters
+
+Kept in the present tense because it is the argument for the fix, and for why the
+fix accepts a real latency cost and a real risk of refusing borderline replays.
 
 The failure is invisible from every vantage point a user has. The run reports
 success. Each step reports success, truthfully — a window *was* activated, text
@@ -523,29 +855,44 @@ generic-titled window in step 1.
       no longer true** — a third path exists (root-scoped counting, 2026-08-10)
       and looks better than Route 2 on first evidence, because the library does
       its own matching rather than us re-implementing it.
-- [ ] **Finish, or kill, Route 3.** See "Route 3, in progress". The next action
-      is not more design: it is the over-rejection test — a decoy window whose
-      title contains the recorded name — plus a repeat run. If root-scoped
-      counting inflates on containment and the target-name filter does not
-      rescue it, this dies the same way as Routes 1 and 2 and should be recorded
-      as such rather than tuned.
-- [ ] **Reconsider whether fail-loud-on-ambiguity is the right design at all.**
-      This now deserves asking before a third counting mechanism is attempted.
-      Two independent tries at "count candidates through the library's own API"
-      have failed for *different* reasons — `all()` rejecting desktop-wide
-      selectors, then `all()` counting the wrong thing once scoped — which
-      suggests the API does not expose the notion of "how many things does this
-      selector match" at all. If that holds, the answer is not a third counting
-      path but a different design: resolving targets once per run,
-      post-execution verification that the right window was written to, or
-      capture recording enough context that replay never has to disambiguate.
+- [x] ~~**Finish, or kill, Route 3.**~~ **Finished: it survives.** The
+      over-rejection test was run with a genuine containment decoy and repeated
+      three times. Raw root-scoped counting *does* inflate to 2 on an
+      unambiguous replay — the failure that killed Routes 1 and 2 — but
+      filtering through `resolved_is_recorded_target` drops the decoy to 1 while
+      still reporting 2 for two genuinely identical windows. See "The
+      over-rejection test".
+- [x] ~~**Settle enumeration completeness, then implement.**~~ **Settled and
+      implemented** — see "Search depth". The completeness question was the wrong
+      one: absolute completeness is unverifiable (`UIMatcher::search` gives no
+      truncation signal at all), but it is also not what the check needs. The
+      requirement is that the counter cover *the resolver's* search space, and
+      that is establishable from the library source — same root node, same
+      matcher, and the resolver's depth is bounded by 50, which is what passing
+      `None` gives the counter.
+- [x] ~~**Reconsider whether fail-loud-on-ambiguity is the right design at
+      all.**~~ It was the right design; the two earlier failures were mechanism
+      failures, not design failures. Both over-counted, and over-counting refuses
+      working playbooks. Filtering the count through `resolved_is_recorded_target`
+      is what made the mechanism usable.
+- [ ] **Measure the cost on a real workload.** ~576 ms/step is measured only
+      against a trivial local page — see "Cost". Acceptable on that evidence, not
+      settled. If a real playbook shows otherwise, the fix is scoping element
+      resolution to the navigated window, or caching the verdict across
+      consecutive steps with an identical selector — *not* checking fewer steps,
+      for the reason trial 3 demonstrates.
+- [ ] **Surface ambiguity to the user rather than only refusing.** Candidate 2
+      from the original brief, still untouched, and now unblocked: detection
+      works, so "this matched two windows, which did you mean?" is buildable.
+      Today the run fails with a message naming the selector and the count, which
+      is honest but leaves the user to close the duplicate window themselves.
 - [ ] **Prefer identifiers that do not change with content.** A window title that
       mutates as the user types is a poor key. Process id continuity, or a
       window handle held for the run, would be stable across exactly the change
       that broke this. Note the measured limits: Windows 11 Notepad hands new
       launches to an existing instance, HWND is 0 for browser windows, and a
       UWP app's process resolves to the shared `ApplicationFrameHost.exe`.
-- [ ] **Reproduce it in a probe.** This is recorded from a live session and read
-      out of the code; it has not been driven deterministically the way the
-      capture defects were. A probe would confirm the mechanism and give any fix
-      something to verify against.
+- [x] ~~**Reproduce it in a probe.**~~ `text_capture_probe -- ambigreplay`
+      reproduces it deterministically: trial 4 opens two windows sharing a title
+      and drives a real replay at them. Before the fix that scenario is exactly
+      the silent wrong-window write; after it, the run refuses.

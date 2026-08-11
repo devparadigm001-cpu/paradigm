@@ -122,6 +122,26 @@ pub enum StepResult {
     /// them would hide exactly the failure this exists to surface. See
     /// docs/known-issues/selector-matching-precision.md.
     FailedWrongTarget,
+    /// Several elements match the selector equally well, so which one the
+    /// recording meant cannot be determined.
+    ///
+    /// Deliberately distinct from `FailedWrongTarget`, which they are easy to
+    /// conflate. `FailedWrongTarget` is a *proven mismatch*: the element found
+    /// is demonstrably not the recorded one. This is *unproven identity*: the
+    /// element found may well be the right one, but an equally good candidate
+    /// exists and nothing in the recording says which was meant.
+    ///
+    /// They need different fixes, too. A wrong target means the selector no
+    /// longer describes what it did at record time. An ambiguous one means the
+    /// selector was never specific enough -- often two windows of the same app
+    /// with the same title -- and the remedy is closing the duplicate or
+    /// re-recording, not repairing drift.
+    ///
+    /// Collapsing the two would make a log read "resolved the wrong element"
+    /// for an element that is very likely correct. For a bug whose whole nature
+    /// is plausible-but-wrong reporting, that is the wrong trade.
+    /// See docs/known-issues/replay-window-selector-ambiguity.md.
+    FailedAmbiguous,
 }
 
 impl StepResult {
@@ -132,6 +152,7 @@ impl StepResult {
                 | StepResult::FailedNotFound
                 | StepResult::FailedAction
                 | StepResult::FailedWrongTarget
+                | StepResult::FailedAmbiguous
         )
     }
 
@@ -144,6 +165,7 @@ impl StepResult {
             StepResult::FailedNotFound => "FAILED (element not found)",
             StepResult::FailedAction => "FAILED (action errored)",
             StepResult::FailedWrongTarget => "FAILED (resolved the wrong element)",
+            StepResult::FailedAmbiguous => "FAILED (selector is ambiguous)",
         }
     }
 }
@@ -286,10 +308,12 @@ fn parse_payload(raw: &str) -> StepPayload {
 ///
 /// Note what this can and cannot do. It only ever rejects matches that
 /// containment ACCEPTED -- any other drift already fails to resolve today, so
-/// this adds no new failure there. It also cannot detect two windows genuinely
-/// sharing a name; that needs a candidate count, which the library does not
-/// expose (see replay-window-selector-ambiguity.md).
-fn resolved_is_recorded_target(recorded: &str, resolved: &str) -> bool {
+/// this adds no new failure there. On its own it also cannot detect two windows
+/// genuinely sharing a name: each one individually IS the recorded name, so this
+/// passes them both, correctly. That case needs a candidate count, which
+/// `resolve_recorded` below supplies -- using this predicate as its filter.
+/// See docs/known-issues/replay-window-selector-ambiguity.md.
+pub fn resolved_is_recorded_target(recorded: &str, resolved: &str) -> bool {
     if recorded == resolved {
         return true;
     }
@@ -297,6 +321,123 @@ fn resolved_is_recorded_target(recorded: &str, resolved: &str) -> bool {
         .strip_prefix('*')
         .map(|undecorated| undecorated == recorded)
         .unwrap_or(false)
+}
+
+/// How long the ambiguity enumeration may spend.
+///
+/// It only ever runs *after* a successful `first()`, so at least one element
+/// matches and the matcher returns on its first pass. This bound exists for the
+/// pathological case where the tree changes in between and the enumeration finds
+/// nothing, which would otherwise poll for the full default timeout.
+const AMBIGUITY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Search depth for the ambiguity enumeration. `None` means the library's
+/// default of 50.
+///
+/// This is the one tuning decision in the check, and it is derived rather than
+/// picked. The requirement is *not* "enumerate every window on the desktop" --
+/// it is "cover everything `first()` could have returned", because the whole
+/// question is whether `first()` had more than one candidate to choose from.
+///
+/// Reading `terminator-rs` 0.23.35 `platforms/windows/engine.rs`, both calls
+/// bottom out in the same `Selector::Role` matcher, from the same node:
+///
+/// * `find_element` (behind `first()`) with `root: None` resolves its root via
+///   `get_root_element_with_retry()`, and `Desktop::root()` -- what the counter
+///   passes to `within()` -- returns `get_root_element()`. The same desktop node.
+/// * `find_element` picks its depth with `calculate_search_depth(role, name,
+///   None, None)`, which returns **5** for a *named container* role
+///   (`pane`/`window`/`application`) and **50** for anything else.
+/// * `find_elements` (behind `all()`) calls `calculate_search_depth(role, name,
+///   root, depth)`, and `should_use_shallow_search` returns false whenever a
+///   root is supplied. So the counter's depth is exactly what we pass:
+///   `depth.unwrap_or(50)`.
+///
+/// So 50 is `>=` the resolver's depth for *every* role, and the counter's
+/// traversal is a superset of the resolver's. A shallower per-role depth --
+/// the tempting optimisation, since depth 3 measured 6x faster for windows --
+/// would mean auditing a search by examining *less* of the tree than the search
+/// itself covered. At depth 3 the counter is below the resolver's 5 for exactly
+/// the window selectors this bug is about: it could report "one candidate,
+/// unambiguous" for a selector `first()` had two to choose from, which is the
+/// original silent-wrong-window bug reintroduced by the check meant to prevent
+/// it.
+///
+/// Matching the library's per-role rule instead of fixing 50 was considered and
+/// rejected: it means replicating `should_use_shallow_search`'s undocumented
+/// predicate, and if that drifts in a future version our depth silently drops
+/// below the resolver's. The failure would be silent under-counting.
+///
+/// The asymmetry settles it. Under-counting is silent and writes to the wrong
+/// window; over-counting is loud and refuses a step the user can see. Only one
+/// of those is recoverable.
+const AMBIGUITY_DEPTH: Option<usize> = None;
+
+/// What the candidate enumeration was able to establish.
+#[derive(Debug)]
+enum Resolution {
+    /// Exactly one candidate carries the recorded name. Act on *this* element,
+    /// not on whatever `first()` happened to return -- see `resolve_recorded`.
+    Unique(UIElement),
+    /// Several do. Which one the recording meant is not knowable from here.
+    Ambiguous(usize),
+    /// No candidate carries the recorded name, or the enumeration failed. The
+    /// caller falls back to checking `first()`'s own pick, which distinguishes
+    /// "the target is genuinely gone" from "the enumeration missed it".
+    /// Never treated as "unambiguous" -- see the swallowed-error pattern in the
+    /// known-issues doc.
+    Inconclusive(String),
+}
+
+/// Find the element that carries the recorded name, and establish whether it is
+/// the only one.
+///
+/// Two filters, doing different jobs. The library's `contains_name` decides
+/// which elements the selector reaches -- the same rule `first()` used, so the
+/// candidate set is the one `first()` chose from. `resolved_is_recorded_target`
+/// then keeps only those whose name genuinely *is* the recorded one, because
+/// containment alone reports false ambiguity: a window titled
+/// `"Draft X - Personal - Microsoft Edge"` contains the whole title of a window
+/// titled `"X - Personal - Microsoft Edge"`, and counting it would refuse a
+/// perfectly unambiguous replay. Measured; see the known-issues doc.
+///
+/// Returning the element, rather than just a count, fixes a real defect the
+/// end-to-end test exposed. `first()` returns whichever containment match it
+/// reaches first in traversal order, which is **not necessarily the recorded
+/// one**: with the decoy above open, `first()` returned `"Draft X …"` and the
+/// target check then refused the whole step -- a legitimate, unambiguous replay
+/// rejected because the resolver guessed and the checker could only veto. Since
+/// the enumeration is already paid for, the exact match is right there; using it
+/// makes resolution constructive instead of merely defensive.
+///
+/// Runs only after a successful `first()`. Ordering matters: a miss costs the
+/// full locate timeout, so enumerating *before* resolution would add that to
+/// every genuinely-absent element.
+async fn resolve_recorded(desktop: &Desktop, selector: &str, recorded: &str) -> Resolution {
+    let candidates = match desktop
+        .locator(selector)
+        .within(desktop.root())
+        .all(Some(AMBIGUITY_TIMEOUT), AMBIGUITY_DEPTH)
+        .await
+    {
+        Ok(candidates) => candidates,
+        Err(e) => {
+            return Resolution::Inconclusive(format!("candidates could not be enumerated: {e}"))
+        }
+    };
+
+    let mut named: Vec<UIElement> = candidates
+        .into_iter()
+        .filter(|el| resolved_is_recorded_target(recorded, &el.name().unwrap_or_default()))
+        .collect();
+
+    match named.len() {
+        0 => Resolution::Inconclusive(
+            "no enumerated candidate carries the recorded name".to_string(),
+        ),
+        1 => Resolution::Unique(named.remove(0)),
+        n => Resolution::Ambiguous(n),
+    }
 }
 
 /// Best-effort name of the foreground application, for `system_state_json`.
@@ -465,29 +606,57 @@ async fn execute_step(
     // Confirm this is the recorded target BEFORE acting on it. Nothing has
     // happened yet, so refusing here costs nothing; acting on the wrong element
     // cannot be undone.
+    let mut element = element;
+    let mut unverified_note = String::new();
     if let Some(recorded) = payload.target_name.as_deref() {
-        let resolved = element.name().unwrap_or_default();
-        if !resolved_is_recorded_target(recorded, &resolved) {
-            return mk(
-                StepResult::FailedWrongTarget,
-                format!(
-                    "selector {selector:?} resolved to the wrong element -- names match by \
-                     containment, not equality.\n  recorded: {recorded:?}\n  resolved: {resolved:?}\n\
-                     Refusing to act: this is how a replay writes to the wrong place while \
-                     reporting success."
-                ),
-            );
+        match resolve_recorded(desktop, selector, recorded).await {
+            // Act on the element that IS the recorded one, which may not be the
+            // one `first()` returned.
+            Resolution::Unique(exact) => element = exact,
+            Resolution::Ambiguous(n) => {
+                return mk(
+                    StepResult::FailedAmbiguous,
+                    format!(
+                        "selector {selector:?} matches {n} elements that all carry the recorded \
+                         name {recorded:?}, so which one the recording meant cannot be \
+                         determined.\nRefusing to act: `first()` would pick one silently, and a \
+                         wrong pick here is invisible in the run report."
+                    ),
+                );
+            }
+            // Nothing enumerated carries the recorded name. Either the target
+            // is genuinely gone, or the enumeration did not see it. `first()`'s
+            // own pick tells the two apart.
+            Resolution::Inconclusive(reason) => {
+                let resolved = element.name().unwrap_or_default();
+                if !resolved_is_recorded_target(recorded, &resolved) {
+                    return mk(
+                        StepResult::FailedWrongTarget,
+                        format!(
+                            "selector {selector:?} resolved to the wrong element -- names match \
+                             by containment, not equality.\n  recorded: {recorded:?}\n  resolved: \
+                             {resolved:?}\nRefusing to act: this is how a replay writes to the \
+                             wrong place while reporting success."
+                        ),
+                    );
+                }
+                unverified_note = format!("\n  note: ambiguity not verified -- {reason}");
+            }
         }
     }
 
-    match step.action_type.as_str() {
+    let mut outcome = match step.action_type.as_str() {
         "click" => click(desktop, &element, selector, &mk),
         "type" => type_text(&element, payload, &mk),
         other => mk(
             StepResult::FailedAction,
             format!("unsupported action_type {other:?}"),
         ),
-    }
+    };
+    // Carried into the step detail rather than dropped: "could not check" must
+    // not be indistinguishable from "checked, and it was fine".
+    outcome.detail.push_str(&unverified_note);
+    outcome
 }
 
 async fn navigate(
@@ -496,16 +665,15 @@ async fn navigate(
     mk: &impl Fn(StepResult, String) -> StepOutcome,
 ) -> StepOutcome {
     if let Some(selector) = payload.selector.as_deref() {
-        // An ambiguity check belongs here -- a generic selector like
-        // `role:Window|name:"Untitled - Notepad"` can match several real
-        // windows, and silently taking the first is how a run reported
-        // "Completed, 12/12 succeeded" while typing into the wrong one.
+        // The ambiguity check runs below, after resolution -- see `ambiguity_of`.
         //
-        // It was implemented and removed. Counting with `Locator::all()` on a
-        // `process:`-scoped selector does not work: measured, it returns every
-        // top-level window of that process and ignores the role and name
-        // entirely, so a browser with three windows reports three matches for
-        // any selector. Failing on that would break working playbooks.
+        // Two earlier counting mechanisms were built and removed before this
+        // one, both for the same reason: they over-counted, and would have
+        // refused legitimate replays. `Locator::all()` on a `process:`-scoped
+        // selector returns every top-level window of that process and ignores
+        // role and name entirely. Root-scoped counting respects both, but its
+        // raw count still inflates on `contains_name`, which is why the count
+        // here is filtered through `resolved_is_recorded_target`.
         // See docs/known-issues/replay-window-selector-ambiguity.md.
         match desktop
             .locator(selector)
@@ -516,23 +684,49 @@ async fn navigate(
                 // Same check as for elements, and this is the site where the
                 // measured collision happened: `role:Window|name:Paradigm`
                 // resolving onto a browser window.
+                let mut window = window;
+                let mut unverified_note = String::new();
                 if let Some(recorded) = payload.target_name.as_deref() {
-                    let resolved = window.name().unwrap_or_default();
-                    if !resolved_is_recorded_target(recorded, &resolved) {
-                        return mk(
-                            StepResult::FailedWrongTarget,
-                            format!(
-                                "window selector {selector:?} resolved to the wrong window -- \
-                                 names match by containment, not equality.\n  recorded: \
-                                 {recorded:?}\n  resolved: {resolved:?}\n Refusing to activate it."
-                            ),
-                        );
+                    // This is the site of the original defect: a recording of
+                    // "Untitled - Notepad" replayed against two blank Notepad
+                    // windows, and the run reported 12/12 succeeded while
+                    // typing into the wrong one.
+                    match resolve_recorded(desktop, selector, recorded).await {
+                        Resolution::Unique(exact) => window = exact,
+                        Resolution::Ambiguous(n) => {
+                            return mk(
+                                StepResult::FailedAmbiguous,
+                                format!(
+                                    "window selector {selector:?} matches {n} windows that all \
+                                     carry the recorded name {recorded:?}, so which one the \
+                                     recording meant cannot be determined.\nRefusing to activate \
+                                     any of them: activating the wrong one sends every later step \
+                                     to the wrong window while the run still reports success."
+                                ),
+                            );
+                        }
+                        Resolution::Inconclusive(reason) => {
+                            let resolved = window.name().unwrap_or_default();
+                            if !resolved_is_recorded_target(recorded, &resolved) {
+                                return mk(
+                                    StepResult::FailedWrongTarget,
+                                    format!(
+                                        "window selector {selector:?} resolved to the wrong \
+                                         window -- names match by containment, not equality.\n  \
+                                         recorded: {recorded:?}\n  resolved: {resolved:?}\n\
+                                         Refusing to activate it."
+                                    ),
+                                );
+                            }
+                            unverified_note =
+                                format!("\n  note: ambiguity not verified -- {reason}");
+                        }
                     }
                 }
                 return match window.activate_window() {
                     Ok(()) => mk(
                         StepResult::Executed,
-                        format!("activated window via {selector:?}"),
+                        format!("activated window via {selector:?}{unverified_note}"),
                     ),
                     Err(e) => mk(
                         StepResult::FailedAction,
@@ -731,15 +925,68 @@ mod tests {
     }
 
     #[test]
-    fn identical_names_on_different_windows_are_not_detectable_here() {
-        // Documents a known limit rather than a behaviour: when two windows
-        // genuinely share a name, the resolved name equals the recorded one and
-        // this check cannot tell them apart. That needs a candidate count, which
-        // the library does not expose -- see replay-window-selector-ambiguity.md.
+    fn identical_names_on_different_windows_are_not_detectable_by_the_name_check_alone() {
+        // Pins the division of labour between the two checks at each resolution
+        // site. When two windows genuinely share a name, the resolved name
+        // equals the recorded one, so the name check passes them both -- as it
+        // should, since each one individually IS the recorded name. Detecting
+        // that there are two is `ambiguity_of`'s job, not this function's.
+        //
+        // This used to record the absence of any such counter. It now records
+        // the boundary between them, so that widening this predicate is never
+        // mistaken for a way to catch ambiguity.
         assert!(resolved_is_recorded_target(
             "Untitled - Notepad",
             "Untitled - Notepad"
         ));
+    }
+
+    #[test]
+    fn the_ambiguity_filter_counts_exact_names_not_containment_matches() {
+        // The counting rule itself, isolated from the enumeration. These are the
+        // real titles measured by `text_capture_probe -- decoycount`.
+        let recorded = "DecoyCount Invoice - Personal - Microsoft Edge";
+        let enumerated = [
+            "Draft DecoyCount Invoice - Personal - Microsoft Edge", // containment decoy
+            "DecoyCount Invoice - Personal - Microsoft Edge",       // the real target
+        ];
+        let counted = enumerated
+            .iter()
+            .filter(|n| resolved_is_recorded_target(recorded, n))
+            .count();
+
+        // Two candidates reach the selector, but only one IS the recorded
+        // window. Counting raw matches here would refuse a replay that is not
+        // ambiguous at all -- the failure that closed Routes 1 and 2.
+        assert_eq!(counted, 1);
+
+        // Two genuinely identical windows must still count as two.
+        let twins = [
+            "DecoyCount Twin - Personal - Microsoft Edge",
+            "DecoyCount Twin - Personal - Microsoft Edge",
+        ];
+        let recorded_twin = "DecoyCount Twin - Personal - Microsoft Edge";
+        assert_eq!(
+            twins
+                .iter()
+                .filter(|n| resolved_is_recorded_target(recorded_twin, n))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn ambiguity_is_a_distinct_failure_from_a_wrong_target() {
+        // Both are failures, and they must not collapse into one another: the
+        // remedies differ, and a log saying "resolved the wrong element" for an
+        // element that is probably correct is the kind of plausible-but-wrong
+        // report this whole investigation is about.
+        assert!(StepResult::FailedAmbiguous.is_failure());
+        assert!(StepResult::FailedWrongTarget.is_failure());
+        assert_ne!(
+            StepResult::FailedAmbiguous.label(),
+            StepResult::FailedWrongTarget.label()
+        );
     }
 
     #[test]
