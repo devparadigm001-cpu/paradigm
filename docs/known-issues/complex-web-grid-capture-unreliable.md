@@ -1,7 +1,10 @@
 # Capture is unreliable against complex web grids (Google Sheets)
 
-**Status:** two distinct problems, both **confirmed against real recordings**;
-root causes hypothesised but **not established**.
+**Status:** two distinct problems, both **confirmed against real recordings**.
+The clipboard cause is established from the code. **The grid mechanism is now
+measured against live Google Sheets** — see "The mechanism, measured". Of the two
+standing hypotheses, one is confirmed, one is refuted, and two symptoms that
+neither predicted are now explained. **Still not fixed.**
 **Affected:** `src-tauri/src/capture` — clipboard handling (absent) and typed
 text against `combobox`-role grid cells.
 **Platform:** Windows. Observed in Google Sheets. Other grid UIs untested.
@@ -114,6 +117,170 @@ only as corroboration; see that doc for the issue itself.
 Note that doc currently exists on the `frontend-dev` branch only, so the link
 above will not resolve from `backend-dev` until the branches meet.
 
+## The mechanism, measured (2026-08-10)
+
+`text_capture_probe -- sheets` opens a blank `sheets.new` document and inspects
+what UIA actually exposes. Two runs, identical results, including runtime ids.
+No fix attempted — this establishes what a fix would be working with.
+
+The two standing hypotheses made opposite, checkable predictions. If cells are
+canvas-rendered, moving between them changes nothing about the focused element,
+because there is no per-cell element to change to. If the Name Box is an async
+indirection, a per-cell identity *does* exist and the question is only when it
+settles.
+
+### H1 — canvas-rendered cells: CONFIRMED, and more completely than expected
+
+The entire Sheets browser window is **56 accessible nodes** to depth 12. Printed
+in full, the document subtree is:
+
+```
+  Document "Untitled spreadsheet - Google Sheets"
+    Pane ""
+```
+
+That is all of it. No `DataItem`, no `Table`, no `Grid`, no rows, no columns.
+**Zero elements anywhere in the window have a name that looks like a cell
+reference.** For comparison, the browser's own chrome — toolbar, tab bar, address
+bar — accounts for most of the other 54 nodes.
+
+Moving the cursor confirms it. The focused element across five cell positions:
+
+```
+  start              role=Edit  id=152289  name="" value="" bounds=(0,0,1,1)
+  after Right        role=Edit  id=152289  name="" value="" bounds=(0,0,1,1)
+  after Right        role=Edit  id=152289  name="" value="" bounds=(0,0,1,1)
+  after Down         role=Edit  id=152289  name="" value="" bounds=(0,0,1,1)
+  after Left         role=Edit  id=152289  name="" value="" bounds=(0,0,1,1)
+
+    distinct focused-element ids   : 1
+    distinct focused-element names : 1
+    distinct focused-element bounds: 1
+```
+
+Focus never moves. It sits on a **1×1 pixel unnamed hidden input** — the same
+runtime id `152289` in both runs, in two different documents — which is where
+Sheets receives keystrokes. There is nothing per-cell to attribute an action to,
+because at rest no cell exists as far as the accessibility tree is concerned.
+
+### The cell editor: a ComboBox that exists only while editing
+
+This is the part neither hypothesis predicted, and it explains the original
+finding's puzzling `combobox` role.
+
+The moment typing starts, an element **appears** that was not in the tree before:
+
+```
+  before typing      role=Edit      id=152289  name=""   bounds=(0,0,1,1)
+  +1 ms   focused    role=ComboBox  id=298118  name="D3" bounds=(2172,320,95,16)
+                     text="7391\n"
+```
+
+A `ComboBox`, **named after the cell reference**, positioned at the cell's real
+screen coordinates, carrying the typed text. So the `combobox`-role "cells" in
+session `50020dc5` were never cells — they were the **cell editor overlay**,
+which exists only during editing and is destroyed on commit.
+
+That reframes Finding 2 entirely. Capture is not misreading a cell; it is reading
+a transient editor whose lifetime is shorter than the action being recorded.
+
+### H2 — asynchronous Name Box indirection: REFUTED
+
+The Name Box does exist and does track the cursor, but it is not slow.
+
+The element found by name is a `Group` (`"Name box (Ctrl + J)"`), whose child
+`Edit` holds the reference. It tracked every move exactly: `B2` → `C2` → `C3` →
+`D3`. Sampling every 25 ms after a keypress:
+
+```
+    before keypress            "C3"
+    CHANGED at +1 ms           "D3"
+    settled                    "D3"
+```
+
+`+1 ms` in one run, `+0 ms` in the other. **The Name Box is effectively
+synchronous with the keypress**, and cannot account for attribution drift on any
+timescale capture operates at. The hypothesis in the original write-up — "it
+appears to update asynchronously; at the moment a type action completes it does
+not reliably reflect the truly-focused cell" — does not survive measurement.
+
+### Where the cell identity actually lives, and why that matters
+
+The identity is reachable, but through an accessor that is easy to miss:
+
+| Element | `name` | `value` | `text(0)` |
+|---|---|---|---|
+| Name Box input | `""` | `""` | **`"D3"`** |
+| cell editor (while editing) | **`"D3"`** | `""` | `"7391\n"` |
+
+Both are empty on `value`. The Name Box carries the reference **only** in
+`text()`; the editor carries it **only** in `name`. So which cell an action
+belongs to is available from two different elements through two different
+accessors, and neither is `value`.
+
+This is worth pinning down before any fix: capture builds a click's
+`element_name` from `e.element_text` (`capture/mod.rs:299`) and a type action's
+from `watched.name` (`capture/text.rs:319`). Those are different accessors on
+different elements, which is exactly the shape that produces a click and a type
+disagreeing about the cell. Stated as a lead, not a conclusion — this was
+measured on the UIA side, and the recorder's mapping to `element_text` /
+`watched.name` was read from the code, not instrumented.
+
+### The stray invisible character, identified: U+FEFF
+
+Session `50020dc5` reported a payload of `"19"` "plus a stray invisible
+character", unlike anything the `<input>` investigation produced. It reproduces,
+and it has a name. After committing with Enter, the editor's text reads:
+
+```
+    text="\u{feff}\n"
+```
+
+**U+FEFF**, the zero-width no-break space. Sheets seeds its hidden editor with
+it. Any payload read from that element inherits it. That is a concrete, testable
+cause for the corrupted-payload half of Finding 2, and it is unrelated to the
+no-settle race in `text-input-capture-truncation.md`.
+
+### What could NOT be established
+
+Two things, recorded so they are not mistaken for settled:
+
+1. **The typed value could not be verified as landing.** The probe's own premise
+   check failed:
+
+   ```
+     did '7391' reach anything UIA can read: false
+     PREMISE UNVERIFIED for phase D
+   ```
+
+   The text was visible in the editor *during* editing (`text="7391\n"`), but
+   after Enter no readable element reports it. Two different explanations fit —
+   the commit did not happen, or it happened and the committed cell value is
+   simply not exposed to UIA (which would follow directly from H1) — and this
+   run cannot separate them. The second is more likely given everything above,
+   but "more likely" is not measured.
+
+2. **An unexplained position after commit.** After Enter, the reported cell is
+   `"Z3"`, not the expected `D4`, on an element with runtime id `461295` — the
+   **same id in both runs, in two different documents**. A stable id across
+   documents suggests a fixed element in Sheets' implementation rather than a
+   real cursor position, but that is a guess. It reproduces exactly, so it is
+   not noise, and it is not understood.
+
+### What this means for a fix
+
+Not a fix, but the constraints any fix inherits:
+
+* **There is no per-cell element to target, at rest.** Any design that assumes
+  replay can locate "cell D3" by selector is unworkable as things stand. The
+  only per-cell element that ever exists is the editor, and only while editing.
+* **The Name Box is a usable, fast source of cell identity** — via `text()` on
+  the child `Edit` of the `"Name box (Ctrl + J)"` group. It was the suspect;
+  it turns out to be the most reliable signal measured here.
+* **Sheets has a screen-reader mode** that is off by default and was not enabled
+  for these runs. Whether it materialises a real cell tree is untested and is
+  the obvious next question, because it would change every constraint above.
+
 ## Not the same bug as the Gmail picker (tested 2026-08-09)
 
 These findings and the Gmail recipient picker
@@ -182,20 +349,44 @@ immediately. Probe coverage has been measuring the environment it was built for.
       above, `is_typing_key` counting `Ctrl+V` as a literal `V` is wrong on its
       own terms. `KeyboardEvent` carries `ctrl_pressed`; `capture` currently
       ignores it.
-- [ ] **Determine whether Finding 2 is the documented no-settle race or a new
-      defect.** Both are plausible and they imply different fixes. The existing
-      `examples/text_capture_probe` harness can be pointed at a grid to compare
-      captured payloads against ground truth the same way.
-- [ ] **Investigate cell attribution separately from payload corruption.** They
-      appeared together but may be independent; the Name Box being a distinct
-      element from the cell being typed into is reason enough to treat them as
-      two problems until shown otherwise.
+- [x] ~~**Determine whether Finding 2 is the documented no-settle race or a new
+      defect.**~~ **A new defect, and not one race but two separate causes.**
+      Payload corruption is Sheets seeding its hidden editor with **U+FEFF**, not
+      a value read too early. Attribution is not a settling problem either — the
+      Name Box updates within 0–1 ms. See "The mechanism, measured".
+- [x] ~~**Investigate cell attribution separately from payload corruption.**~~
+      Done, and separating them was right: they have different causes entirely
+      (U+FEFF seeding versus a transient editor element). Note the finding that
+      reframes both — the `combobox` "cells" are the **cell editor overlay**,
+      which exists only while a cell is being edited.
+- [ ] **Test Sheets' screen-reader mode.** Off by default, not enabled for the
+      measured runs, and the single change most likely to alter every constraint
+      above: if it materialises a real per-cell accessibility tree, targeting
+      cells becomes possible and the fix looks completely different. Ask this
+      before designing anything.
+- [ ] **Establish whether a committed cell value is readable at all.** The probe
+      could not verify the typed text after Enter, and could not distinguish "the
+      commit did not happen" from "committed values are invisible to UIA". That
+      distinction decides whether replay can ever verify what it wrote into a
+      grid.
+- [ ] **Explain the `Z3` element (runtime id `461295`).** Reported as the cell
+      position after commit instead of the expected `D4`, identically across two
+      runs and two documents. Reproducible, so not noise, and currently not
+      understood.
+- [ ] **Confirm the accessor mismatch on the recorder side.** Cell identity lives
+      in `text()` on the Name Box input and in `name` on the editor, never in
+      `value`. Capture reads `e.element_text` for clicks and `watched.name` for
+      types — different accessors on different elements, which would produce
+      exactly the click/type disagreement observed. Read from the code, not yet
+      instrumented against a live grid.
 - [ ] **Test a second complex grid** — Excel Online, or any non-Sheets
       virtualized data grid — to establish how much of this is Sheets-specific
       versus general to grid UIs. Still worth doing, but note the scope has
       narrowed: the cross-application "widget category" theory was tested and
       refuted (see above), so this is now asking whether *grids* share a
       mechanism, not whether all dynamic widgets do.
-- [ ] **Add a complex-grid target to routine probe coverage.** The gap that let
-      both findings reach a human test is that nothing between the simple
-      `<input>` probes and a live user session ever exercised one.
+- [x] ~~**Add a complex-grid target to routine probe coverage.**~~
+      `text_capture_probe -- sheets` exists and runs against live Google Sheets.
+      Note its cost: each run creates a blank "Untitled spreadsheet" in the
+      signed-in Drive account and does not delete it, so it is a deliberate
+      invocation rather than something to fold into a routine sweep.

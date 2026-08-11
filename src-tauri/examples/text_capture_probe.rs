@@ -4310,11 +4310,485 @@ async fn resolveorder_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ---------------------------------------------------------- sheets mode ----
+// What does UIA actually see inside a Google Sheets grid?
+//
+// complex-web-grid-capture-unreliable.md records two hypotheses for why cell
+// typing and attribution are unreliable, neither tested:
+//
+//   H1  cells are canvas-rendered and are not real accessible elements at all
+//   H2  cell identity comes from the Name Box, which updates asynchronously, so
+//       capture reads it before Sheets has caught up
+//
+// The two make different, checkable predictions. If H1 holds, moving between
+// cells changes nothing about the focused element's identity, because there is
+// no per-cell element to change to. If H2 holds, there IS a per-cell identity
+// somewhere and the question is only when it settles -- so the Name Box should
+// be observably stale for some measurable interval after a move.
+//
+// This mode measures both, plus a typing race, and prints raw values throughout
+// so the conclusion can be checked rather than taken.
+//
+// Opens sheets.new, which creates a blank "Untitled spreadsheet" in the signed-in
+// account's Drive. Nothing is read from any existing document.
+
+/// One line describing an element, for identity comparison across steps.
+fn snap(el: &UIElement) -> String {
+    let a = el.attributes();
+    let b = el
+        .bounds()
+        .ok()
+        .map(|(x, y, w, h)| format!("({:.0},{:.0},{:.0},{:.0})", x, y, w, h))
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "role={:<12} id={:<12} name={:?} value={:?} bounds={b}",
+        a.role,
+        el.id().unwrap_or_else(|| "-".to_string()),
+        a.name.unwrap_or_default(),
+        a.value.unwrap_or_default(),
+    )
+}
+
+/// Does this name look like a spreadsheet cell reference (A1, BC12)?
+fn looks_like_cell_ref(s: &str) -> bool {
+    let s = s.trim();
+    if s.len() < 2 || s.len() > 8 {
+        return false;
+    }
+    let mut letters = 0usize;
+    let mut digits = 0usize;
+    for c in s.chars() {
+        if c.is_ascii_alphabetic() && digits == 0 {
+            letters += 1;
+        } else if c.is_ascii_digit() {
+            digits += 1;
+        } else {
+            return false;
+        }
+    }
+    letters >= 1 && digits >= 1
+}
+
+/// Walk the subtree, counting roles and collecting anything named like a cell.
+fn census(
+    el: &UIElement,
+    depth: usize,
+    max_depth: usize,
+    counts: &mut std::collections::BTreeMap<String, usize>,
+    cell_named: &mut Vec<(String, String)>,
+    budget: &mut usize,
+) {
+    if *budget == 0 {
+        return;
+    }
+    *budget -= 1;
+    let role = el.role();
+    *counts.entry(role.clone()).or_insert(0) += 1;
+    if let Some(name) = el.name() {
+        if looks_like_cell_ref(&name) && cell_named.len() < 40 {
+            cell_named.push((role, name));
+        }
+    }
+    if depth >= max_depth {
+        return;
+    }
+    if let Ok(children) = el.children() {
+        for c in &children {
+            census(c, depth + 1, max_depth, counts, cell_named, budget);
+        }
+    }
+}
+
+/// Print the whole subtree, indented. Small trees only -- Sheets' turned out to
+/// be 56 nodes, which is itself the headline finding.
+fn dump_tree(el: &UIElement, depth: usize, max_depth: usize, budget: &mut usize) {
+    if *budget == 0 {
+        return;
+    }
+    *budget -= 1;
+    let a = el.attributes();
+    let name = a.name.unwrap_or_default();
+    let value = a.value.unwrap_or_default();
+    let extra = if value.is_empty() {
+        String::new()
+    } else {
+        format!("  value={value:?}")
+    };
+    println!(
+        "  {:indent$}{} {:?}{extra}",
+        "",
+        a.role,
+        name,
+        indent = depth * 2
+    );
+    if depth >= max_depth {
+        return;
+    }
+    if let Ok(children) = el.children() {
+        for c in &children {
+            dump_tree(c, depth + 1, max_depth, budget);
+        }
+    }
+}
+
+/// Every element that could plausibly carry "which cell am I on" -- the Name Box
+/// input and the formula bar are both `Edit`s in Chromium's tree.
+/// Scoped to the Sheets window on purpose: a desktop-wide search pulled in Edits
+/// from every other browser window on the machine, including a second Sheets
+/// document left over from an earlier run, which is exactly the sort of
+/// contamination that makes a reading look meaningful when it is not.
+async fn identity_carriers(desktop: &Desktop, window: &UIElement) -> Vec<UIElement> {
+    let mut out = Vec::new();
+    for sel in ["role:Edit", "role:ComboBox"] {
+        if let Ok(all) = desktop
+            .locator(sel)
+            .within(window.clone())
+            .all(Some(Duration::from_secs(5)), None)
+            .await
+        {
+            out.extend(all);
+        }
+    }
+    out
+}
+
+fn describe_carriers(label: &str, carriers: &[UIElement]) {
+    println!("  {label}");
+    for (i, el) in carriers.iter().enumerate() {
+        let a = el.attributes();
+        println!(
+            "    [{i}] role={:<9} name={:?} value={:?} text={:?}",
+            a.role,
+            a.name.unwrap_or_default(),
+            a.value.unwrap_or_default(),
+            el.text(0).unwrap_or_default(),
+        );
+    }
+}
+
+/// Print and return the focused element's identity: (id, name, bounds).
+#[allow(clippy::type_complexity)]
+fn focused_snapshot(
+    desktop: &Desktop,
+    label: &str,
+) -> Option<(String, String, Option<(f64, f64, f64, f64)>)> {
+    match desktop.focused_element() {
+        Ok(el) => {
+            println!("  {label:<18} {}", snap(&el));
+            Some((
+                el.id().unwrap_or_default(),
+                el.name().unwrap_or_default(),
+                el.bounds().ok(),
+            ))
+        }
+        Err(e) => {
+            println!("  {label:<18} Err {e}");
+            None
+        }
+    }
+}
+
+async fn sheets_mode() -> ExitCode {
+    println!("== what UIA sees inside a Google Sheets grid ==\n");
+    println!("Opens sheets.new -- creates a blank 'Untitled spreadsheet' in the");
+    println!("signed-in account's Drive. No existing document is read.\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // ---- precondition: is a Sheets document actually open? ------------------
+    // A login redirect or a slow load must read as INCONCLUSIVE, not as "no
+    // cell elements found".
+    let window = match desktop
+        .locator("role:Window|name:Google Sheets")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    {
+        Some(w) => w,
+        None => {
+            println!("\n  INCONCLUSIVE: no window titled '… Google Sheets' was found.");
+            println!("  Most likely the account is not signed in, or the document did not");
+            println!("  finish loading. Nothing below would be measuring Sheets, so the");
+            println!("  probe stops rather than reporting findings about whatever else is");
+            println!("  on screen.");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("\n  window: {:?}", window.name().unwrap_or_default());
+
+    // ---- phase A: tree census ----------------------------------------------
+    println!("\n================ A. what the tree contains ================\n");
+    let mut counts = std::collections::BTreeMap::new();
+    let mut cell_named = Vec::new();
+    let mut budget = 6000usize;
+    let started = std::time::Instant::now();
+    census(&window, 0, 12, &mut counts, &mut cell_named, &mut budget);
+    println!(
+        "  walked {} nodes to depth 12 in {} ms\n",
+        6000 - budget,
+        started.elapsed().as_millis()
+    );
+    println!("  roles present:");
+    let mut by_count: Vec<_> = counts.iter().collect();
+    by_count.sort_by(|a, b| b.1.cmp(a.1));
+    for (role, n) in by_count.iter().take(20) {
+        println!("    {n:>5}  {role}");
+    }
+    println!(
+        "\n  elements whose NAME looks like a cell reference: {}",
+        cell_named.len()
+    );
+    for (role, name) in cell_named.iter().take(15) {
+        println!("    role={role:<12} name={name:?}");
+    }
+    if budget == 0 {
+        println!("\n  NOTE: node budget exhausted -- the census is a sample, not a total.");
+    }
+
+    println!("\n  full tree (it is small enough to print in full):");
+    let mut dump_budget = 200usize;
+    dump_tree(&window, 0, 12, &mut dump_budget);
+
+    // ---- phase B: does focus identity change per cell? ----------------------
+    println!("\n================ B. focus identity across cell moves ================\n");
+    println!("  If cells are real accessible elements, moving between them should");
+    println!("  change the focused element's identity, name, or bounds.\n");
+
+    let mut identities = Vec::new();
+    if let Some(v) = focused_snapshot(&desktop, "start") {
+        identities.push(("start", v));
+    }
+    for (label, key) in [
+        ("after Right", "{Right}"),
+        ("after Right", "{Right}"),
+        ("after Down", "{Down}"),
+        ("after Left", "{Left}"),
+    ] {
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key(key);
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        if let Some(v) = focused_snapshot(&desktop, label) {
+            identities.push((label, v));
+        }
+    }
+
+    let distinct_ids: std::collections::BTreeSet<_> =
+        identities.iter().map(|(_, (id, _, _))| id.clone()).collect();
+    let distinct_names: std::collections::BTreeSet<_> = identities
+        .iter()
+        .map(|(_, (_, name, _))| name.clone())
+        .collect();
+    let distinct_bounds: std::collections::BTreeSet<_> = identities
+        .iter()
+        .map(|(_, (_, _, b))| format!("{b:?}"))
+        .collect();
+    println!("\n  across {} positions:", identities.len());
+    println!("    distinct focused-element ids   : {}", distinct_ids.len());
+    println!("    distinct focused-element names : {}", distinct_names.len());
+    println!("    distinct focused-element bounds: {}", distinct_bounds.len());
+
+    // ---- phase C: the Name Box, and whether it lags -------------------------
+    println!("\n================ C. the Name Box ================\n");
+    let name_box = desktop
+        .locator("role:ComboBox|name:Name box")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+        .or_else(|| None);
+    let name_box = match name_box {
+        Some(nb) => {
+            println!("  found via role:ComboBox|name:Name box");
+            Some(nb)
+        }
+        None => {
+            // Try without the role, in case Sheets does not expose it as ComboBox.
+            match desktop
+                .locator("name:Name box")
+                .within(desktop.root())
+                .all(Some(Duration::from_secs(5)), None)
+                .await
+                .ok()
+                .and_then(|all| all.into_iter().next())
+            {
+                Some(nb) => {
+                    println!("  found via name:Name box (role is {:?})", nb.role());
+                    Some(nb)
+                }
+                None => {
+                    println!("  NOT FOUND by either selector. The Name Box hypothesis cannot");
+                    println!("  be tested through this element if capture cannot see it either.");
+                    None
+                }
+            }
+        }
+    };
+
+    if let Some(nb) = &name_box {
+        println!("  {}", snap(nb));
+        println!("\n  its subtree -- the editable Name Box should be a child:");
+        let mut nb_budget = 40usize;
+        dump_tree(nb, 0, 4, &mut nb_budget);
+    }
+
+    // The Group above is a container. Whatever actually holds "B2" has to be an
+    // Edit or ComboBox somewhere, so sample every one of them across moves.
+    println!("\n  every Edit / ComboBox in the window, sampled across cell moves:");
+    let carriers = identity_carriers(&desktop, &window).await;
+    if carriers.is_empty() {
+        println!("    none found -- there is no element of either role to carry cell identity");
+    }
+    describe_carriers("at current cell:", &carriers);
+    for (label, key) in [("after Right", "{Right}"), ("after Down", "{Down}")] {
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key(key);
+        }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        describe_carriers(&format!("{label}:"), &carriers);
+    }
+
+    // ---- the actual H2 test -------------------------------------------------
+    // Whichever carrier reads like a cell reference IS the cell-identity signal.
+    // The hypothesis is that it updates asynchronously, so capture can read it
+    // before it has caught up. 900 ms sampling above is far too coarse to see
+    // that. Press a key and sample hard.
+    let cell_carrier = carriers.iter().find(|el| {
+        let t = el.text(0).unwrap_or_default();
+        looks_like_cell_ref(&t)
+    });
+    match cell_carrier {
+        None => {
+            println!("\n  no carrier reads like a cell reference, so there is no Name Box");
+            println!("  signal to race against and H2 cannot be tested this way.");
+        }
+        Some(cc) => {
+            println!("\n  H2: how fast does the cell reference update after a move?");
+            let before = cc.text(0).unwrap_or_default();
+            println!("    before keypress            {before:?}");
+            if let Ok(el) = desktop.focused_element() {
+                let _ = el.press_key("{Right}");
+            }
+            let t0 = std::time::Instant::now();
+            let mut first_change: Option<u128> = None;
+            for _ in 0..40 {
+                let now = cc.text(0).unwrap_or_default();
+                let elapsed = t0.elapsed().as_millis();
+                if now != before && first_change.is_none() {
+                    first_change = Some(elapsed);
+                    println!("    CHANGED at +{elapsed} ms          {now:?}");
+                }
+                if elapsed > 1500 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let settled = cc.text(0).unwrap_or_default();
+            println!("    settled                    {settled:?}");
+            match first_change {
+                Some(ms) => println!(
+                    "    -> the cell reference lagged the keypress by ~{ms} ms (read every 25 ms)"
+                ),
+                None => println!(
+                    "    -> it never changed within 1.5 s. Either the move did not happen, \
+                     or this element does not track the cursor."
+                ),
+            }
+        }
+    }
+
+    // ---- phase D: typing race ----------------------------------------------
+    println!("\n================ D. typing into a cell ================\n");
+    println!("  Types 4 characters, then samples what UIA reports over time.\n");
+    if let Ok(el) = desktop.focused_element() {
+        println!("  before typing      {}", snap(&el));
+        let t0 = std::time::Instant::now();
+        let _ = el.type_text("7391", false);
+        println!("  typed in {} ms", t0.elapsed().as_millis());
+
+        let t1 = std::time::Instant::now();
+        for delay in [0u64, 100, 300, 800, 1500] {
+            while (t1.elapsed().as_millis() as u64) < delay {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let f = desktop.focused_element();
+            match f {
+                Ok(cur) => println!("    +{:<5}ms  focused {}", t1.elapsed().as_millis(), snap(&cur)),
+                Err(e) => println!("    +{:<5}ms  Err {e}", t1.elapsed().as_millis()),
+            }
+            describe_carriers("               carriers:", &carriers);
+        }
+
+        // Commit and see what the cell reports afterwards.
+        if let Ok(cur) = desktop.focused_element() {
+            let _ = cur.press_key("{Enter}");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Ok(cur) = desktop.focused_element() {
+            println!("\n  after Enter        {}", snap(&cur));
+        }
+        describe_carriers("after Enter carriers:", &carriers);
+
+        // ---- premise check --------------------------------------------------
+        // Everything in this phase is meaningless if the keystrokes never
+        // reached the sheet. Go back to the cell and ask the formula bar what
+        // it holds. If nothing anywhere reports "7391", the typing is
+        // unverified and phase D decides nothing.
+        if let Ok(cur) = desktop.focused_element() {
+            let _ = cur.press_key("{Up}");
+        }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let after = identity_carriers(&desktop, &window).await;
+        describe_carriers("back on the typed cell:", &after);
+
+        let landed = after.iter().any(|el| {
+            let a = el.attributes();
+            a.value.unwrap_or_default().contains("7391")
+                || el.text(0).unwrap_or_default().contains("7391")
+        });
+        println!("\n  did '7391' reach anything UIA can read: {landed}");
+        if !landed {
+            println!("  PREMISE UNVERIFIED for phase D: no readable element reports the");
+            println!("  typed text, so this phase cannot distinguish 'typing did not");
+            println!("  happen' from 'typing happened and is invisible to UIA'. Both are");
+            println!("  consistent with the output above, and they are different findings.");
+        }
+    }
+
+    println!("\n--- note ---");
+    println!("  A blank 'Untitled spreadsheet' now exists in the signed-in Drive");
+    println!("  account. This probe does not delete it.");
+
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "sheets") {
+        return sheets_mode().await;
+    }
     if std::env::args().any(|a| a == "resolveorder") {
         return resolveorder_mode().await;
     }
