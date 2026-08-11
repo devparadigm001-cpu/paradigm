@@ -6737,11 +6737,126 @@ async fn notepadgrid_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ---------------------------------------------------- notepadclose mode ----
+// Close the Notepad windows this investigation's probes left behind.
+//
+// Deliberately not a blanket close. Every probe run left an instance open, but
+// the user's own Notepad windows are in the same list and are indistinguishable
+// by process. So the title is the discriminator, and anything that is not
+// recognisably probe-created is left alone and reported.
+//
+// Recognisably probe-created:
+//   "Untitled - Notepad"          a fresh buffer -- nothing to lose either way
+//   "*alpha line - Notepad"       the exact text `notepadgrid` types
+//   "*paradigm-probe-… - Notepad" a file an earlier probe created
+//
+// Anything else -- a real filename -- is somebody's work and is not touched.
+// A `*` means unsaved changes, so closing raises a save prompt; that is answered
+// with "Don't save", which is only ever reached for a window already classified
+// as probe-created.
+fn is_probe_notepad(title: &str) -> bool {
+    let t = title.trim();
+    t.starts_with("Untitled - Notepad")
+        || t.starts_with("*alpha line - Notepad")
+        || t.starts_with("*paradigm-probe-")
+        || t.starts_with("paradigm-probe-")
+}
+
+async fn notepadclose_mode() -> ExitCode {
+    println!("== close probe-created Notepad windows ==\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let windows = desktop
+        .locator("role:Window|name:Notepad")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(10)), Some(3))
+        .await
+        .unwrap_or_default();
+
+    println!("  {} Notepad window(s) open:\n", windows.len());
+    let mut safe = Vec::new();
+    let mut keep = Vec::new();
+    for w in &windows {
+        let title = w.name().unwrap_or_default();
+        if is_probe_notepad(&title) {
+            println!("    PROBE-CREATED  {title:?}");
+            safe.push(w.clone());
+        } else {
+            println!("    LEAVING ALONE  {title:?}");
+            keep.push(title);
+        }
+    }
+
+    if !keep.is_empty() {
+        println!(
+            "\n  {} window(s) are not recognisably probe-created and will NOT be touched.",
+            keep.len()
+        );
+    }
+    if safe.is_empty() {
+        println!("\n  nothing to close.");
+        return ExitCode::SUCCESS;
+    }
+
+    println!("\n  closing {} probe window(s)...", safe.len());
+    let mut closed = 0usize;
+    for w in &safe {
+        let title = w.name().unwrap_or_default();
+        if w.close().is_err() {
+            println!("    could not close {title:?}");
+            continue;
+        }
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // An unsaved buffer raises a save prompt. Answer it with "Don't save".
+        for label in ["Don't save", "Do not save", "Don’t save"] {
+            if let Ok(btns) = desktop
+                .locator(format!("role:Button|name:{label}").as_str())
+                .within(desktop.root())
+                .all(Some(Duration::from_secs(3)), Some(6))
+                .await
+            {
+                if let Some(b) = btns.first() {
+                    println!("    answering save prompt for {title:?} with {label:?}");
+                    robust_click(&desktop, b);
+                    tokio::time::sleep(Duration::from_millis(900)).await;
+                    break;
+                }
+            }
+        }
+        closed += 1;
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after = desktop
+        .locator("role:Window|name:Notepad")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(10)), Some(3))
+        .await
+        .unwrap_or_default();
+    println!("\n  closed {closed}; {} Notepad window(s) remain:", after.len());
+    for w in &after {
+        println!("    {:?}", w.name().unwrap_or_default());
+    }
+
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "notepadclose") {
+        return notepadclose_mode().await;
+    }
     if std::env::args().any(|a| a == "notepadgrid") {
         return notepadgrid_mode().await;
     }

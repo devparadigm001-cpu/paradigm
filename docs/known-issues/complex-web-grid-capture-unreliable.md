@@ -809,14 +809,15 @@ immediately. Probe coverage has been measuring the environment it was built for.
       resolve to, so this needs a different addressing mechanism entirely —
       plausibly driving the Name Box, which was measured tracking the cursor
       within 0–1 ms.
-- [ ] **Measure the per-keystroke cost — now suspected, not just theoretical.**
-      One focused-element resolution per printable key-down, in every
-      application. The Notepad runs took several minutes for ~25 seconds of
-      scripted activity on a machine with seven Notepad windows open. That is a
-      plausible cause and not an established one: the grid path was in the build
-      for every run, so there is no before/after. Needs a real A/B — the same
-      driven session with the grid watcher compiled out — before drawing any
-      conclusion.
+- [ ] **LOW PRIORITY — measure the per-keystroke cost.** One focused-element
+      resolution per printable key-down, in every application. The Notepad runs
+      took several minutes for ~25 seconds of scripted activity on a machine with
+      seven Notepad windows open, which makes this suspected rather than merely
+      theoretical — but it is not established, because the grid path was in the
+      build for every run and there is no before/after. Settling it needs a real
+      A/B: the same driven session with the grid watcher compiled out.
+      Deliberately deprioritised — no user-facing symptom has been reported, and
+      the observation comes from a machine in an unusually loaded state.
 - [ ] **Confirm the accessor mismatch on the recorder side.** Cell identity lives
       in `text()` on the Name Box input and in `name` on the editor, never in
       `value`. Capture reads `e.element_text` for clicks and `watched.name` for
