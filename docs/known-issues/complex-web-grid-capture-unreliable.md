@@ -437,14 +437,45 @@ disagreement is confounded: it does not separate "the editor's name is an
 unreliable attribution" from "the probe's own key driving was too chaotic for the
 editor to be reporting anything stable".
 
-That confound is the `{END}` defect above. **The prototype needs re-running with
-an Enter that does not inject extra keystrokes** before any conclusion is drawn
-about the mechanism itself. Until then:
+That confound is the `{END}` defect above, now filed separately as
+`press-key-enter-injects-end-keystroke.md`.
 
-* reading the editor while alive is clearly *possible* — the data is there, clean,
-  for over a second
-* whether its `name` is a trustworthy cell attribution is **open**, with one run
-  for and one against
+### Re-run without the confound: the mechanism works
+
+`text_capture_probe -- sheetsclean` repeats the experiment with the corrupting
+factor removed. Getting to a clean commit took two attempts, and the failed one
+is worth recording because it looked like a fix:
+
+* **`type_text("\n")`** injects nothing — but does not commit either. The editor
+  stayed open and accumulated `"apple\nbanana\ncherry"` in one cell while the
+  exported CSV stayed **empty**. It removed the confound by removing the thing
+  being measured.
+* **`press_key("{Tab}")`** commits a cell edit and contains neither `ENTER` nor
+  `RETURN`, so it is sent verbatim. That is the clean commit.
+
+With Tab, over three runs:
+
+```
+  typed      watcher cell watcher v  csv at cell  match
+  apple      A1           apple      apple        true
+  banana     B1           banana     banana       true
+  cherry     C1           cherry     cherry       true
+
+  watcher cell AND value confirmed by the saved file: 3/3
+```
+
+Nine of nine across three runs, checked by parsing the watcher's reported cell
+reference into row and column and reading that exact position out of the exported
+CSV — so both halves are verified, not just that the value appears somewhere.
+
+**The mechanism is sound.** The transient editor reports the correct cell and the
+correct value, and the earlier 1/3 result was the `{END}` defect moving the cursor
+out from under the measurement, not the editor lying. Attribution via the editor's
+`name` is no longer an open question.
+
+What remains unproven is everything between this and a working feature: this is a
+polling loop in a probe, not an event-driven capture path, and it was measured on
+short single-line values typed by automation rather than on real human editing.
 
 ### What a fix would need, on current evidence
 
@@ -566,15 +597,15 @@ immediately. Probe coverage has been measuring the environment it was built for.
       `terminator-rs` sends `{LEFT}` then `{END}` before every Enter as a browser
       autocomplete workaround, and in a grid `{END}` jumps to the last column of
       the data region.
-- [ ] **Re-run the editor-watcher prototype with a clean Enter.** The mechanism
-      read correctly 3/3 in one run and 1/3 in another, and the disagreement is
-      confounded by the `{END}` defect corrupting cell navigation. Send Enter
-      without the injected keystrokes, then re-measure attribution against the
-      CSV. This is the single experiment standing between "plausible" and
-      "established".
-- [ ] **Audit `press_key` with Enter across replay.** The `{LEFT}{END}` preamble
-      is injected into whatever has focus. Harmless in a text box, not harmless
-      in a spreadsheet, where it moves the cursor before the commit lands.
+- [x] ~~**Re-run the editor-watcher prototype with a clean Enter.**~~ **Done —
+      clean pass, 9/9 across three runs.** Committing with `{Tab}` instead of
+      Enter removes the injected keystrokes; every value the watcher read landed
+      in exactly the cell it named, verified by indexing the exported CSV at the
+      parsed cell reference. The earlier 1/3 was the confound, not the mechanism.
+- [x] ~~**Audit `press_key` with Enter across replay.**~~ Audited: `press_key`
+      appears **zero** times in `src/`. Replay only calls `type_text`, which uses
+      `send_text` and injects nothing, so the defect is latent rather than live.
+      Filed as `press-key-enter-injects-end-keystroke.md`.
 - [ ] **Add a capture path for the transient editor.** The existing event-driven
       pipeline produced zero `type` actions across three real cell edits, so this
       is new mechanism rather than tuning. The editor is readable for ~1.2 s

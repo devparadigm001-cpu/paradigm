@@ -5831,7 +5831,11 @@ async fn sheetswatch_mode() -> ExitCode {
         // Navigate deterministically.
         let _ = name_box_input.type_text(cell, true);
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let _ = name_box_input.press_key("{Enter}");
+        // CLEAN Enter. `press_key("{Enter}")` injects {LEFT} then {END} first as
+        // a browser-autocomplete workaround, and {END} relocates the cursor in a
+        // grid -- which corrupted the previous run of this experiment.
+        // `type_text` goes through send_text and adds nothing.
+        let _ = name_box_input.type_text("\n", false);
         tokio::time::sleep(Duration::from_millis(1200)).await;
 
         // Type, then run the watcher over the editor's lifetime.
@@ -5852,10 +5856,11 @@ async fn sheetswatch_mode() -> ExitCode {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        // Commit. Everything after this point reads as U+FEFF at a stale cell,
-        // which is why the emitted value is the one remembered above.
+        // Commit with a clean Enter, for the same reason as above. Everything
+        // after this point reads as U+FEFF at a stale cell, which is why the
+        // emitted value is the one remembered before this line.
         if let Ok(el) = desktop.focused_element() {
-            let _ = el.press_key("{Enter}");
+            let _ = el.type_text("\n", false);
         }
         tokio::time::sleep(Duration::from_millis(1000)).await;
 
@@ -5944,11 +5949,212 @@ async fn sheetswatch_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ----------------------------------------------------- sheetsclean mode ----
+// The unconfounded re-run of the editor-watcher experiment.
+//
+// Two earlier attempts were spoiled by how Enter gets sent:
+//   * press_key("{Enter}") injects {LEFT}{END} first, and {END} relocates the
+//     cursor in a grid, so the cell under edit moved before every commit.
+//   * type_text("\n") adds nothing, but does not commit either -- the editor
+//     stayed open and accumulated "apple\nbanana\ncherry" while the saved file
+//     stayed empty.
+//
+// Tab commits a cell edit and moves one column right, and "{Tab}" contains
+// neither ENTER nor RETURN, so press_key sends it verbatim. That gives a commit
+// with no injected keystrokes.
+//
+// Which cells get used no longer matters: the test is whether the cell the
+// watcher REPORTS is the cell the value actually landed in, checked against the
+// exported CSV by parsing the reference into row and column.
+
+/// "B2" -> (col 2, row 2). 1-based.
+fn parse_cell_ref(s: &str) -> Option<(usize, usize)> {
+    let s = s.trim();
+    let split = s.find(|c: char| c.is_ascii_digit())?;
+    let (letters, digits) = s.split_at(split);
+    if letters.is_empty() || digits.is_empty() {
+        return None;
+    }
+    let mut col = 0usize;
+    for c in letters.chars() {
+        if !c.is_ascii_alphabetic() {
+            return None;
+        }
+        col = col * 26 + (c.to_ascii_uppercase() as usize - 'A' as usize + 1);
+    }
+    Some((col, digits.parse().ok()?))
+}
+
+/// Value at (col, row) of a CSV, 1-based. Naive split: probe values have no commas.
+fn csv_at(body: &str, col: usize, row: usize) -> Option<String> {
+    let line = body.lines().nth(row.checked_sub(1)?)?;
+    let field = line.split(',').nth(col.checked_sub(1)?)?;
+    Some(field.trim_matches('"').to_string())
+}
+
+async fn sheetsclean_mode() -> ExitCode {
+    println!("== editor watcher, committing with Tab (no injected keystrokes) ==\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = desktop
+        .locator("role:Window|name:Untitled spreadsheet")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    let mut doc_id = String::new();
+    if let Ok(bars) = desktop
+        .locator("role:Edit|name:Address and search bar")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for b in &bars {
+            let t = b.text(0).unwrap_or_default();
+            if let Some(rest) = t.split("/d/").nth(1) {
+                doc_id = rest.split('/').next().unwrap_or("").to_string();
+            }
+        }
+    }
+    println!("  DOCUMENT ID: {doc_id}");
+
+    // Ctrl+Home is clean -- no ENTER substring, so no preamble.
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{ctrl}{home}");
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let values = ["apple", "banana", "cherry"];
+    let mut derived: Vec<(String, String)> = Vec::new();
+
+    for value in values {
+        println!("\n---- typing {value:?} ----");
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.type_text(value, false);
+        }
+        let mut last_seen: Option<(String, String)> = None;
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_millis(900) {
+            if let Ok(el) = desktop.focused_element() {
+                let n = el.name().unwrap_or_default();
+                if el.role() == "ComboBox" && looks_like_cell_ref(&n) {
+                    let text = clean_cell_text(&el.text(0).unwrap_or_default());
+                    if !text.is_empty() {
+                        last_seen = Some((n, text));
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        match &last_seen {
+            Some((c, v)) => {
+                println!("  watcher emitted: {c} = {v:?}");
+                derived.push((c.clone(), v.clone()));
+            }
+            None => println!("  watcher emitted NOTHING"),
+        }
+        // Tab commits and moves right. No preamble.
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{Tab}");
+        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+    }
+
+    // ---- ground truth -------------------------------------------------------
+    println!("\n================ ground truth (CSV export) ================\n");
+    let before_csv = newest_csv().map(|(p, _)| p);
+    let export = format!("https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, &export])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    let mut saved = String::new();
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some((p, _)) = newest_csv() {
+            if Some(&p) != before_csv.as_ref() {
+                println!("  downloaded {}", p.display());
+                saved = std::fs::read_to_string(&p).unwrap_or_default();
+                break;
+            }
+        }
+    }
+    if saved.is_empty() {
+        println!("  no CSV -- cannot verify. Inconclusive.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::SUCCESS;
+    }
+    for (i, line) in saved.lines().enumerate().take(8) {
+        println!("    row {:<3} {line:?}", i + 1);
+    }
+
+    // ---- verdict ------------------------------------------------------------
+    println!("\n================ VERDICT ================\n");
+    println!(
+        "  {:<10} {:<12} {:<10} {:<12} {}",
+        "typed", "watcher cell", "watcher v", "csv at cell", "match"
+    );
+    let mut correct = 0usize;
+    for (i, value) in values.iter().enumerate() {
+        let (cell, got) = derived
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| ("-".into(), "-".into()));
+        let at = parse_cell_ref(&cell)
+            .and_then(|(c, r)| csv_at(&saved, c, r))
+            .unwrap_or_else(|| "<none>".into());
+        let ok = at == *value && got == *value;
+        if ok {
+            correct += 1;
+        }
+        println!("  {value:<10} {cell:<12} {got:<10} {at:<12} {ok}");
+    }
+    println!(
+        "\n  watcher cell AND value confirmed by the saved file: {correct}/{}",
+        values.len()
+    );
+    if correct == values.len() {
+        println!("\n  CLEAN PASS. With no injected keystrokes, every value the watcher read");
+        println!("  from the transient editor landed in exactly the cell the watcher named.");
+    } else {
+        println!("\n  NOT CLEAN. The watcher's cell attribution does not consistently match");
+        println!("  where the data actually went, even with a commit that injects nothing.");
+    }
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "sheetsclean") {
+        return sheetsclean_mode().await;
+    }
     if std::env::args().any(|a| a == "sheetswatch") {
         return sheetswatch_mode().await;
     }
