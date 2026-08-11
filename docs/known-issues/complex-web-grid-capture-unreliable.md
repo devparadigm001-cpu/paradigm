@@ -589,6 +589,7 @@ checked rather than assumed.
 | `replaycheck` — web `<input>` capture then replay | **PASS**, 4/4 steps, `type` still `role=edit`, no duplicate action |
 | `multiline` — `<textarea>` across Enter | **PASS**, 2 type actions, replay reproduces exactly |
 | `windowswitch` — attribution across an app switch | **PASS**, typing still ordered before the switch |
+| `notepadgrid` — Notepad, `Document` role | **PASS** ×3, buffer reconstructed exactly, 0 grid actions |
 | `cargo test` (94 unit + 23 integration) | pass, except the known pre-existing `ipc_pipeline` failure |
 | `cargo clippy --all-targets` | 0 errors |
 
@@ -602,51 +603,68 @@ same three actions as before this change, and reports `excluded_count: 0` — so
 the grid path neither fixed nor worsened it. It tracks
 `text-input-capture-truncation.md`.
 
-#### The Notepad check: attempted properly, and still not measured
+#### Notepad: verified, on the fourth attempt
 
-This was pursued rather than left as an assumption, and it did not come off. The
-attempt is recorded because the reasons are specific and someone will try again.
+`text_capture_probe -- notepad` cannot answer this. It compares the focused
+element's pid against the pid it launched, and Windows 11 Notepad hands new
+launches to an existing instance, so the window belongs to a process it did not
+spawn — the same pid instability the window-identity work measured. It is right
+to refuse, and forcing it through would mean typing into a window it cannot
+vouch for.
 
-`text_capture_probe -- notepad` aborts on its own precondition: it compares the
-focused element's pid against the pid it launched, and Windows 11 Notepad hands
-new launches to an existing instance, so the window belongs to a process the
-probe did not spawn. That is the same pid instability the window-identity work
-measured. The precondition is right to refuse, and forcing it through would mean
-typing into a window the probe cannot vouch for.
+`-- notepadgrid` identifies the surface by its own properties instead: window
+title contains "Notepad", a role `capture::text` accepts, and a buffer verified
+**empty** so the probe never types into real work. It also *activates* the
+window rather than assuming it took focus, which is why the original never
+converged — focus was sitting on an unrelated `Button` throughout.
 
-`-- notepadgrid` was written to avoid that: it identifies the surface by its own
-properties instead of a pid — window title contains "Notepad", role accepted by
-`capture::text`, buffer verified **empty** — and activates the window rather than
-hoping it takes focus, which is why the original never converged (focus was on an
-unrelated `Button` throughout).
+**Three independent runs, identical:**
 
-It did not complete either. **Four runs, each past its timeout with no output at
-all.** Narrowing, in order:
+```
+  after activating "Untitled - Notepad": focus role="Document" window="" text_len=0
+  anchored on "Untitled - Notepad", role="Document", verified empty
 
-* the window sweep used the default depth 50, which descends into every window's
-  full subtree — including a Notepad holding a ~198 MB document. Reduced to
-  depth 3, which is sufficient for top-level windows.
-* the emptiness check called `text(0)`, the read that is expensive on a large
-  buffer. Reordered so the window title screens first and that read only ever
-  happens on a fresh `Untitled - Notepad`.
-* every UIA call was then time-bounded, so a hang would report itself.
+  4 action(s), 0 exclusion(s), 49 unmapped
+    navigate  role=Window     name="Untitled - Notepad"
+    click     role=document   name="Text editor"
+    type      role=document   name="Text editor" payload="alpha line\r"
+    type      role=document   name="Text editor" payload="beta line"
 
-It still produced nothing, which places the stall before any bounded call. Each
-attempt also launches a Notepad it never closes, so UIA had six instances to
-traverse by the end — the environment degraded as the attempts continued, which
-is the most likely reason they got worse rather than better.
+  concatenated payloads         : "alpha line\rbeta line"
+  actually in the Notepad buffer: "alpha line\rbeta line"
+  actions from the GRID path    : 0
+```
 
-**What replaced it.** The property the Notepad run would have checked is now a
-unit test rather than an argument. `is_cell_editor(role, name)` is the single
-decision that keeps this watcher out of every non-grid application, and
-`every_non_grid_surface_is_ignored` pins it against `Document` (Notepad's role,
-established by an earlier probe measurement and the reason `"document"` is in
-`TEXT_ROLES`), `Edit`, `Button`, and `ComboBox`es named `"Menus"` and `"Zoom"` —
-which exist in Sheets' own window.
+Document-role capture is unchanged — two `type` actions still reconstruct the
+buffer exactly, across an Enter — and the grid path contributed **no action and
+no exclusion**. The role is still `document`, not `ComboBox`.
 
-That is a stronger guarantee than one live Notepad run, because it holds on every
-build. It is **not** the same thing as having driven real Notepad typing through
-the real pump, and that remains open.
+The property is also pinned as a unit test, `every_non_grid_surface_is_ignored`,
+against `Document`, `Edit`, `Button`, and `ComboBox`es named `"Menus"` and
+`"Zoom"` — which exist in Sheets' own window. The live run and the invariant
+cover each other: one proves it against the real pump once, the other holds on
+every build.
+
+**A false alarm worth recording.** These runs were first reported as "did not
+complete — four runs past timeout with no output", and a hang was diagnosed:
+depth-50 traversal into a ~198 MB Notepad document. All of that was wrong. The
+runs were **succeeding**; they were slow, and Rust block-buffers stdout when it
+is piped to a file, so nothing was visible until the process exited. The bounded
+version later measured the enumeration this was blamed on at **236 ms**.
+
+The lesson is the one this investigation keeps relearning in new costume: *no
+output* is not evidence of *no progress*. A probe whose output cannot be seen
+until it exits cannot distinguish "stuck" from "still working", and the absence
+got read as data — the same shape as the swallowed errors catalogued in
+`replay-window-selector-ambiguity.md`.
+
+**Still open: the cost.** The scripted activity in these runs is roughly 25
+seconds, and they took several minutes. `GridCellWatcher` resolves the focused
+element on every key-down, and this machine had seven Notepad windows open by the
+end. That is a plausible cause and is *not* established — there is no
+before/after comparison, because the grid path was already in the build for every
+run. It does raise the per-keystroke cost item below from theoretical to
+suspected.
 
 ### What is NOT fixed
 
@@ -782,21 +800,23 @@ immediately. Probe coverage has been measuring the environment it was built for.
       `capture/grid.rs`, wired into the pump. Zero → 4/4 cell edits captured with
       correct attribution and clean text, confirmed against the CSV export, two
       runs. See "Finding 2 FIXED".
-- [ ] **Drive real Notepad typing through the pump.** Still the one regression
-      not measured live. Two probe modes and four runs did not complete — see
-      "The Notepad check". The property is now pinned by
-      `every_non_grid_surface_is_ignored`, which is stronger in that it holds on
-      every build, but it is a unit test and not a live run. Retry on a machine
-      with no large Notepad document open, and close each launched instance
-      rather than letting them accumulate.
+- [x] ~~**Drive real Notepad typing through the pump.**~~ **Verified**, three
+      identical runs: `type` actions still `role=document`, payloads reconstruct
+      the buffer exactly across an Enter, and the grid path produced zero actions
+      and zero exclusions. See "Notepad: verified".
 - [ ] **Make a captured grid edit replayable.** Capture is now correct; replay is
       not solved and is not close. There is no cell element for a selector to
       resolve to, so this needs a different addressing mechanism entirely —
       plausibly driving the Name Box, which was measured tracking the cursor
       within 0–1 ms.
-- [ ] **Measure the per-keystroke cost.** One focused-element resolution per
-      printable key-down, in every application, not just grids. Cheap in
-      principle — it exits after one role check — but unmeasured under load.
+- [ ] **Measure the per-keystroke cost — now suspected, not just theoretical.**
+      One focused-element resolution per printable key-down, in every
+      application. The Notepad runs took several minutes for ~25 seconds of
+      scripted activity on a machine with seven Notepad windows open. That is a
+      plausible cause and not an established one: the grid path was in the build
+      for every run, so there is no before/after. Needs a real A/B — the same
+      driven session with the grid watcher compiled out — before drawing any
+      conclusion.
 - [ ] **Confirm the accessor mismatch on the recorder side.** Cell identity lives
       in `text()` on the Name Box input and in `name` on the editor, never in
       `value`. Capture reads `e.element_text` for clicks and `watched.name` for
