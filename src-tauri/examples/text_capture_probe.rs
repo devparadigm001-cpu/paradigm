@@ -6147,11 +6147,357 @@ async fn sheetsclean_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------ sheetskeys mode ----
+// The design question that decides how Sheets capture must be built.
+//
+// The editor overlay is created by TYPING, not by clicking, so the Click event
+// that drives `TextFieldWatcher::focus_moved` never fires for it. The pipeline
+// therefore never learns the editor exists. The question is whether some event
+// it already receives carries that element anyway.
+//
+// `KeyboardEvent.metadata.ui_element` is an `Option<UIElement>`. Whether the
+// recorder POPULATES it, and whether the element it populates is the editor
+// rather than the page, is not something to assume -- if it is populated, the
+// fix is a few lines in an existing handler; if it is not, capture needs its own
+// element resolution and a `Desktop` handle it does not currently hold.
+async fn sheetskeys_mode() -> ExitCode {
+    use futures::StreamExt;
+    use terminator_workflow_recorder::{WorkflowEvent, WorkflowRecorder, WorkflowRecorderConfig};
+
+    println!("== do keyboard events carry the Sheets cell editor? ==\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = desktop
+        .locator("role:Window|name:Untitled spreadsheet")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    let mut doc_id = String::new();
+    if let Ok(bars) = desktop
+        .locator("role:Edit|name:Address and search bar")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for b in &bars {
+            let t = b.text(0).unwrap_or_default();
+            if let Some(rest) = t.split("/d/").nth(1) {
+                doc_id = rest.split('/').next().unwrap_or("").to_string();
+            }
+        }
+    }
+    println!("  DOCUMENT ID: {doc_id}");
+
+    let config = WorkflowRecorderConfig {
+        record_mouse: true,
+        record_keyboard: true,
+        capture_ui_elements: true,
+        ..Default::default()
+    };
+    let mut recorder = WorkflowRecorder::new("sheetskeys".to_string(), config);
+    let mut events = Box::pin(recorder.event_stream());
+    if let Err(e) = recorder.start().await {
+        eprintln!("could not start recorder: {e}");
+        return ExitCode::FAILURE;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Collect events in the background while we drive typing.
+    let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = std::sync::Arc::clone(&collected);
+    let pump = tokio::spawn(async move {
+        while let Some(ev) = events.next().await {
+            if let WorkflowEvent::Keyboard(e) = ev {
+                if !e.is_key_down {
+                    continue;
+                }
+                let desc = match &e.metadata.ui_element {
+                    Some(el) => format!(
+                        "key={:<4} ui_element: role={:<10} name={:?} text={:?}",
+                        e.key_code,
+                        el.role(),
+                        el.name().unwrap_or_default(),
+                        el.text(0).unwrap_or_default()
+                    ),
+                    None => format!("key={:<4} ui_element: NONE", e.key_code),
+                };
+                if let Ok(mut v) = sink.lock() {
+                    v.push(desc);
+                }
+            }
+        }
+    });
+
+    println!("\n  typing 'apple' TAB 'banana' TAB into cells...");
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{ctrl}{home}");
+    }
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    for value in ["apple", "banana"] {
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.type_text(value, false);
+        }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{Tab}");
+        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let _ = recorder.stop().await;
+    pump.abort();
+
+    println!("\n================ KEYBOARD EVENTS ================\n");
+    let rows = collected.lock().map(|v| v.clone()).unwrap_or_default();
+    if rows.is_empty() {
+        println!("  no key-down events captured at all.");
+    }
+    for r in rows.iter().take(40) {
+        println!("  {r}");
+    }
+    let with_el = rows.iter().filter(|r| !r.contains("NONE")).count();
+    let editorish = rows.iter().filter(|r| r.contains("ComboBox")).count();
+    println!("\n  key-down events            : {}", rows.len());
+    println!("  carrying a ui_element      : {with_el}");
+    println!("  whose element is a ComboBox: {editorish}");
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+
+    if editorish > 0 {
+        println!("\n  The editor IS reachable from keyboard events -- capture can hook the");
+        println!("  existing Keyboard handler without new element resolution.");
+    } else if with_el > 0 {
+        println!("\n  Keyboard events carry an element, but never the editor. Capture would");
+        println!("  have to resolve the focused element itself.");
+    } else {
+        println!("\n  Keyboard events carry no element at all. Capture needs its own");
+        println!("  focused-element resolution, and therefore a Desktop handle.");
+    }
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------- sheetscapture mode ----
+// Integration test for the shipped grid capture path.
+//
+// Drives real edits into a real Sheets document through a real CaptureSession,
+// then checks the captured actions against the document's own CSV export. The
+// export is the arbiter -- the UI that produced the reading cannot also verify
+// it.
+async fn sheetscapture_mode() -> ExitCode {
+    use paradigm_lib::capture::{CaptureSession, ExclusionList};
+
+    println!("== integrated Sheets cell capture, end to end ==\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = desktop
+        .locator("role:Window|name:Untitled spreadsheet")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    let mut doc_id = String::new();
+    if let Ok(bars) = desktop
+        .locator("role:Edit|name:Address and search bar")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for b in &bars {
+            let t = b.text(0).unwrap_or_default();
+            if let Some(rest) = t.split("/d/").nth(1) {
+                doc_id = rest.split('/').next().unwrap_or("").to_string();
+            }
+        }
+    }
+    println!("  DOCUMENT ID: {doc_id}");
+
+    let session = match CaptureSession::start_session(
+        "sheetscapture",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // A click first, so the watcher has app identity for the exclusion gate.
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{ctrl}{home}");
+    }
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Tab commits and moves right; four cells across row 1.
+    let values = ["apple", "banana", "cherry", "date"];
+    for value in values {
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.type_text(value, false);
+        }
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{Tab}");
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n================ CAPTURED ================\n");
+    println!(
+        "  {} action(s), {} unmapped event(s)",
+        report.actions.len(),
+        report.unmapped_events
+    );
+    // Distinguishes "the watcher produced nothing" from "it produced candidates
+    // the gate rejected" -- opposite diagnoses with opposite fixes.
+    println!("  {} exclusion(s):", report.exclusions.len());
+    for e in report.exclusions.iter().take(12) {
+        println!("    {:?} {:?}", e.kind.as_str(), e.reason);
+    }
+    let mut cell_types: Vec<(String, String)> = Vec::new();
+    for a in &report.actions {
+        println!(
+            "    {:<9} role={:<10} name={:?} payload={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-"),
+            a.payload.as_deref().unwrap_or("-")
+        );
+        if a.kind.as_str() == "type" {
+            if let (Some(n), Some(p)) = (a.element_name.clone(), a.payload.clone()) {
+                cell_types.push((n, p));
+            }
+        }
+    }
+
+    // ---- ground truth -------------------------------------------------------
+    println!("\n================ GROUND TRUTH (CSV) ================\n");
+    let before_csv = newest_csv().map(|(p, _)| p);
+    let export = format!("https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, &export])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    let mut saved = String::new();
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some((p, _)) = newest_csv() {
+            if Some(&p) != before_csv.as_ref() {
+                saved = std::fs::read_to_string(&p).unwrap_or_default();
+                break;
+            }
+        }
+    }
+    for (i, line) in saved.lines().enumerate().take(6) {
+        println!("    row {:<3} {line:?}", i + 1);
+    }
+
+    println!("\n================ VERDICT ================\n");
+    println!("  {:<8} {:<12} {:<10} {:<10} {}", "typed", "captured as", "payload", "csv there", "ok");
+    let mut correct = 0usize;
+    for (i, value) in values.iter().enumerate() {
+        let (cell, payload) = cell_types
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| ("-".into(), "-".into()));
+        let at = parse_cell_ref(&cell)
+            .and_then(|(c, r)| csv_at(&saved, c, r))
+            .unwrap_or_else(|| "<none>".into());
+        let clean = !payload.contains('\u{feff}');
+        let ok = payload == *value && at == *value && clean;
+        if ok {
+            correct += 1;
+        }
+        println!("  {value:<8} {cell:<12} {payload:<10} {at:<10} {ok}");
+    }
+    println!(
+        "\n  type actions captured                 : {}",
+        cell_types.len()
+    );
+    println!("  cell + payload confirmed by CSV       : {correct}/{}", values.len());
+    println!(
+        "  payloads containing U+FEFF            : {}",
+        cell_types
+            .iter()
+            .filter(|(_, p)| p.contains('\u{feff}'))
+            .count()
+    );
+    if correct == values.len() {
+        println!("\n  PASS: every cell edit was captured, attributed to the right cell,");
+        println!("  with clean text, and confirmed against the saved document.");
+    } else {
+        println!("\n  NOT A CLEAN PASS -- see the rows above.");
+    }
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "sheetscapture") {
+        return sheetscapture_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetskeys") {
+        return sheetskeys_mode().await;
+    }
     if std::env::args().any(|a| a == "sheetsclean") {
         return sheetsclean_mode().await;
     }

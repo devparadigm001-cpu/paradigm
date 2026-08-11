@@ -1,10 +1,12 @@
 # Capture is unreliable against complex web grids (Google Sheets)
 
-**Status:** two distinct problems, both **confirmed against real recordings**.
-The clipboard cause is established from the code. **The grid mechanism is now
-measured against live Google Sheets** — see "The mechanism, measured". Of the two
-standing hypotheses, one is confirmed, one is refuted, and two symptoms that
-neither predicted are now explained. **Still not fixed.**
+**Status:** two distinct problems.
+**Finding 2 (cell capture) is FIXED, 2026-08-11** — `capture/grid.rs` captures
+cell edits with correct attribution and clean text, verified against the
+document's own CSV export. See "Finding 2 FIXED". Replay of those edits is *not*
+solved.
+**Finding 1 (clipboard) remains open.** Its cause is established from the code;
+no fix attempted.
 **Affected:** `src-tauri/src/capture` — clipboard handling (absent) and typed
 text against `combobox`-role grid cells.
 **Platform:** Windows. Observed in Google Sheets. Other grid UIs untested.
@@ -489,6 +491,139 @@ short single-line values typed by automation rather than on real human editing.
 * **An Enter that does not send `{LEFT}{END}`**, or grid targets will keep moving
   under the automation.
 
+## Finding 2 FIXED: grid cell capture is implemented (2026-08-11)
+
+`capture/grid.rs` — `GridCellWatcher`, wired into the pump alongside
+`TextFieldWatcher`. Capture went from **zero** `type` actions for Sheets cell
+edits to **4 of 4**, each attributed to the correct cell with clean text,
+confirmed against the document's own CSV export. Two runs, identical.
+
+**Finding 1 (clipboard) is untouched and still open.**
+
+### The three design questions, answered by measurement
+
+**1. Is there an existing event that detects the editor?** No. `Click` never
+names it, because the editor is created by *typing*. And `KeyboardEvent` carries
+`metadata.ui_element: None` — measured across a driven Sheets session, **0 of 15
+key-downs** carried an element. So there was nothing in the event stream to hook,
+and capture had to gain its own focused-element resolution and a `Desktop`
+handle. This is new machinery, not a tuned existing path, and the measurement is
+why.
+
+**2. Does it fit `TextFieldWatcher`?** No — and the reason is structural rather
+than cosmetic. `combobox` is already in `TEXT_ROLES`, so the existing watcher
+would happily accept the editor. But it **reads its element when the edit ends**,
+and a cell editor does not survive that moment. A flush-time read lands after the
+overlay is recycled and returns `U+FEFF` attributed to a different cell — which
+is exactly the corruption the original recordings showed. The read model is
+inverted, so this is a parallel watcher, not a merge: it samples while the editor
+is alive and emits the **last good sample**. Everything downstream is shared —
+same `ActionCandidate`, same `admit`, same exclusion gate.
+
+**3. What signals "safe to read"?** Nothing does, so keystrokes are the clock.
+The prototype polled at 25 ms; that is unnecessary in the real pipeline because
+key-downs already arrive exactly when the value can change. Sampling on key-down
+is event-driven, costs one focused-element resolution per printable key, and
+guarantees a sample exists from *before* the commit keystroke. An edit ends on a
+trigger key (Enter or Tab), on the editor reporting a different cell, or on
+session stop.
+
+### The gate caught it before the grid did
+
+Worth recording, because the first integration run looked like total failure and
+was nothing of the kind:
+
+```
+  1 action(s), 58 unmapped event(s)
+  4 exclusion(s):
+    "type" UnidentifiedSource
+    "type" UnidentifiedSource
+    "type" UnidentifiedSource
+    "type" UnidentifiedSource
+```
+
+Zero captured actions — but **four exclusions**, one per cell edit. The watcher
+had detected, sampled and emitted all four; `CapturedStream::admit` then dropped
+them, because it fails closed on an action whose source app cannot be named and a
+keyboard-only cell edit produces no `Click` to name it with.
+
+The fix supplies the missing fact rather than weakening the gate: the watcher
+already holds the resolved element, so it reads the owning application and window
+off it — the same identification a click performs. Fail-closed is intact.
+
+Printing exclusions alongside actions is what made this a five-minute diagnosis
+instead of a hunt. "Produced nothing" and "produced things that were rejected" are
+opposite diagnoses with opposite fixes, and the run output could not previously
+tell them apart.
+
+### Result, verified against the saved document
+
+```
+  5 action(s), 58 unmapped event(s)
+  0 exclusion(s):
+    navigate  role=Window     name="Untitled spreadsheet - Google Sheets …"
+    type      role=ComboBox   name="A1" payload="apple"
+    type      role=ComboBox   name="B1" payload="banana"
+    type      role=ComboBox   name="C1" payload="cherry"
+    type      role=ComboBox   name="D1" payload="date"
+
+  row 1   "apple,banana,cherry,date"
+
+  cell + payload confirmed by CSV : 4/4
+  payloads containing U+FEFF      : 0
+```
+
+Four cells in sequence, so moving between cells is covered, not just a single
+edit. The CSV is the arbiter: the cell each action names is indexed directly and
+compared, so both halves are checked rather than just "the value appears
+somewhere".
+
+### Regression: existing capture is unchanged
+
+This sits on the same pump as every other capture path, and runs a
+focused-element resolution on every key-down in every application, so it was
+checked rather than assumed.
+
+| Check | Result |
+|---|---|
+| `replaycheck` — web `<input>` capture then replay | **PASS**, 4/4 steps, `type` still `role=edit`, no duplicate action |
+| `multiline` — `<textarea>` across Enter | **PASS**, 2 type actions, replay reproduces exactly |
+| `windowswitch` — attribution across an app switch | **PASS**, typing still ordered before the switch |
+| `cargo test` (94 unit + 23 integration) | pass, except the known pre-existing `ipc_pipeline` failure |
+| `cargo clippy --all-targets` | 0 errors |
+
+The important negative in the first three: **no spurious `type` action appeared**
+anywhere. `sample()` returns `None` unless the focused element is a `ComboBox`
+whose name parses as a cell reference, so every non-grid context exits after one
+role check.
+
+`ipc_pipeline::full_pipeline_over_ipc` still fails with the same assertion and the
+same three actions as before this change, and reports `excluded_count: 0` — so
+the grid path neither fixed nor worsened it. It tracks
+`text-input-capture-truncation.md`.
+
+**The Notepad regression is not verified.** `text_capture_probe -- notepad`
+aborted on its own precondition — it could not confirm it owned the Notepad
+window (focus resolved to a `Button` in another process) and refused to type
+rather than drive an unknown window. Retried once, same outcome. What can be said
+without it: Notepad's editing surface reports role `Document`, and `sample()`
+returns `None` for anything that is not a `ComboBox`, so the grid path is inert
+there by construction. That is an argument, not a measurement, and it is the one
+regression check this work did not complete.
+
+### What is NOT fixed
+
+* **Replay.** A captured Sheets edit records the cell and the text, and nothing
+  makes it replayable — there is no element for a selector to resolve to, which
+  is the whole finding of Part 1. Recording is now correct; reproducing is not
+  solved.
+* **Clipboard (Finding 1).** Untouched.
+* **Anything but Sheets.** The cell-reference shape is the discriminator, so this
+  works for grids that name their editor after the cell. Excel Online and other
+  grids remain untested.
+* **Cost.** One focused-element resolution per printable key-down, in every
+  application. Not measured under load.
+
 ### What this means for a fix
 
 Not a fix, but the constraints any fix inherits:
@@ -606,11 +741,23 @@ immediately. Probe coverage has been measuring the environment it was built for.
       appears **zero** times in `src/`. Replay only calls `type_text`, which uses
       `send_text` and injects nothing, so the defect is latent rather than live.
       Filed as `press-key-enter-injects-end-keystroke.md`.
-- [ ] **Add a capture path for the transient editor.** The existing event-driven
-      pipeline produced zero `type` actions across three real cell edits, so this
-      is new mechanism rather than tuning. The editor is readable for ~1.2 s
-      carrying a clean value and a cell name; the value must be taken from the
-      last observation before commit.
+- [x] ~~**Add a capture path for the transient editor.**~~ **Done** —
+      `capture/grid.rs`, wired into the pump. Zero → 4/4 cell edits captured with
+      correct attribution and clean text, confirmed against the CSV export, two
+      runs. See "Finding 2 FIXED".
+- [ ] **Verify the Notepad regression.** The only regression check not completed:
+      the probe aborted on its own precondition (could not confirm it owned the
+      Notepad window) twice. The structural argument is that `sample()` exits on
+      any role that is not `ComboBox`, and Notepad reports `Document` — but that
+      is reasoning, not measurement.
+- [ ] **Make a captured grid edit replayable.** Capture is now correct; replay is
+      not solved and is not close. There is no cell element for a selector to
+      resolve to, so this needs a different addressing mechanism entirely —
+      plausibly driving the Name Box, which was measured tracking the cursor
+      within 0–1 ms.
+- [ ] **Measure the per-keystroke cost.** One focused-element resolution per
+      printable key-down, in every application, not just grids. Cheap in
+      principle — it exits after one role check — but unmeasured under load.
 - [ ] **Confirm the accessor mismatch on the recorder side.** Cell identity lives
       in `text()` on the Name Box input and in `name` on the editor, never in
       `value`. Capture reads `e.element_text` for clicks and `watched.name` for

@@ -25,6 +25,7 @@
 
 pub mod exclusion;
 pub mod stream;
+pub mod grid;
 pub mod text;
 
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,7 @@ pub use exclusion::ExclusionList;
 pub use stream::{
     ActionCandidate, ActionKind, Admission, CapturedAction, CapturedStream, ExclusionRecord,
 };
+pub use grid::GridCellWatcher;
 pub use text::TextFieldWatcher;
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +72,7 @@ pub struct CaptureSession {
     /// Produces the `Type` actions. Shared with the pump so `stop_session` can
     /// flush a field the user was still in when they stopped recording.
     watcher: Arc<Mutex<TextFieldWatcher>>,
+    grid: Arc<Mutex<GridCellWatcher>>,
     pump: Option<JoinHandle<()>>,
 }
 
@@ -102,10 +105,12 @@ impl CaptureSession {
         let stream = Arc::new(Mutex::new(CapturedStream::new(exclusions)));
         let unmapped = Arc::new(Mutex::new(0usize));
         let watcher = Arc::new(Mutex::new(TextFieldWatcher::new()));
+        let grid = Arc::new(Mutex::new(GridCellWatcher::new()));
 
         let pump_stream = Arc::clone(&stream);
         let pump_unmapped = Arc::clone(&unmapped);
         let pump_watcher = Arc::clone(&watcher);
+        let pump_grid = Arc::clone(&grid);
         let pump = tokio::spawn(async move {
             while let Some(event) = events.next().await {
                 // Typed text is synthesised from focus transitions rather than
@@ -116,6 +121,15 @@ impl CaptureSession {
                 if let Some(typed) = observe_text(&pump_watcher, &event) {
                     if let Ok(mut s) = pump_stream.lock() {
                         s.admit(typed);
+                    }
+                }
+
+                // A grid cell has no element for the watcher above to follow --
+                // it is created by typing and destroyed by committing -- so it
+                // gets its own path. See `capture::grid`.
+                if let Some(cell) = observe_grid(&pump_grid, &event) {
+                    if let Ok(mut s) = pump_stream.lock() {
+                        s.admit(cell);
                     }
                 }
 
@@ -147,6 +161,7 @@ impl CaptureSession {
             stream,
             unmapped,
             watcher,
+            grid,
             pump: Some(pump),
         })
     }
@@ -171,6 +186,16 @@ impl CaptureSession {
         // writer, and still through admit() so the gate applies.
         if let (Ok(mut watcher), Ok(mut stream)) = (self.watcher.lock(), self.stream.lock()) {
             if let Some(candidate) = watcher.flush(now_ms()) {
+                stream.admit(candidate);
+            }
+        }
+
+        // Same for a cell edit left uncommitted. Note this emits the last
+        // SAMPLED value rather than re-reading -- by now the editor may be gone,
+        // and re-reading it is exactly the mistake that produced U+FEFF
+        // payloads. See `capture::grid`.
+        if let (Ok(mut grid), Ok(mut stream)) = (self.grid.lock(), self.stream.lock()) {
+            if let Some(candidate) = grid.flush(now_ms()) {
                 stream.admit(candidate);
             }
         }
@@ -259,6 +284,49 @@ fn observe_text(
         // actually happened in.
         WorkflowEvent::ApplicationSwitch(e) => {
             watcher.flush(e.metadata.timestamp.unwrap_or_else(now_ms))
+        }
+
+        _ => None,
+    }
+}
+
+/// Feed one event to the grid watcher, returning a `Type` candidate when a cell
+/// edit finishes.
+///
+/// Separate from `observe_text` because the two disagree about when to read.
+/// `TextFieldWatcher` reads its element when the edit ends; a grid cell's editor
+/// does not survive that moment, so this samples on the way through and emits
+/// what it last saw. See `capture::grid` for the measurements.
+fn observe_grid(
+    grid: &Arc<Mutex<GridCellWatcher>>,
+    event: &WorkflowEvent,
+) -> Option<ActionCandidate> {
+    let mut grid = grid.lock().ok()?;
+
+    match event {
+        // Keyboard events carry no `ui_element` -- measured, 0 of 15 key-downs
+        // in a driven Sheets session -- so the watcher resolves focus itself.
+        WorkflowEvent::Keyboard(e) if e.is_key_down => {
+            grid.observe_key(e.key_code, e.metadata.timestamp.unwrap_or_else(now_ms))
+        }
+
+        // Clicks never name the editor, but they do say which app is in play,
+        // and the exclusion gate needs that.
+        WorkflowEvent::Click(e) => {
+            let mut identifiers = Vec::new();
+            if let Some(p) = &e.process_name {
+                identifiers.push(p.clone());
+            }
+            identifiers.extend(app_identifiers(e.metadata.ui_element.as_ref()));
+            if let Some(url) = &e.page_url {
+                identifiers.push(url.clone());
+            }
+            grid.note_context(identifiers, e.process_name.clone());
+            None
+        }
+
+        WorkflowEvent::ApplicationSwitch(e) => {
+            grid.flush(e.metadata.timestamp.unwrap_or_else(now_ms))
         }
 
         _ => None,
