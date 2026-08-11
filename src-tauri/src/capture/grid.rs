@@ -77,6 +77,17 @@ pub fn looks_like_cell_ref(s: &str) -> bool {
     (1..=3).contains(&letters) && (1..=7).contains(&digits)
 }
 
+/// Is this focused element the transient cell editor?
+///
+/// The single decision that keeps this watcher out of every non-grid
+/// application. Extracted as a pure function so the property can be tested
+/// directly: a `Document` surface (Notepad), an `Edit` (`<input>`,
+/// `<textarea>`), and a `ComboBox` that is an ordinary dropdown must all be
+/// ignored, or capture would start attaching spreadsheet actions to them.
+pub fn is_cell_editor(role: &str, name: &str) -> bool {
+    role == "ComboBox" && looks_like_cell_ref(name)
+}
+
 /// Sheets seeds its hidden editor with `U+FEFF`, and the value carries a
 /// trailing newline while the editor is open. Neither belongs in a payload.
 ///
@@ -208,11 +219,9 @@ impl GridCellWatcher {
         }
         let desktop = self.desktop.as_ref()?;
         let el = desktop.focused_element().ok()?;
-        if el.role() != "ComboBox" {
-            return None;
-        }
-        let cell = el.name()?;
-        if !looks_like_cell_ref(&cell) {
+        let role = el.role();
+        let cell = el.name().unwrap_or_default();
+        if !is_cell_editor(&role, &cell) {
             return None;
         }
         let text = clean_cell_text(&el.text(0).ok()?);
@@ -305,6 +314,33 @@ mod tests {
         for other in [0x41u32, 0x30, 0x1B, 0x08] {
             assert!(!is_trigger_key(other));
         }
+    }
+
+    #[test]
+    fn every_non_grid_surface_is_ignored() {
+        // This is the Notepad regression, pinned as an invariant. Notepad's
+        // editing surface reports role "Document" -- measured by
+        // `text_capture_probe -- notepad`, which is why "document" is in
+        // `text::TEXT_ROLES`. If this watcher ever accepted it, Notepad typing
+        // would gain a second, bogus action attributed to a spreadsheet cell.
+        assert!(!is_cell_editor("Document", ""));
+        assert!(!is_cell_editor("Document", "Untitled - Notepad"));
+
+        // Web text fields, which `TextFieldWatcher` owns.
+        assert!(!is_cell_editor("Edit", ""));
+        assert!(!is_cell_editor("Edit", "FieldA"));
+        assert!(!is_cell_editor("edit", "A1"));
+
+        // A ComboBox is necessary but nowhere near sufficient: Sheets' own
+        // window contains dropdowns named "Menus" and "Zoom".
+        assert!(!is_cell_editor("ComboBox", "Menus"));
+        assert!(!is_cell_editor("ComboBox", "Zoom"));
+        assert!(!is_cell_editor("ComboBox", ""));
+        assert!(!is_cell_editor("Button", "A1"));
+
+        // Only the real thing.
+        assert!(is_cell_editor("ComboBox", "A1"));
+        assert!(is_cell_editor("ComboBox", "BC12"));
     }
 
     #[test]

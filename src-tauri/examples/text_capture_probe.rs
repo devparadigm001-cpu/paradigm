@@ -6487,11 +6487,264 @@ async fn sheetscapture_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ----------------------------------------------------- notepadgrid mode ----
+// Does Document-role capture still work with GridCellWatcher in the pipeline?
+//
+// `notepad` mode cannot answer this here: its precondition compares the focused
+// element's pid against the pid it launched, and Windows 11 Notepad hands new
+// launches to an existing instance, so the window is owned by a process we did
+// not spawn. That is the same pid instability the window-identity work already
+// measured. It correctly refuses to proceed, twice, and forcing it through would
+// mean typing into a window this probe cannot vouch for.
+//
+// So identity comes from the element's own properties instead of from a pid:
+//
+//   * its window's title contains "Notepad"
+//   * its role is one `capture::text` accepts
+//   * its text is EMPTY -- a fresh surface, not a document with the user's work
+//
+// And the window is ACTIVATED first rather than assumed to have taken focus,
+// which is why the original precondition never converged: focus was sitting on
+// an unrelated Button the whole time.
+async fn notepadgrid_mode() -> ExitCode {
+    use paradigm_lib::capture::{text, CaptureSession, ExclusionList};
+
+    println!("== Notepad capture with GridCellWatcher in the pipeline ==\n");
+    println!("WARNING: performs real clicks and typing. Hands off.\n");
+
+    let existing = std::process::Command::new("notepad.exe").spawn();
+    if existing.is_err() {
+        eprintln!("could not launch Notepad");
+        return ExitCode::FAILURE;
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Find a Notepad window, activate it, and only then look at focus.
+    // Every UIA call below is time-bounded. Three earlier attempts at this
+    // measurement ran past their timeout producing no output at all, and a hang
+    // with no output cannot be told apart from a slow machine. Bounding the
+    // calls converts that into a reportable fact.
+    println!("  enumerating Notepad windows (bounded to 20s)...");
+    let started = std::time::Instant::now();
+    let windows = match tokio::time::timeout(
+        Duration::from_secs(20),
+        desktop
+            .locator("role:Window|name:Notepad")
+            .within(desktop.root())
+            .all(Some(Duration::from_secs(8)), Some(3)),
+    )
+    .await
+    {
+        Ok(Ok(w)) => w,
+        Ok(Err(e)) => {
+            println!("  enumeration errored: {e}");
+            Vec::new()
+        }
+        Err(_) => {
+            println!("\n  INCONCLUSIVE: enumerating Notepad windows did not return within 20s.");
+            println!("  This machine currently has a Notepad holding a very large document,");
+            println!("  and UIA traversal through it is the suspected cause. Not a result");
+            println!("  about capture.");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "  Notepad windows found: {} in {} ms",
+        windows.len(),
+        started.elapsed().as_millis()
+    );
+    for w in &windows {
+        println!("    {:?}", w.name().unwrap_or_default());
+    }
+
+    let mut surface: Option<(UIElement, String, String)> = None;
+    for w in &windows {
+        let title = w.name().unwrap_or_default();
+
+        // Title first, before ANY text read. `text(0)` walks the element's
+        // subtree, and on a Notepad holding a large document that read does not
+        // return in any usable time -- it is what hung the first two attempts.
+        // "Untitled - Notepad" with no modified marker is a fresh buffer, so the
+        // read below is guaranteed to be cheap. This also keeps the probe away
+        // from a window holding real work.
+        if !title.starts_with("Untitled - Notepad") {
+            println!("    skipping {title:?}: not a fresh untitled buffer");
+            continue;
+        }
+
+        let _ = w.activate_window();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let Ok(el) = desktop.focused_element() else {
+            continue;
+        };
+        let role = el.role();
+        let win_name = el
+            .window()
+            .ok()
+            .flatten()
+            .and_then(|x| x.name())
+            .unwrap_or_default();
+
+        // Bounded: this is the read that hangs on a large buffer.
+        let probe_el = el.clone();
+        let body = match tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || probe_el.text(0).unwrap_or_default()),
+        )
+        .await
+        {
+            Ok(Ok(t)) => t,
+            _ => {
+                println!("    rejected: reading this surface's text did not return within 10s");
+                continue;
+            }
+        };
+        println!(
+            "  after activating {title:?}: focus role={role:?} window={win_name:?} text_len={}",
+            body.len()
+        );
+
+        if !win_name.contains("Notepad") && !title.contains("Notepad") {
+            println!("    rejected: focus is not inside a Notepad window");
+            continue;
+        }
+        if !text::is_text_role(&role) {
+            println!("    rejected: role {role:?} is not an editable role");
+            continue;
+        }
+        if !body.trim().is_empty() {
+            println!("    rejected: surface is NOT empty -- refusing to type into real content");
+            continue;
+        }
+        surface = Some((el, role, title));
+        break;
+    }
+
+    let Some((element, role, title)) = surface else {
+        println!("\n  INCONCLUSIVE: no freshly-launched, verified-empty Notepad surface could");
+        println!("  be confirmed. Not typing into a window that cannot be vouched for.");
+        return ExitCode::FAILURE;
+    };
+    println!("\n  anchored on {title:?}, role={role:?}, verified empty");
+    println!("  accepted by is_text_role: {}", text::is_text_role(&role));
+
+    // ---- capture ------------------------------------------------------------
+    let session = match CaptureSession::start_session(
+        "notepad-grid-regression",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    println!("\n-- driving: click, type a line, Enter, type a second line --");
+    robust_click(&desktop, &element);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    for ch in "alpha line".chars() {
+        let _ = element.type_text(&ch.to_string(), false);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = element.press_key("{Enter}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for ch in "beta line".chars() {
+        let _ = element.type_text(&ch.to_string(), false);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let actual = element.text(0).unwrap_or_default();
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // ---- results ------------------------------------------------------------
+    println!("\n================ CAPTURED ================\n");
+    println!(
+        "  {} action(s), {} exclusion(s), {} unmapped",
+        report.actions.len(),
+        report.exclusions.len(),
+        report.unmapped_events
+    );
+    for a in &report.actions {
+        println!(
+            "    {:<9} role={:<10} name={:?} payload={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-"),
+            a.payload.as_deref().unwrap_or("-")
+        );
+    }
+    for e in report.exclusions.iter().take(8) {
+        println!("    excluded {:?} {:?}", e.kind.as_str(), e.reason);
+    }
+
+    let types: Vec<&paradigm_lib::capture::CapturedAction> = report
+        .actions
+        .iter()
+        .filter(|a| a.kind.as_str() == "type")
+        .collect();
+    let combined: String = types
+        .iter()
+        .filter_map(|a| a.payload.clone())
+        .collect::<Vec<_>>()
+        .join("");
+    let grid_actions = report
+        .actions
+        .iter()
+        .filter(|a| a.element_role.as_deref() == Some("ComboBox"))
+        .count();
+
+    println!("\n================ VERDICT ================\n");
+    println!("  type actions captured        : {}", types.len());
+    println!("  concatenated payloads        : {combined:?}");
+    println!("  actually in the Notepad buffer: {actual:?}");
+    println!("  actions from the GRID path    : {grid_actions}  (must be 0)");
+
+    let norm = |s: &str| s.replace("\r\n", "\n").replace('\r', "\n");
+    let text_ok = !types.is_empty() && norm(&combined) == norm(&actual);
+    let grid_ok = grid_actions == 0;
+    if text_ok && grid_ok {
+        println!("\n  PASS: Document-role capture is unchanged, and the grid path stayed");
+        println!("  inert -- it contributed no action and no exclusion.");
+    } else if !text_ok {
+        println!("\n  REGRESSION: Notepad text capture no longer reproduces the buffer.");
+    } else {
+        println!("\n  REGRESSION: the grid path produced actions inside Notepad.");
+    }
+
+    println!("\n--- cleanup ---");
+    println!("  Notepad left open with unsaved text; close it without saving.");
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "notepadgrid") {
+        return notepadgrid_mode().await;
+    }
     if std::env::args().any(|a| a == "sheetscapture") {
         return sheetscapture_mode().await;
     }
