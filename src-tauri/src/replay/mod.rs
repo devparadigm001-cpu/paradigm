@@ -233,6 +233,11 @@ struct StepPayload {
     /// use of it is outstanding.
     #[allow(dead_code)]
     process: Option<String>,
+    /// The role as captured, before compile mapped it to a control role.
+    ///
+    /// Needed to recognise a grid cell edit, whose target is a transient
+    /// `ComboBox` editor rather than anything a selector can resolve.
+    raw_role: Option<String>,
 }
 
 impl StepPayload {
@@ -272,6 +277,7 @@ fn parse_payload(raw: &str) -> StepPayload {
         target_name: v["target"]["name"].as_str().map(str::to_string),
         app: v["app"].as_str().map(str::to_string),
         process: v["process"].as_str().map(str::to_string),
+        raw_role: v["target"]["raw_role"].as_str().map(str::to_string),
     }
 }
 
@@ -578,6 +584,23 @@ async fn execute_step(
         return navigate(desktop, payload, &mk).await;
     }
 
+    // 3b. Grid cells have nothing to resolve, so they take their own path.
+    //
+    // Every other step shape is "resolve a selector, act on what it finds". A
+    // spreadsheet cell has no element until typing creates one, so the thing
+    // that receives the typing cannot also be the thing that is located first.
+    // Entry happens through the Name Box instead -- see `grid_type`.
+    if step.action_type == "type" {
+        if let (Some(role), Some(cell)) = (
+            payload.raw_role.as_deref(),
+            payload.target_name.as_deref(),
+        ) {
+            if crate::capture::grid::is_cell_editor(role, cell) {
+                return grid_type(desktop, payload, cell, &mk).await;
+            }
+        }
+    }
+
     // 4. click / type both need the element first.
     let Some(selector) = payload.selector.as_deref() else {
         return mk(
@@ -657,6 +680,148 @@ async fn execute_step(
     // not be indistinguishable from "checked, and it was fine".
     outcome.detail.push_str(&unverified_note);
     outcome
+}
+
+/// Reproduce a spreadsheet cell edit.
+///
+/// ## Why this cannot use a selector
+///
+/// There is no cell element. Measured against a live Google Sheets document, the
+/// grid contributes nothing to the accessibility tree; the only per-cell element
+/// is a `ComboBox` editor that typing *creates* and committing destroys. So the
+/// element that receives the text cannot be located beforehand -- there is
+/// nothing there until after the action has begun.
+///
+/// ## Entry through the Name Box
+///
+/// The Name Box -- the little reference field left of the formula bar -- is a
+/// real, persistent `Edit`, and its text tracks the cursor within 0-1 ms. Giving
+/// it a reference and pressing Enter moves the cursor, which is how a keyboard
+/// user reaches a cell. Measured 3/3 against the document's CSV export.
+///
+/// This keeps replay **element-based**. Coordinate clicking was the obvious
+/// alternative and is far more fragile: scroll position, zoom, frozen panes and
+/// window size all move a cell's pixels while its reference stays the same.
+///
+/// Two details that are not incidental:
+///
+/// * `set_value` is used, not `type_text`. `type_text` APPENDS -- measured, the
+///   box went `"A1"` -> `"A1B2"` -> `"A1B2D5"`, never a valid reference, and
+///   Enter did nothing each time.
+/// * The commit is `{Tab}`, not `{Enter}`. `press_key` injects `{LEFT}{END}`
+///   before any Enter, and in a grid `{END}` jumps to the last column of the
+///   data region. See press-key-enter-injects-end-keystroke.md. Inside the Name
+///   Box those same keys are harmless caret moves, which is why Enter is fine
+///   *there* and not on the grid.
+async fn grid_type(
+    desktop: &Desktop,
+    payload: &StepPayload,
+    cell: &str,
+    mk: &impl Fn(StepResult, String) -> StepOutcome,
+) -> StepOutcome {
+    let Some(text) = payload.text.as_deref().filter(|t| !t.is_empty()) else {
+        return mk(
+            StepResult::FailedAction,
+            format!("grid step for cell {cell:?} has no text to type"),
+        );
+    };
+
+    // The Name Box input is the `Edit` child of the group named "Name box".
+    let name_box = match desktop
+        .locator("name:Name box")
+        .first(Some(ELEMENT_LOCATE_TIMEOUT))
+        .await
+    {
+        Ok(group) => group
+            .children()
+            .ok()
+            .and_then(|c| c.into_iter().find(|e| e.role() == "Edit")),
+        Err(e) => {
+            return mk(
+                StepResult::FailedNotFound,
+                format!(
+                    "no Name Box found, so cell {cell:?} cannot be reached: {e}\n\
+                     A grid edit is replayed by navigating through the Name Box; without \
+                     it there is no way into a cell."
+                ),
+            )
+        }
+    };
+    let Some(name_box) = name_box else {
+        return mk(
+            StepResult::FailedNotFound,
+            format!("the Name Box group has no editable child, so cell {cell:?} cannot be reached"),
+        );
+    };
+
+    if let Err(e) = name_box.set_value(cell) {
+        return mk(
+            StepResult::FailedAction,
+            format!("could not put {cell:?} into the Name Box: {e}"),
+        );
+    }
+    if let Err(e) = name_box.press_key("{Enter}") {
+        return mk(
+            StepResult::FailedAction,
+            format!("could not submit the Name Box for {cell:?}: {e}"),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // Confirm the cursor actually moved BEFORE typing. Nothing has been written
+    // yet, so refusing here costs nothing; typing into whatever happens to be
+    // selected is how a replay writes to the wrong cell while reporting success.
+    let landed = name_box.text(0).unwrap_or_default();
+    if landed.trim() != cell {
+        return mk(
+            StepResult::FailedWrongTarget,
+            format!(
+                "the Name Box reads {landed:?} after asking for {cell:?}, so the cursor is \
+                 not demonstrably on the recorded cell.\nRefusing to type: this is how a \
+                 replay fills the wrong cell while reporting success."
+            ),
+        );
+    }
+
+    let target = match desktop.focused_element() {
+        Ok(el) => el,
+        Err(e) => {
+            return mk(
+                StepResult::FailedNotFound,
+                format!("cursor is on {cell:?} but nothing holds focus to type into: {e}"),
+            )
+        }
+    };
+    if let Err(e) = target.type_text(text, false) {
+        return mk(
+            StepResult::FailedAction,
+            format!("typing into cell {cell:?} failed: {e}"),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Commit against whatever holds focus NOW, not against `target`.
+    //
+    // Typing creates the editor overlay and focus moves to it, so `target` is
+    // the pre-edit element by this point. Sending the commit there made
+    // `press_key` focus it first, which abandoned the edit instead of committing
+    // it. The symptom was precise and worth recording: every cell landed EXCEPT
+    // the last one, because each pending edit was being committed by the *next*
+    // step's Name Box navigation rather than by its own Tab -- and the final
+    // step has no next step. Measured 2/3, twice, before this line changed.
+    let committer = desktop.focused_element().unwrap_or(target);
+    if let Err(e) = committer.press_key("{Tab}") {
+        return mk(
+            StepResult::FailedAction,
+            format!("typed into cell {cell:?} but committing it failed: {e}"),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(600));
+
+    mk(
+        StepResult::Executed,
+        format!("typed {} character(s) into cell {cell:?} via the Name Box", text.chars().count()),
+    )
 }
 
 async fn navigate(
@@ -973,6 +1138,49 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn a_grid_cell_step_is_recognised_from_its_stored_payload() {
+        // The exact shape `GridCellWatcher` produces and `compile` stores.
+        let raw = r#"{"app":"msedge.exe","text":"apple",
+                      "target":{"name":"B2","raw_role":"ComboBox",
+                                "selector":"role:ComboBox|name:B2"}}"#;
+        let p = parse_payload(raw);
+        assert_eq!(p.raw_role.as_deref(), Some("ComboBox"));
+        assert!(crate::capture::grid::is_cell_editor(
+            p.raw_role.as_deref().unwrap(),
+            p.target_name.as_deref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn ordinary_steps_do_not_take_the_grid_path() {
+        // The grid path must claim only real cell edits. A web text field and a
+        // dropdown both have to keep going through selector resolution, or
+        // replay would try to reach them through a Name Box that is not there.
+        for raw in [
+            r#"{"target":{"name":"FieldA","raw_role":"Edit"}}"#,
+            r#"{"target":{"name":"Untitled - Notepad","raw_role":"Window"}}"#,
+            r#"{"target":{"name":"Menus","raw_role":"ComboBox"}}"#,
+            r#"{"target":{"name":"Text editor","raw_role":"Document"}}"#,
+        ] {
+            let p = parse_payload(raw);
+            let claimed = match (p.raw_role.as_deref(), p.target_name.as_deref()) {
+                (Some(r), Some(n)) => crate::capture::grid::is_cell_editor(r, n),
+                _ => false,
+            };
+            assert!(!claimed, "grid path wrongly claimed {raw}");
+        }
+    }
+
+    #[test]
+    fn a_playbook_recorded_before_raw_role_existed_does_not_take_the_grid_path() {
+        // Strictly additive: an old payload has no raw_role, so the grid check
+        // cannot fire and the step resolves exactly as it always did.
+        let raw = r#"{"target":{"name":"B2","selector":"role:ComboBox|name:B2"}}"#;
+        let p = parse_payload(raw);
+        assert_eq!(p.raw_role, None);
     }
 
     #[test]

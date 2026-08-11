@@ -6849,11 +6849,532 @@ async fn notepadclose_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ----------------------------------------------------- sheetsentry mode ----
+// Part 1: how does anything GET INTO a cell, when no cell element exists?
+//
+// Replay's normal shape is resolve-a-selector then act on what it finds. A grid
+// cell has nothing to resolve: the ComboBox editor is created BY typing, so it
+// cannot be the thing that receives the typing.
+//
+// The obvious answer is coordinate clicking, and it is the fragile one -- it
+// breaks on scroll, zoom, window resize and frozen rows. But there is a
+// persistent, element-based candidate that was never fairly tested: the Name
+// Box. It is a real element (`Edit` child of the "Name box (Ctrl + J)" group),
+// and its text was measured tracking the cursor within 0-1 ms. Typing a
+// reference into it and pressing Enter is how a keyboard user reaches a cell.
+//
+// It was tried once in `sheetswatch` and appeared to fail -- values landed in
+// A1. That run committed with `type_text("\n")`, which does not submit anything,
+// so the navigation never happened and the mechanism was never actually on
+// trial. Note also that `press_key("{Enter}")`'s injected {LEFT}{END} is
+// harmless HERE: inside a text field those are caret moves, not grid navigation.
+//
+// This mode tests entry by Name Box, verifying after each step that the cursor
+// really moved, and checks the result against the CSV export.
+async fn sheetsentry_mode() -> ExitCode {
+    println!("== can the Name Box drive cell entry for replay? ==\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = desktop
+        .locator("role:Window|name:Untitled spreadsheet")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    let mut doc_id = String::new();
+    if let Ok(bars) = desktop
+        .locator("role:Edit|name:Address and search bar")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for b in &bars {
+            let t = b.text(0).unwrap_or_default();
+            if let Some(rest) = t.split("/d/").nth(1) {
+                doc_id = rest.split('/').next().unwrap_or("").to_string();
+            }
+        }
+    }
+    println!("  DOCUMENT ID: {doc_id}");
+
+    // The Name Box input: the Edit child of the group named "Name box".
+    let name_box = desktop
+        .locator("name:Name box")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+        .and_then(|g| {
+            g.children()
+                .ok()
+                .and_then(|c| c.into_iter().find(|e| e.role() == "Edit"))
+        });
+    let Some(name_box) = name_box else {
+        println!("  Name Box input not found -- entry by Name Box is not available.");
+        return ExitCode::FAILURE;
+    };
+    println!("  Name Box input found: {}", snap(&name_box));
+
+    let plan = [("B2", "apple"), ("D5", "banana"), ("C9", "cherry")];
+    let mut steps: Vec<(String, bool, String)> = Vec::new();
+
+    for (cell, value) in plan {
+        println!("\n---- {cell} = {value:?} ----");
+
+        // ENTRY: replace the Name Box contents, then submit.
+        //
+        // `type_text` APPENDS -- measured: the box read "A1", then "A1B2", then
+        // "A1B2D5", never a valid reference, so Enter did nothing. It has to be
+        // cleared first. Two ways to do that, tried in order so the run says
+        // which actually works rather than assuming.
+        let mut moved = false;
+        let mut landed = String::new();
+        let mut how = "none";
+        for strategy in ["set_value", "ctrl+a then type"] {
+            match strategy {
+                "set_value" => {
+                    let _ = name_box.set_value(cell);
+                }
+                _ => {
+                    let _ = name_box.press_key("{ctrl}a");
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = name_box.type_text(cell, true);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // {LEFT}{END} injected before Enter are caret moves inside this text
+            // field, so the grid defect does not apply here.
+            let _ = name_box.press_key("{Enter}");
+            tokio::time::sleep(Duration::from_millis(1400)).await;
+
+            landed = name_box.text(0).unwrap_or_default();
+            println!("  via {strategy:<18} box reads {landed:?}");
+            if landed.trim() == cell {
+                moved = true;
+                how = strategy;
+                break;
+            }
+        }
+        println!("  cursor on {cell}: {moved} (via {how})");
+        if !moved {
+            println!("  NOT typing: the cursor is not demonstrably on {cell}");
+            steps.push((cell.to_string(), false, String::new()));
+            continue;
+        }
+
+        // TYPE into whatever now has focus (the grid's hidden input).
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.type_text(value, false);
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        // Observe the editor, which is the only per-cell element that exists.
+        let seen = desktop
+            .focused_element()
+            .ok()
+            .map(|el| (el.role(), el.name().unwrap_or_default()))
+            .unwrap_or_default();
+        println!("  editor during typing: role={:?} name={:?}", seen.0, seen.1);
+
+        // Commit with Tab -- no injected keystrokes.
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{Tab}");
+        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        steps.push((cell.to_string(), true, seen.1));
+    }
+
+    // ---- ground truth -------------------------------------------------------
+    println!("\n================ GROUND TRUTH (CSV) ================\n");
+    let before_csv = newest_csv().map(|(p, _)| p);
+    let export = format!("https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, &export])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    let mut saved = String::new();
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some((p, _)) = newest_csv() {
+            if Some(&p) != before_csv.as_ref() {
+                saved = std::fs::read_to_string(&p).unwrap_or_default();
+                break;
+            }
+        }
+    }
+    for (i, line) in saved.lines().enumerate().take(12) {
+        println!("    row {:<3} {line:?}", i + 1);
+    }
+
+    println!("\n================ VERDICT ================\n");
+    println!("  {:<6} {:<9} {:<8} {:<12} {}", "cell", "value", "entered", "editor said", "csv at cell");
+    let mut ok = 0usize;
+    for (i, (cell, value)) in plan.iter().enumerate() {
+        let (_, entered, editor) = steps
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| (cell.to_string(), false, String::new()));
+        let at = parse_cell_ref(cell)
+            .and_then(|(c, r)| csv_at(&saved, c, r))
+            .unwrap_or_else(|| "<none>".into());
+        if at == *value {
+            ok += 1;
+        }
+        println!("  {cell:<6} {value:<9} {entered:<8} {editor:<12} {at}");
+    }
+    println!("\n  values landing in the INTENDED cell: {ok}/{}", plan.len());
+    if ok == plan.len() {
+        println!("\n  Name Box entry works. Replay can reach a cell through a persistent");
+        println!("  element, with no coordinates involved.");
+    } else {
+        println!("\n  Name Box entry did NOT place every value correctly.");
+    }
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------- sheetsroundtrip mode ----
+// Record real Sheets cell edits, then replay them into a FRESH document and
+// check the result against that document's CSV export.
+//
+// A fresh document matters: replaying into the recorded one would pass even if
+// replay did nothing at all, because the values are already there.
+async fn sheetsroundtrip_mode() -> ExitCode {
+    use paradigm_lib::capture::{CaptureSession, ExclusionList};
+    use paradigm_lib::compile::{compile, store, ReversibilityPolicy};
+    use paradigm_lib::labeling::RedactionPolicy;
+
+    println!("== record Sheets cell edits, replay them into a fresh document ==\n");
+
+    let browser = browser_order()[0];
+    let open_new_sheet = || async {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+            .spawn()
+        {
+            let _ = c.wait();
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    };
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    async fn current_sheet(desktop: &Desktop) -> Option<(UIElement, String)> {
+        let w = desktop
+            .locator("role:Window|name:Untitled spreadsheet")
+            .within(desktop.root())
+            .all(Some(Duration::from_secs(8)), Some(3))
+            .await
+            .ok()?
+            .into_iter()
+            .next()?;
+        let mut id = String::new();
+        if let Ok(bars) = desktop
+            .locator("role:Edit|name:Address and search bar")
+            .within(w.clone())
+            .all(Some(Duration::from_secs(5)), None)
+            .await
+        {
+            for b in &bars {
+                let t = b.text(0).unwrap_or_default();
+                if let Some(rest) = t.split("/d/").nth(1) {
+                    id = rest.split('/').next().unwrap_or("").to_string();
+                }
+            }
+        }
+        Some((w, id))
+    }
+
+    // ---- record -------------------------------------------------------------
+    println!("-- opening the RECORDING document --");
+    open_new_sheet().await;
+    let Some((_, rec_id)) = current_sheet(&desktop).await else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    println!("  recording document: {rec_id}");
+
+    let session = match CaptureSession::start_session(
+        "sheets-roundtrip",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{ctrl}{home}");
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let values = ["alpha", "bravo", "charlie"];
+    for v in values {
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.type_text(v, false);
+        }
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{Tab}");
+        }
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("\n  captured {} action(s):", report.actions.len());
+    for a in &report.actions {
+        println!(
+            "    {:<9} role={:<10} name={:?} payload={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-"),
+            a.payload.as_deref().unwrap_or("-")
+        );
+    }
+    let recorded_cells: Vec<(String, String)> = report
+        .actions
+        .iter()
+        .filter(|a| a.kind.as_str() == "type")
+        .filter_map(|a| Some((a.element_name.clone()?, a.payload.clone()?)))
+        .collect();
+    if recorded_cells.is_empty() {
+        println!("\n  nothing to replay -- capture produced no cell edits.");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- compile + store ----------------------------------------------------
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("temp db failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Only the cell edits: the recorded navigate points at the OLD document.
+    let cell_actions: Vec<_> = report
+        .actions
+        .iter()
+        .filter(|a| a.kind.as_str() == "type")
+        .cloned()
+        .collect();
+    let playbook = compile(
+        &cell_actions,
+        "Sheets Roundtrip",
+        &ReversibilityPolicy::placeholder(),
+        &RedactionPolicy::placeholder(),
+    );
+    if let Err(e) = store::store(&mut conn, &playbook) {
+        eprintln!("store failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("  stored {} step(s)", playbook.steps.len());
+
+    // ---- replay into a FRESH document ---------------------------------------
+    println!("\n-- opening a FRESH document to replay into --");
+    open_new_sheet().await;
+    let Some((_, play_id)) = current_sheet(&desktop).await else {
+        println!("  could not open a fresh document.");
+        return ExitCode::FAILURE;
+    };
+    if play_id == rec_id {
+        println!("  the fresh document is the same as the recorded one; aborting, since");
+        println!("  replaying into it would pass without doing anything.");
+        return ExitCode::FAILURE;
+    }
+    println!("  replay document: {play_id}");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let run = match paradigm_lib::replay::replay(&mut conn, &desktop, &playbook.id).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("replay failed to run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("\n  replay status: {}", run.status);
+    for o in &run.outcomes {
+        println!("    [{}] {:<9} {}", o.step_order, o.action_type, o.result.label());
+        if o.result.is_failure() {
+            for line in o.detail.lines() {
+                println!("         {line}");
+            }
+        }
+    }
+
+    // ---- ground truth on the REPLAY document --------------------------------
+    //
+    // The export is rendered server-side, so it shows what Sheets has SAVED, not
+    // what is on screen. Sheets autosaves asynchronously, and a first run of this
+    // exported immediately after the last commit and came back missing only the
+    // final cell -- which looks identical to "replay failed on the last step".
+    // Waiting first separates the two.
+    println!("\n  waiting 10s for Sheets to sync before exporting...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    println!("\n================ GROUND TRUTH (replay doc CSV) ================\n");
+    let before_csv = newest_csv().map(|(p, _)| p);
+    let export = format!("https://docs.google.com/spreadsheets/d/{play_id}/export?format=csv");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, &export])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    let mut saved = String::new();
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some((p, _)) = newest_csv() {
+            if Some(&p) != before_csv.as_ref() {
+                saved = std::fs::read_to_string(&p).unwrap_or_default();
+                break;
+            }
+        }
+    }
+    for (i, line) in saved.lines().enumerate().take(8) {
+        println!("    row {:<3} {line:?}", i + 1);
+    }
+
+    println!("\n================ VERDICT ================\n");
+    println!("  {:<8} {:<10} {}", "cell", "recorded", "in the REPLAY document");
+    let mut ok = 0usize;
+    for (cell, value) in &recorded_cells {
+        let at = parse_cell_ref(cell)
+            .and_then(|(c, r)| csv_at(&saved, c, r))
+            .unwrap_or_else(|| "<none>".into());
+        if at == *value {
+            ok += 1;
+        }
+        println!("  {cell:<8} {value:<10} {at}");
+    }
+    println!("\n  cells reproduced correctly: {ok}/{}", recorded_cells.len());
+    if ok == recorded_cells.len() && run.status == "completed" {
+        println!("\n  PASS: a recorded Sheets edit replays into a different document and");
+        println!("  lands in the right cell with the right value.");
+    } else {
+        println!("\n  NOT A CLEAN PASS.");
+    }
+    println!("\n  CLEANUP IDS: {rec_id} {play_id}");
+    ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------- closewins mode ----
+// Close browser windows whose title starts with a given prefix.
+//
+// Probe runs accumulate windows, and that is not cosmetic: repeated runs leave
+// several copies of the same page open, which makes a selector like
+// `role:edit|name:FieldA` genuinely ambiguous and causes `replaycheck` to be
+// refused by the ambiguity check -- correctly, but for an environmental reason
+// rather than a real one.
+//
+// Prefix match, not containment, so a prefix cannot accidentally sweep up an
+// unrelated window whose title merely mentions the same words.
+async fn closewins_mode() -> ExitCode {
+    let prefix = std::env::args()
+        .skip_while(|a| a != "closewins")
+        .nth(1)
+        .unwrap_or_default();
+    if prefix.trim().is_empty() {
+        eprintln!("usage: closewins <title-prefix>");
+        return ExitCode::FAILURE;
+    }
+    println!("== closing windows whose title starts with {prefix:?} ==\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let all = desktop
+        .locator(format!("role:Window|name:{prefix}").as_str())
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(10)), Some(3))
+        .await
+        .unwrap_or_default();
+
+    let mut closed = 0usize;
+    for w in &all {
+        let name = w.name().unwrap_or_default();
+        if !name.starts_with(&prefix) {
+            println!("  leaving {name:?} (prefix does not match)");
+            continue;
+        }
+        match w.close() {
+            Ok(()) => {
+                println!("  closed {name:?}");
+                closed += 1;
+            }
+            Err(e) => println!("  could not close {name:?}: {e}"),
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    println!("\n  {closed} window(s) closed");
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "closewins") {
+        return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsroundtrip") {
+        return sheetsroundtrip_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsentry") {
+        return sheetsentry_mode().await;
+    }
     if std::env::args().any(|a| a == "notepadclose") {
         return notepadclose_mode().await;
     }

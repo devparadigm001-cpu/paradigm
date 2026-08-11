@@ -1,10 +1,11 @@
 # Capture is unreliable against complex web grids (Google Sheets)
 
 **Status:** two distinct problems.
-**Finding 2 (cell capture) is FIXED, 2026-08-11** — `capture/grid.rs` captures
-cell edits with correct attribution and clean text, verified against the
-document's own CSV export. See "Finding 2 FIXED". Replay of those edits is *not*
-solved.
+**Finding 2 (cell capture AND replay) is FIXED, 2026-08-11** — `capture/grid.rs`
+captures cell edits with correct attribution and clean text, and `replay`'s
+`grid_type` reproduces them into a different document through the Name Box, with
+no coordinates involved. Both verified against CSV exports. See "Finding 2 FIXED"
+and "Replay of grid edits: implemented".
 **Finding 1 (clipboard) remains open.** Its cause is established from the code;
 no fix attempted.
 **Affected:** `src-tauri/src/capture` — clipboard handling (absent) and typed
@@ -666,6 +667,134 @@ before/after comparison, because the grid path was already in the build for ever
 run. It does raise the per-keystroke cost item below from theoretical to
 suspected.
 
+## Replay of grid edits: implemented (2026-08-11)
+
+`replay/mod.rs` — `grid_type`. A recorded Sheets cell edit now replays into a
+**different, empty document** and lands in the right cell with the right value.
+Verified against that document's CSV export, 3/3, twice.
+
+### The problem it had to solve
+
+Every other step shape is *resolve a selector, act on what it finds*. A grid cell
+has nothing to resolve: the ComboBox editor is created **by** typing, so the
+element that receives the text cannot also be the element located beforehand.
+
+### Entry is through the Name Box, not coordinates
+
+The obvious answer was coordinate clicking — and it is the fragile one, since
+scroll position, zoom, frozen panes and window size all move a cell's pixels
+while its reference stays the same.
+
+It is not necessary. The **Name Box** — the reference field left of the formula
+bar — is a real, persistent `Edit`, and Part 1 measured its text tracking the
+cursor within 0–1 ms. Giving it a reference and pressing Enter moves the cursor,
+which is how a keyboard user reaches a cell:
+
+```
+  via set_value          box reads "B2"
+  cursor on B2: true
+  editor during typing: role="ComboBox" name="B2"
+  ...
+  row 2   ",apple,,"
+  row 5   ",,,banana"
+  row 9   ",,cherry,"
+
+  values landing in the INTENDED cell: 3/3
+```
+
+So replay stays **element-based**. No coordinates anywhere.
+
+An earlier attempt at Name Box navigation (in `sheetswatch`) appeared to fail and
+was written off; it had committed with `type_text("\n")`, which submits nothing,
+so the mechanism was never actually on trial.
+
+### Capture already records enough — no companion fix needed
+
+The captured action carries `element_name` = the cell reference (`"A1"`), which
+is exactly what Name Box entry consumes. Nothing extra had to be recorded: no
+coordinates, no grid indices. The one addition on the replay side was parsing
+`target.raw_role` out of the stored payload, which `compile` was already writing.
+
+### Two details that only measurement would have found
+
+**`type_text` appends; `set_value` replaces.** Typing a reference into the Name
+Box produced `"A1"` → `"A1B2"` → `"A1B2D5"` — never a valid reference, so Enter
+did nothing and the cursor never moved. The probe's own verification caught this
+and refused to type, rather than filling whatever cell happened to be selected.
+
+**The commit must go to the element focused *after* typing.** Sending `{Tab}` to
+the element resolved before typing made `press_key` focus it first, which
+abandoned the edit instead of committing it. The symptom was precise: **every
+cell landed except the last one**, twice — because each pending edit was being
+committed by the *next* step's Name Box navigation, and the final step has no
+next step. Re-resolving focus before the commit took it from 2/3 to 3/3.
+
+That failure is worth keeping in mind: replay reported all three steps
+`executed`, and two thirds of the data arrived. A run that is *mostly* right is
+exactly the shape this project keeps finding hardest to notice.
+
+**Enter is still avoided on the grid.** The commit is `{Tab}`, because
+`press_key` injects `{LEFT}{END}` before any Enter and `{END}` relocates the
+cursor in a grid — see `press-key-enter-injects-end-keystroke.md`. Inside the
+Name Box those same keys are harmless caret moves, which is why Enter is fine
+there and not on the grid.
+
+### Verified end to end
+
+`text_capture_probe -- sheetsroundtrip` records real cell edits, compiles and
+stores them, then replays into a **freshly created** document — deliberately not
+the recorded one, where replay could pass by doing nothing:
+
+```
+  captured:  type role=ComboBox name="A1" payload="alpha"
+             type role=ComboBox name="B1" payload="bravo"
+             type role=ComboBox name="C1" payload="charlie"
+
+  replay status: completed   [1] executed  [2] executed  [3] executed
+
+  replay document CSV:  row 1  "alpha,bravo,charlie"
+
+  cells reproduced correctly: 3/3
+```
+
+The export is rendered server-side, so it reports what Sheets **saved**, not what
+is on screen. A 10 s sync wait was added before exporting after a first run
+missed only the final cell — which looks identical to a failed last step. That
+turned out not to be the cause, but the wait stays because the two are otherwise
+indistinguishable.
+
+### Regressions
+
+| Check | Result |
+|---|---|
+| `cargo test` | 98 pass |
+| `cargo clippy --all-targets` | 0 errors |
+| `replaycheck` — ordinary web replay | **PASS**, 4/4 |
+| `ordinary_steps_do_not_take_the_grid_path` | unit test: `Edit`, `Window`, `Document`, and a `ComboBox` named `"Menus"` all keep the normal path |
+| `a_playbook_recorded_before_raw_role_existed…` | old payloads have no `raw_role`, so the grid branch cannot fire |
+
+One `replaycheck` run failed first with `FAILED (selector is ambiguous)` on
+`role:edit|name:FieldA`. That was **not** a regression: repeated probe runs had
+left several copies of the probe page open, so the selector really did match more
+than one element and tonight's ambiguity check refused it — correctly. With the
+duplicates closed it passes 4/4. Worth recording as the first time that check
+fired on something other than a scenario built to trigger it.
+
+### Honest limits
+
+* **Only Sheets, and only where the Name Box exists.** The mechanism depends on a
+  persistent reference field. Excel Online and other grids are untested.
+* **The cell reference is absolute.** A playbook recorded against `B2` writes to
+  `B2` on replay regardless of what the sheet looks like. That is correct for
+  fixed-layout data entry and wrong for anything positional; there is no notion
+  of "the next empty row".
+* **No verification that the value stuck.** `grid_type` confirms the cursor
+  reached the cell before typing, but nothing afterwards re-reads the cell —
+  because UIA cannot see committed cell values at all. Verification would need
+  an export, which replay does not do.
+* **Sheet-agnostic.** The reference carries no sheet name, so a multi-tab
+  workbook replays into whichever sheet is active.
+
 ### What is NOT fixed
 
 * **Replay.** A captured Sheets edit records the cell and the text, and nothing
@@ -804,11 +933,17 @@ immediately. Probe coverage has been measuring the environment it was built for.
       identical runs: `type` actions still `role=document`, payloads reconstruct
       the buffer exactly across an Enter, and the grid path produced zero actions
       and zero exclusions. See "Notepad: verified".
-- [ ] **Make a captured grid edit replayable.** Capture is now correct; replay is
-      not solved and is not close. There is no cell element for a selector to
-      resolve to, so this needs a different addressing mechanism entirely —
-      plausibly driving the Name Box, which was measured tracking the cursor
-      within 0–1 ms.
+- [x] ~~**Make a captured grid edit replayable.**~~ **Done** — `grid_type`
+      reaches the cell through the Name Box, which is element-based rather than
+      coordinate-based. Recorded edits replay into a fresh document, 3/3 by CSV,
+      twice. See "Replay of grid edits: implemented".
+- [ ] **Decide what a grid edit should mean on replay.** The cell reference is
+      absolute, so a playbook recorded against `B2` always writes `B2`. Right for
+      fixed-layout forms, wrong for append-style data entry, and the recording
+      carries nothing that distinguishes the two. A design question, not a bug.
+- [ ] **Carry the sheet name.** A reference alone replays into whichever tab is
+      active, so a multi-sheet workbook can be written to the wrong sheet with
+      everything reporting success.
 - [ ] **LOW PRIORITY — measure the per-keystroke cost.** One focused-element
       resolution per printable key-down, in every application. The Notepad runs
       took several minutes for ~25 seconds of scripted activity on a machine with
