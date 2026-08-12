@@ -7479,6 +7479,11 @@ async fn main() -> ExitCode {
     }
     println!("\nWARNING: this performs real clicks and typing. Hands off.\n");
 
+    // In-memory only -- no I/O until the run ends. Writing log lines during a
+    // timing race measures the instrument: enabling the recorder's tracing was
+    // recorded making this very defect vanish.
+    paradigm_lib::capture::text::set_trace(true);
+
     // ---- put the page on screen ------------------------------------------
     let page = std::env::temp_dir().join("paradigm-text-capture-probe.html");
     if let Err(e) = std::fs::write(&page, PAGE) {
@@ -7639,6 +7644,29 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // The instrumented watcher trace. This is the evidence both prior attempts
+    // at the no-settle race lacked: which route started each watch, on which
+    // element, and what each flush actually saw.
+    // Exclusions distinguish "the watcher produced nothing" from "it produced a
+    // candidate the gate refused" -- opposite diagnoses, and the A-trial trace
+    // shows an EMITTING line for a field that has no action in the report.
+    println!("\n================ EXCLUSIONS ================\n");
+    if report.exclusions.is_empty() {
+        println!("  (none)");
+    }
+    for e in report.exclusions.iter().take(20) {
+        println!("  {:?} {:?}", e.kind.as_str(), e.reason);
+    }
+
+    let watcher_trace = paradigm_lib::capture::text::take_trace();
+    println!("\n================ WATCHER TRACE ================\n");
+    if watcher_trace.is_empty() {
+        println!("  (empty -- tracing was not enabled, or nothing was observed)");
+    }
+    for line in &watcher_trace {
+        println!("  {line}");
+    }
 
     println!("\n\n================ RESULTS ================");
     println!(

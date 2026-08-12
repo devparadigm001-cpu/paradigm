@@ -48,9 +48,66 @@
 //! so a field first focused by Tab alone is not watched. See the known-issues
 //! doc for the follow-up.
 
-use terminator::UIElement;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use terminator::{Desktop, UIElement};
 
 use super::stream::{ActionCandidate, ActionKind};
+
+// ---------------------------------------------------------- instrumentation --
+//
+// Off by default; when off the cost is one relaxed atomic load.
+//
+// Deliberately an in-memory buffer rather than `tracing`. This defect is a
+// Heisenbug: the original investigation recorded that enabling the recorder's
+// tracing output made it VANISH (4/4 events, all exact), because log I/O shifts
+// the timing. Instrumenting a timing race with writes to stdout would measure
+// the instrument. Pushing a `String` under a mutex is nanoseconds and does no
+// I/O until the run is over.
+static TRACE_ON: AtomicBool = AtomicBool::new(false);
+static TRACE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Turn the in-memory watcher trace on or off. Diagnostics only.
+pub fn set_trace(on: bool) {
+    TRACE_ON.store(on, Ordering::Relaxed);
+}
+
+/// Take everything traced so far, emptying the buffer.
+pub fn take_trace() -> Vec<String> {
+    TRACE
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
+}
+
+fn trace(msg: impl FnOnce() -> String) {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        if let Ok(mut v) = TRACE.lock() {
+            v.push(msg());
+        }
+    }
+}
+
+/// Roles a KEYSTROKE-driven watch may start on.
+///
+/// Narrower than `is_text_role` on purpose, and the difference is the whole
+/// safety argument. Before any click, `focused_element()` resolves to
+/// `role="Document"`. `is_text_role("Document")` is now **true** -- it was false
+/// when this approach was first tried, and was added so Notepad's editing
+/// surface would be recognised. Starting a keystroke-driven watch on a Document
+/// would mean a stray key before any click begins watching the whole page, and
+/// the next click flushes it, emitting the entire page text as a `type` action.
+///
+/// A click-driven watch still accepts Document, because a click names the
+/// element deliberately. A keystroke does not name anything.
+fn keystroke_startable_role(role: &str) -> bool {
+    let role = role.trim().to_lowercase();
+    matches!(
+        role.as_str(),
+        "edit" | "textbox" | "passwordbox" | "password" | "searchbox"
+    )
+}
 
 /// Roles we treat as editable text.
 ///
@@ -124,6 +181,8 @@ struct Watched {
 #[derive(Default)]
 pub struct TextFieldWatcher {
     watching: Option<Watched>,
+    /// Resolved lazily, only when a keystroke-driven start is attempted.
+    desktop: Option<Desktop>,
 }
 
 impl TextFieldWatcher {
@@ -144,9 +203,54 @@ impl TextFieldWatcher {
         process_name: Option<String>,
         timestamp_ms: u64,
     ) -> Option<ActionCandidate> {
+        trace(|| {
+            format!(
+                "focus_moved route=click role={role:?} name={:?} already_watching={}",
+                name,
+                self.watching
+                    .as_ref()
+                    .map(|w| w.name.clone().unwrap_or_default())
+                    .unwrap_or_else(|| "<none>".into()),
+            )
+        });
+
         // Re-focusing the same field is not a transition; keep accumulating.
         if let (Some(new), Some(current)) = (element, self.watching.as_ref()) {
             if same_element(new, &current.element) {
+                // Adopt the click's app identity if the watch has none.
+                //
+                // This is what made the first two attempts at the no-settle race
+                // fail, and it took instrumentation to see. A keystroke-driven
+                // watch names no application, because a keystroke carries no
+                // element and no process. The click that follows names the same
+                // element, so this branch used to return here immediately -- and
+                // the identity it was carrying went unused. At flush the
+                // candidate was built correctly, with the right payload, and
+                // `CapturedStream::admit` then dropped it: it fails closed on an
+                // action whose source app cannot be named.
+                //
+                // The trace shows exactly that: `EMITTING payload="A0123..."`
+                // followed by a single `"type" UnidentifiedSource` exclusion and
+                // no FieldA action in the report. That is why trial A read as
+                // 0/5 while every part tested sound in isolation.
+                //
+                // Supplying the fact, not weakening the gate: this is the same
+                // identification a click-started watch would have recorded.
+                if let Some(w) = self.watching.as_mut() {
+                    if w.identifiers.is_empty() && !identifiers.is_empty() {
+                        trace(|| format!("  adopting app identity from the click: {identifiers:?}"));
+                        w.identifiers = identifiers;
+                    }
+                    if w.process_name.is_none() && process_name.is_some() {
+                        w.process_name = process_name;
+                    }
+                }
+                trace(|| {
+                    format!(
+                        "  same element as watched (id={:?}); keeping the watch, no flush",
+                        new.id()
+                    )
+                });
                 return None;
             }
         }
@@ -182,12 +286,26 @@ impl TextFieldWatcher {
     pub fn key_pressed(&mut self, key_code: u32, timestamp_ms: u64) -> Option<ActionCandidate> {
         if !is_trigger_key(key_code) {
             if is_typing_key(key_code) {
+                // Follow focus on every typing key, not just when nothing is
+                // watched. Trial E's keystrokes arrive while the PREVIOUS
+                // field's watch is still live, so a "start only if idle" gate
+                // never fires for it -- measured, E stayed 0/5 with that gate
+                // while A-D passed.
+                //
+                // Cost is one `focused_element()` per typing key: measured at
+                // 4-7 ms mean, 21 ms max, and correct 40/40 in both settled and
+                // no-settle shapes by the previous investigation.
+                let leaving = self.follow_focus_on_keystroke(timestamp_ms);
                 if let Some(w) = self.watching.as_mut() {
                     w.keystrokes += 1;
+                }
+                if leaving.is_some() {
+                    return leaving;
                 }
             }
             return None;
         }
+
 
         if key_code == 0x09 {
             // Tab: focus is leaving. Flush and stop watching -- a click will
@@ -240,9 +358,31 @@ impl TextFieldWatcher {
     /// Leaves the watcher empty. Called on focus change, on a trigger key, and
     /// once when the session stops.
     pub fn flush(&mut self, timestamp_ms: u64) -> Option<ActionCandidate> {
-        let watched = self.watching.take()?;
+        let Some(watched) = self.watching.take() else {
+            trace(|| "flush: nothing was being watched".to_string());
+            return None;
+        };
 
-        let current = read_text(&watched.element)?;
+        let Some(current) = read_text(&watched.element) else {
+            trace(|| {
+                format!(
+                    "flush: could NOT read the watched element (name={:?}); dropping",
+                    watched.name
+                )
+            });
+            return None;
+        };
+
+        trace(|| {
+            format!(
+                "flush: name={:?} initial={:?} current={:?} keystrokes={} trusted={}",
+                watched.name,
+                watched.initial,
+                current,
+                watched.keystrokes,
+                watched.baseline_trusted
+            )
+        });
 
         // Two independent reasons to believe this field was typed into.
         //
@@ -260,10 +400,14 @@ impl TextFieldWatcher {
         let changed = current != watched.initial;
         let typed_into = watched.keystrokes > 0;
         if !changed && !typed_into {
+            trace(|| {
+                "  NOT EMITTING: value unchanged and no keystrokes were attributed".to_string()
+            });
             return None;
         }
 
         if current.trim().is_empty() {
+            trace(|| "  NOT EMITTING: field is empty".to_string());
             // Clearing a field is a real edit, but an empty payload carries no
             // information a replay could use, and the recorder skipped these
             // too. Treated the same way rather than silently differing.
@@ -306,8 +450,10 @@ impl TextFieldWatcher {
         };
 
         if payload.is_empty() {
+            trace(|| "  NOT EMITTING: computed payload is empty".to_string());
             return None;
         }
+        trace(|| format!("  EMITTING payload={payload:?}"));
 
         let appended = payload.len() < current.len();
         let duration = timestamp_ms.saturating_sub(watched.started_ms);
@@ -326,6 +472,77 @@ impl TextFieldWatcher {
             )),
             timestamp_ms,
         })
+    }
+
+    /// Keep the watch pointed at whatever actually has focus, on each typing key.
+    ///
+    /// The reconstruction of the twice-abandoned `begin_from_keystroke`, this
+    /// time instrumented. Returns a candidate when focus has moved off a field
+    /// that was being watched, since that field's edit is finished.
+    ///
+    /// A click still starts watches too. This exists because a click EVENT can
+    /// be processed long after the click happened -- in trial A, with a 400 ms
+    /// settle, the first keystroke still arrived before the click event did.
+    fn follow_focus_on_keystroke(&mut self, timestamp_ms: u64) -> Option<ActionCandidate> {
+        if self.desktop.is_none() {
+            self.desktop = Desktop::new_default().ok();
+            trace(|| {
+                format!(
+                    "keystroke-follow: Desktop::new_default -> {}",
+                    if self.desktop.is_some() { "ok" } else { "FAILED" }
+                )
+            });
+        }
+        let desktop = self.desktop.as_ref()?;
+        let el = match desktop.focused_element() {
+            Ok(el) => el,
+            Err(e) => {
+                trace(|| format!("keystroke-follow: focused_element FAILED: {e}"));
+                return None;
+            }
+        };
+
+        // Already on it: the overwhelmingly common case, and it must stay cheap
+        // and side-effect free.
+        if let Some(w) = self.watching.as_ref() {
+            if same_element(&el, &w.element) {
+                return None;
+            }
+        }
+
+        let role = el.role();
+        let name = el.name();
+        if !keystroke_startable_role(&role) {
+            trace(|| {
+                format!("keystroke-follow REFUSED: role={role:?} name={name:?} is not startable")
+            });
+            return None;
+        }
+
+        // Focus has moved to a different field. Whatever was being watched is
+        // finished, so flush it before re-pointing.
+        let leaving = self.flush(timestamp_ms);
+        let initial = read_text(&el).unwrap_or_default();
+        trace(|| {
+            format!(
+                "keystroke-follow STARTED: role={role:?} name={name:?} id={:?} initial={initial:?}",
+                el.id()
+            )
+        });
+        self.watching = Some(Watched {
+            initial,
+            element: el,
+            role,
+            name,
+            // A keystroke names no application. The click for this same element
+            // adopts into the watch when it arrives -- see `focus_moved`.
+            identifiers: Vec::new(),
+            process_name: None,
+            started_ms: timestamp_ms,
+            keystrokes: 0,
+            baseline_trusted: false,
+        });
+        leaving
     }
 
     /// Whether a field is currently being watched. For diagnostics.
