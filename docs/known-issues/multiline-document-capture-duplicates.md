@@ -1,8 +1,9 @@
 # Multi-line documents capture cumulative text, so replay duplicates it
 
-**Status: FIXED for the append case** (2026-08-08). Two caveats remain and are
-stated in "What is not fixed" — mid-edit scenarios still emit the full value,
-and the `Document`-role path could not be re-tested this session.
+**Status: FIXED for the append case** (2026-08-08), and **verified on a real
+`Document`-role surface** (2026-08-11 — see "Document-role verification").
+One caveat remains and is stated in "What is not fixed": mid-edit scenarios
+still emit the full value.
 **Affected:** `src-tauri/src/capture/text.rs` — `TextFieldWatcher::flush`.
 **Not** limited to `Document`-role surfaces, contrary to this document's first
 version: a web `<textarea>` reports role `"Edit"`, identical to a single-line
@@ -165,6 +166,55 @@ the path every single-flush field depends on. The distinction is carried by
 | Exit path: Tab | 2 actions, replay matches exactly |
 | Full suite | 76 lib, 8 db_encryption, 12 ipc_commands, 2 replay_aborted pass; `ipc_pipeline` red on the separate no-settle race |
 
+## Document-role verification (2026-08-11)
+
+Verified. The evidence is the `notepadgrid` run recorded in
+`text-input-capture-truncation.md` § "Notepad verification (2026-08-11)", three
+identical runs against real Notepad:
+
+```
+  anchored on "paradigm-probe-….txt - Notepad", role="Document", verified empty
+
+    type  role=document  name="Text editor"  payload="alpha line\r"
+    type  role=document  name="Text editor"  payload="beta line\r"
+    type  role=document  name="Text editor"  payload="gammaburst"
+
+  concatenated payloads         : "alpha line\rbeta line\rgammaburst"
+  actually in the Notepad buffer: "alpha line\rbeta line\rgammaburst"
+```
+
+That run was commissioned for a *different* fix — the no-settle keystroke-focus
+race — so the question is whether it incidentally covers this one. It does, and
+not by coincidence: it drives **this document's own Evidence sequence**.
+
+* **The surface is right.** `role="Document"`, the exact path this item names,
+  anchored on a window whose emptiness was verified before typing.
+* **The duplication mechanism was exercised, twice.** Duplication arises from
+  flush-then-re-watch on a trigger key (see "Why two actions, and why the second
+  accumulates"). The probe presses **Enter twice**
+  (`text_capture_probe.rs:6690`, `:6702`), producing three flushes — so the
+  re-watch path ran on both, and `baseline_trusted: true` (`capture/text.rs:365`)
+  is reachable only from that path.
+* **The payloads are visibly deltas, which is the fix's signature.** Pre-fix,
+  flush 2 would have carried `"alpha line\rbeta line"` and flush 3 the whole
+  document. Observed instead: `"beta line\r"` and `"gammaburst"`. This is the
+  distinguishing observation — a pure timing fix would not change *what* a flush
+  emits.
+* **The assertion is the duplication assertion.** The probe computes
+  `concat(payloads) == buffer` (`text_capture_probe.rs:6743-6747`, `:6791`).
+  By this document's own correctness argument — replay types each payload at the
+  caret without clearing, so concatenating payloads is exactly what a replay
+  writes — that comparison *is* the replay-equivalence check. Cumulative payloads
+  cannot satisfy it; they are strictly longer, which is precisely the 30-vs-20
+  failure shape the `<textarea>` reproduced before the fix.
+
+**Scope, stated honestly.** This closes the append case on a `Document` surface,
+which is exactly the scope of what was fixed. It does not exercise mid-edit,
+still unfixed below. And it establishes replay-equivalence by concatenation
+rather than by a live replay into Notepad; the live-replay leg was run on the
+`<textarea>` ("replay matches exactly", in the fix's verification table). No
+re-run was needed to close this item.
+
 ## What is not fixed
 
 **Mid-edit still emits the full value.** A delta is only well-defined for an
@@ -173,20 +223,20 @@ emitting the whole field — which is precisely the pre-fix behaviour, so nothin
 regressed, but nothing improved either. A recording that edits into the middle
 of an existing paragraph and is flushed twice can still duplicate.
 
-**The `Document` path was not re-tested this session.** Verification ran against
-a web `<textarea>`, not Notepad. Windows 11 hands a fresh `notepad.exe` launch
-off to an already-running instance — measured directly, focus landed on pid
-18552 while the probe had launched 9596 — so Notepad cannot be targeted without
-risking typing into a window the probe does not own. That is the same hand-off
-documented in the no-settle-race investigation in
-`text-input-capture-truncation.md`. The `<textarea>` exercises the same code
-path (a multi-line surface flushed twice, delta emitted from a trusted
-baseline), so the fix is not believed to be role-specific — but "not believed
-to be" is weaker than "measured", and Notepad specifically is unverified.
+~~**The `Document` path was not re-tested this session.**~~ **Resolved
+2026-08-11 — see "Document-role verification" below.** The obstacle recorded
+here was real: Windows 11 hands a fresh `notepad.exe` launch off to an
+already-running instance — measured directly, focus landed on pid 18552 while
+the probe had launched 9596 — so Notepad could not be targeted without risking
+typing into a window the probe did not own. An earlier attempt demonstrated the
+risk concretely: an unscoped `role:Document` search matched a Spotify tab in the
+user's browser and typed probe text into it.
 
-An earlier attempt in this session to make the probe target Notepad safely also
-demonstrated the risk concretely: an unscoped `role:Document` search matched a
-Spotify tab in the user's browser and typed probe text into it.
+That obstacle was solved rather than worked around: launch `notepad.exe` with a
+**uniquely-named empty file**, so the window title is unambiguous *and* the
+buffer is empty by construction rather than by hope, then refuse to type unless
+the anchored surface is a Notepad window with a verified-empty body
+(`text_capture_probe.rs:6640-6660`).
 
 ## Why it matters
 
@@ -206,8 +256,12 @@ content into a real document.
 - [x] **Confirm the replay behaviour empirically.** Done — a live user session
       on 2026-08-08 replayed a recording that typed "Weekly summary draft"
       twice, and the probe reproduced it on a `<textarea>` before the fix.
-- [ ] **Verify the fix against a `Document`-role surface.** See "What is not
-      fixed" — Notepad could not be safely targeted this session.
+- [x] **Verify the fix against a `Document`-role surface.** Done 2026-08-11 —
+      three identical `notepadgrid` runs against real Notepad, `role="Document"`,
+      two Enters, payloads emitted as deltas and concatenating to the buffer
+      exactly. See "Document-role verification" above. Covered by a run
+      commissioned for the no-settle race fix, which drives this document's own
+      Evidence sequence; no separate run was needed.
 - [ ] **Decide whether mid-edit deserves a real answer**, or whether
       full-value-on-mid-edit is acceptable indefinitely.
 - [ ] **Decide what a multi-line action should carry — this is the real
@@ -223,7 +277,12 @@ content into a real document.
       surfaces.** In an `<input>`, Enter means "done". In a document it means
       "new line" and is not a completion signal at all — which is why this
       recording split into two actions rather than one in the first place.
-- [ ] **Check the same behaviour on other multi-line surfaces** — a browser
-      `<textarea>`, WordPad, VS Code — to establish whether "Document role"
-      is the right predicate for this handling or merely the one Notepad
-      happens to report.
+- [ ] **Check the same behaviour on other multi-line surfaces** — WordPad, VS
+      Code — to establish whether "Document role" is the right predicate for this
+      handling or merely the one Notepad happens to report. The `<textarea>`
+      (role `"Edit"`) and Notepad (role `"Document"`) legs are both now measured,
+      which is already evidence *against* role being the right predicate: the
+      same delta logic is correct on both, keyed on `baseline_trusted` rather
+      than on role. That is the intended design — see "Why not 'stop flushing on
+      Enter for multi-line fields'" — so this item is now about confirming the
+      generalisation, not about choosing a predicate.
