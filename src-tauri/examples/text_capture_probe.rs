@@ -7445,6 +7445,140 @@ async fn closewins_mode() -> ExitCode {
 // The control playbook is the point. "The row disappeared" is also what a
 // delete-everything bug looks like.
 
+// -------------------------------------------------------- multimon mode ----
+// Does the secondary-monitor click refusal still reproduce on 0.23.35, and does
+// the workaround replay actually ships still carry the click?
+//
+// The doc records this from 2026-08-03 and 2026-08-04. Re-measured rather than
+// assumed: the library version is pinned, but "the bug is still there" and "our
+// fallback still covers it" are separate claims and both decide what to do next.
+//
+// Nothing here clicks arbitrary UI. It opens the probe's own page positioned on
+// the secondary monitor and clicks a field in it, then proves the click landed
+// by checking what has focus afterwards.
+async fn multimon_mode() -> ExitCode {
+    println!("== secondary-monitor click refusal, re-measured ==\n");
+
+    println!(
+        "  per-monitor DPI aware BEFORE ensure_dpi_aware(): {}",
+        paradigm_lib::replay::is_per_monitor_dpi_aware()
+    );
+    paradigm_lib::replay::ensure_dpi_aware();
+    let dpi_ok = paradigm_lib::replay::is_per_monitor_dpi_aware();
+    println!("  per-monitor DPI aware AFTER:  {dpi_ok}");
+    if !dpi_ok {
+        println!("  !! the coordinate fallback needs this; results below are not trustworthy");
+    }
+
+    let page = std::env::temp_dir().join("paradigm-text-capture-probe.html");
+    if std::fs::write(&page, PAGE).is_err() {
+        eprintln!("could not write probe page");
+        return ExitCode::FAILURE;
+    }
+    let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+    let browser = browser_order()[0];
+    // Positioned on the secondary display. x=2000 is inside DISPLAY4, which
+    // starts at 1920 -- past the primary's width, which is the whole condition
+    // the defect turns on.
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "start",
+            "",
+            browser,
+            "--new-window",
+            "--window-position=2000,120",
+            "--window-size=900,600",
+            &url,
+        ])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("\n  opened the probe page at x=2000 (secondary display); waiting 12s...");
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let field = match desktop
+        .locator("role:Edit|name:FieldA")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            println!("  INCONCLUSIVE: FieldA not found: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let bounds = field.bounds().ok();
+    println!("\n  FieldA bounds: {bounds:?}");
+    let on_secondary = bounds.map(|(x, _, _, _)| x >= 1920.0).unwrap_or(false);
+    println!("  on the secondary display (x >= 1920): {on_secondary}");
+    if !on_secondary {
+        println!("\n  INCONCLUSIVE: the window did not land on the secondary display, so this");
+        println!("  run does not exercise the defect at all.");
+        return ExitCode::FAILURE;
+    }
+
+    // The two halves of the reported defect.
+    let visible = field.is_visible();
+    println!("\n  is_visible() : {visible:?}   (UIA says on-screen; the check disagrees)");
+    let clicked = field.click();
+    let refused = matches!(
+        clicked,
+        Err(terminator::AutomationError::ElementNotVisible(_))
+    );
+    println!("  click()      : {}", match &clicked {
+        Ok(_) => "Ok -- NOT refused".to_string(),
+        Err(e) => format!("Err {e}"),
+    });
+
+    // The workaround the product actually ships, exercised the same way
+    // replay::click does it.
+    let mut fallback_ok = false;
+    if let Some((x, y, w, h)) = bounds {
+        let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+        println!("\n  falling back to a real click at ({cx}, {cy})...");
+        match desktop.click_at_coordinates(cx, cy) {
+            Ok(_) => {
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                // Proof the click LANDED, not merely that the call returned Ok.
+                let focused = desktop
+                    .focused_element()
+                    .ok()
+                    .and_then(|el| el.name())
+                    .unwrap_or_default();
+                println!("  focused element afterwards: {focused:?}");
+                fallback_ok = focused == "FieldA";
+            }
+            Err(e) => println!("  coordinate click failed: {e}"),
+        }
+    }
+
+    println!("\n================ VERDICT ================\n");
+    println!("  defect still reproduces (click refused on secondary): {refused}");
+    println!("  is_visible() wrongly false                          : {:?}", visible.as_ref().map(|v| !v));
+    println!("  shipped workaround lands the click                  : {fallback_ok}");
+    println!("  process per-monitor DPI aware                       : {dpi_ok}");
+    if refused && fallback_ok {
+        println!("\n  Both halves confirmed: the library still refuses, and the coordinate");
+        println!("  fallback still covers it. Replay is mitigated, not fixed.");
+    } else if !refused {
+        println!("\n  The refusal did NOT reproduce. Either the library changed or the");
+        println!("  element was not where this run assumed.");
+    } else {
+        println!("\n  The refusal reproduces and the workaround did NOT land the click.");
+    }
+    ExitCode::SUCCESS
+}
+
 async fn seedplaybooks_mode() -> ExitCode {
     use paradigm_lib::capture::stream::{ActionCandidate, CapturedStream};
     use paradigm_lib::capture::{ActionKind, ExclusionList};
@@ -7708,6 +7842,9 @@ async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "multimon") {
+        return multimon_mode().await;
+    }
     if std::env::args().any(|a| a == "seedplaybooks") {
         return seedplaybooks_mode().await;
     }

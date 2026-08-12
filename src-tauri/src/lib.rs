@@ -108,6 +108,22 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
                 Err(e) => eprintln!("[paradigm] labeling model unavailable: {e}"),
             }
 
+            // Replay's coordinate-click fallback -- the workaround for the
+            // secondary-monitor click refusal -- silently clicks the wrong
+            // place unless this process is per-monitor DPI aware. That coupling
+            // was flagged as invisible to callers and easy to break, so the app
+            // states it at startup instead of leaving it to be discovered by a
+            // misplaced click on someone's second display.
+            //
+            // Reported, not enforced: forcing an awareness here would change how
+            // the app's own window scales, which is a rendering decision rather
+            // than an automation one.
+            // See docs/known-issues/terminator-multi-monitor-visibility.md.
+            eprintln!(
+                "[paradigm] per-monitor DPI aware: {}",
+                replay::is_per_monitor_dpi_aware()
+            );
+
             app.manage(AppState {
                 db: tokio::sync::Mutex::new(conn),
                 db_path,

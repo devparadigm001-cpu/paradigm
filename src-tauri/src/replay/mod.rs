@@ -244,6 +244,34 @@ pub fn ensure_dpi_aware() {
     });
 }
 
+/// Is this process actually per-monitor DPI aware?
+///
+/// `ensure_dpi_aware` discards its return value, and that is not an oversight
+/// that can be fixed by checking it: `SetProcessDpiAwarenessContext` FAILS when
+/// awareness was already set — which is what happens in a host that ships a DPI
+/// manifest, and in that case the process may already be correct. Success and
+/// failure of the setter therefore say nothing useful on their own.
+///
+/// What matters is the state afterwards, so this asks for it directly. It exists
+/// because the coordinate-click fallback silently clicks the wrong place when the
+/// process is not per-monitor aware — the coupling the known-issues doc calls
+/// "invisible to callers and easy to break". Now it is answerable.
+///
+/// See docs/known-issues/terminator-multi-monitor-visibility.md.
+pub fn is_per_monitor_dpi_aware() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::HiDpi::{
+            GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+            DPI_AWARENESS_PER_MONITOR_AWARE,
+        };
+        GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext())
+            == DPI_AWARENESS_PER_MONITOR_AWARE
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 /// What a compiled step's payload JSON carries.
 struct StepPayload {
     selector: Option<String>,
@@ -994,12 +1022,25 @@ fn click(
         Err(AutomationError::ElementNotVisible(msg)) => match element.bounds() {
             Ok((x, y, w, h)) if w > 0.0 && h > 0.0 => {
                 let (cx, cy) = (x + w / 2.0, y + h / 2.0);
+                // The fallback mixes UIA bounds (physical pixels) with screen
+                // coordinates, so it lands in the wrong place -- silently, with
+                // no error and no effect -- unless this process is per-monitor
+                // DPI aware. Said out loud in the step detail rather than left
+                // as an invisible precondition, because the failure it causes
+                // looks like "the click did nothing" rather than like a DPI
+                // problem. Measured: a click meant for x=2888 went to ~3611.
+                let dpi_note = if is_per_monitor_dpi_aware() {
+                    ""
+                } else {
+                    " -- WARNING: this process is not per-monitor DPI aware, so this \
+                     coordinate may be wrong"
+                };
                 match desktop.click_at_coordinates(cx, cy) {
                     Ok(()) => mk(
                         StepResult::ExecutedViaCoordinateClick,
                         format!(
                             "element.click() refused ({msg}); clicked real coordinates \
-                             ({cx:.0}, {cy:.0}) instead -- known multi-monitor defect"
+                             ({cx:.0}, {cy:.0}) instead -- known multi-monitor defect{dpi_note}"
                         ),
                     ),
                     Err(e) => mk(
