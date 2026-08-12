@@ -1014,6 +1014,82 @@ Every probe to date used simple `<input>` elements or Notepad, and every one
 passed. One human session against a real target surfaced two problems
 immediately. Probe coverage has been measuring the environment it was built for.
 
+## Absolute cell references are the decision (2026-08-12)
+
+**Settled, not still open.** A grid edit replays to the cell reference it was
+recorded against: `B2` records as `B2` and replays as `B2`. This is the final
+behaviour, and `grid_type`'s Name Box navigation already implements it.
+
+**Why absolute is right for the primary use case.** The product automates
+repetitive drafting and form-filling against fixed-layout documents — an invoice
+template, a weekly report, a data-entry sheet where the same field lives in the
+same place every time. In all of those, "write the total into `D14`" is exactly
+what the user means, and it stays correct however many times it runs. Absolute is
+not a limitation there; it is the requirement.
+
+**Relative/offset replay is a future feature, not a defect.** Append-style entry
+— "add a row at the bottom of whatever is there now" — is a genuine and different
+need, and absolute references cannot express it. That is worth building later. It
+is recorded here as a **feature to consider**, and deliberately not as a bug,
+because the current behaviour is not wrong: it is one of two valid semantics, and
+it is the one the primary use case needs.
+
+What such a feature would have to settle, so the note is useful rather than
+decorative:
+
+* **How the recording expresses intent.** The capture carries a bare cell
+  reference and nothing that distinguishes "this exact cell" from "the next free
+  row". Intent cannot be inferred after the fact from `B2` alone, so either the
+  user states it or the recorder infers it from context — and inference here
+  would be guessing at the user's meaning, which this project has repeatedly
+  found to be the expensive kind of wrong.
+* **What an offset is relative to.** The last written row, the end of a data
+  region, or a named anchor are three different answers that disagree the moment
+  the sheet is not shaped the way the recording assumed.
+
+Neither is urgent, and neither blocks Phase 2.
+
+## The sheet-name gap (2026-08-12)
+
+**This is a defect, and it is separate from the decision above.** Deciding
+absolute references does not resolve it — it sharpens it. "Always write `B2`" is
+only well-defined once you know *which sheet's* `B2`.
+
+Nothing in the pipeline carries a sheet identity. `looks_like_cell_ref`
+(`capture/grid.rs:86`) caps the column run at three letters *specifically so
+`"Sheet1"` does not parse as a cell*, and the tests pin that
+(`cell_references_are_recognised_and_other_names_are_not` rejects `"Sheet1"`).
+So capture records `B2`, replay types `B2` into the Name Box, and the Name Box
+resolves it **within whatever tab is active at that moment**. A playbook recorded
+on `Sheet2` and replayed with `Sheet1` in front writes to the wrong sheet, and
+every step reports success.
+
+That is the silent-wrong-target failure class this project has now hit five times
+— not a design choice, and not something to bundle with the relative-replay
+feature above. Bundling them would let a real defect inherit a feature's priority.
+
+**Why it is not fixed today, stated honestly.** The likely fix is cheap *if* one
+assumption holds: Sheets' Name Box accepts a **qualified** reference
+(`Sheet2!B2`), in which case replay needs no separate sheet-selection step and
+`grid_type` changes by one string. That assumption is **untested**. Both halves
+need measurement against live Google Sheets:
+
+1. **Does the Name Box accept `Sheet2!B2`** and move the cursor across tabs?
+   Verified the way the rest of this document verifies things — by CSV export,
+   not by reading the UI that produced it.
+2. **Can capture obtain the active sheet name** at edit time? The sheet tabs are
+   in the accessibility tree, but which element reports the *selected* one, and
+   whether it is readable at the moment the editor appears, has not been checked.
+
+Guessing either would produce exactly the kind of confident, unverified claim
+this file has already had to retract once. The measurement is a `sheetsedit`-style
+probe run, which creates a real spreadsheet in the signed-in Drive account — a
+deliberate act, not something to fold into a routine sweep.
+
+**Until then, the exposure is bounded and worth stating:** single-sheet
+workbooks, which is what every measurement in this document used, are unaffected.
+The gap needs a multi-sheet workbook *and* a tab change between record and replay.
+
 ## Next steps
 
 - [x] ~~**Decide how clipboard operations should be modelled at all.**~~
@@ -1080,13 +1156,19 @@ immediately. Probe coverage has been measuring the environment it was built for.
       reaches the cell through the Name Box, which is element-based rather than
       coordinate-based. Recorded edits replay into a fresh document, 3/3 by CSV,
       twice. See "Replay of grid edits: implemented".
-- [ ] **Decide what a grid edit should mean on replay.** The cell reference is
-      absolute, so a playbook recorded against `B2` always writes `B2`. Right for
-      fixed-layout forms, wrong for append-style data entry, and the recording
-      carries nothing that distinguishes the two. A design question, not a bug.
-- [ ] **Carry the sheet name.** A reference alone replays into whichever tab is
-      active, so a multi-sheet workbook can be written to the wrong sheet with
-      everything reporting success.
+- [x] ~~**Decide what a grid edit should mean on replay.**~~ **Decided
+      2026-08-12: absolute, by design.** A playbook recorded against `B2` always
+      writes `B2`, and that is the intended final behaviour — see "Absolute cell
+      references are the decision". Relative/offset replay is a **future
+      feature**, not a defect in this behaviour.
+- [ ] **Carry the sheet name — reclassified as a defect, 2026-08-12.** A
+      reference alone replays into whichever tab is active, so a multi-sheet
+      workbook can be written to the wrong sheet with everything reporting
+      success. Deliberately **not** deferred alongside relative replay: that is a
+      choice between two valid behaviours, this is the silent-wrong-target
+      failure class. Deferred because the fix is unmeasured, not because it is
+      minor — see "The sheet-name gap" for the hypothesis and what must be
+      measured.
 - [x] ~~**Measure the per-keystroke cost.**~~ **Measured: 2.22 ms per keystroke,
       and a confirmed non-issue.** The suspicion did not survive an A/B — see
       "The per-keystroke cost, measured".

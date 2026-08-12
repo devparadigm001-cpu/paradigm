@@ -137,22 +137,27 @@ pub struct StoredStepLog {
     pub timestamp: String,
 }
 
+/// The column list every `runs` query selects, in the order `row_to_run` reads.
+/// Kept in one place so the three readers cannot drift apart.
+const RUN_COLUMNS: &str = "id, playbook_id, feature, status, billable, started_at, completed_at";
+
+fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<StoredRun> {
+    Ok(StoredRun {
+        id: r.get(0)?,
+        playbook_id: r.get(1)?,
+        feature: r.get(2)?,
+        status: r.get(3)?,
+        billable: r.get::<_, i64>(4)? != 0,
+        started_at: r.get(5)?,
+        completed_at: r.get(6)?,
+    })
+}
+
 pub fn load_run(conn: &Connection, run_id: &str) -> Result<StoredRun, DbError> {
     Ok(conn.query_row(
-        "SELECT id, playbook_id, feature, status, billable, started_at, completed_at
-           FROM runs WHERE id = ?1",
+        &format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1"),
         [run_id],
-        |r| {
-            Ok(StoredRun {
-                id: r.get(0)?,
-                playbook_id: r.get(1)?,
-                feature: r.get(2)?,
-                status: r.get(3)?,
-                billable: r.get::<_, i64>(4)? != 0,
-                started_at: r.get(5)?,
-                completed_at: r.get(6)?,
-            })
-        },
+        row_to_run,
     )?)
 }
 
@@ -161,23 +166,38 @@ pub fn load_runs_for_playbook(
     conn: &Connection,
     playbook_id: &str,
 ) -> Result<Vec<StoredRun>, DbError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, playbook_id, feature, status, billable, started_at, completed_at
-           FROM runs
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RUN_COLUMNS} FROM runs
           WHERE playbook_id = ?1
-          ORDER BY started_at DESC, id",
-    )?;
-    let rows = stmt.query_map([playbook_id], |r| {
-        Ok(StoredRun {
-            id: r.get(0)?,
-            playbook_id: r.get(1)?,
-            feature: r.get(2)?,
-            status: r.get(3)?,
-            billable: r.get::<_, i64>(4)? != 0,
-            started_at: r.get(5)?,
-            completed_at: r.get(6)?,
-        })
-    })?;
+          ORDER BY started_at DESC, id"
+    ))?;
+    let rows = stmt.query_map([playbook_id], row_to_run)?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Runs that no longer belong to a playbook, most recent first.
+///
+/// These are unreachable through `load_runs_for_playbook`, which needs an id to
+/// ask for: once `playbook_id` is NULL there is no id to pass. That is the whole
+/// reason this exists -- the schema deliberately keeps the history and, until
+/// this, nothing could read it back. See
+/// `docs/known-issues/no-way-to-delete-playbooks.md`.
+///
+/// **What NULL means here.** `migrations/20260803000002_init_runs.sql` gives
+/// `playbook_id` `ON DELETE SET NULL` with the comment "run history must outlive
+/// its playbook", and documents NULL as *also* marking an ad-hoc run that was
+/// never recorded as a playbook. Those two causes are indistinguishable in the
+/// schema. Today only one of them can occur: `start_run` takes `&str`, not
+/// `Option<&str>`, so every run is created attached and a NULL can only have
+/// come from a deletion. If an ad-hoc run path is ever added, this query starts
+/// returning both and telling them apart needs a column that does not exist yet.
+pub fn load_orphaned_runs(conn: &Connection) -> Result<Vec<StoredRun>, DbError> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RUN_COLUMNS} FROM runs
+          WHERE playbook_id IS NULL
+          ORDER BY started_at DESC, id"
+    ))?;
+    let rows = stmt.query_map([], row_to_run)?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 

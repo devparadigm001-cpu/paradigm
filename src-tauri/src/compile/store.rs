@@ -379,6 +379,103 @@ mod tests {
         );
     }
 
+    /// The retained history is not just retained, it is READABLE.
+    ///
+    /// The test above proves the run survives its playbook with a NULL
+    /// `playbook_id`. Surviving is not the same as being reachable: the only
+    /// reader was `load_runs_for_playbook`, which needs an id to ask for, and
+    /// after deletion there is no id to pass. So the history was being kept and
+    /// could not be got back -- the open item in
+    /// `docs/known-issues/no-way-to-delete-playbooks.md`.
+    ///
+    /// This drives the whole path against a real encrypted database: store a
+    /// playbook, run it, log real step events, delete it, then read the run and
+    /// its logs back through `load_orphaned_runs`.
+    #[test]
+    fn a_deleted_playbooks_run_history_is_still_readable_through_the_orphan_path() {
+        use crate::replay::journal::{
+            self, load_orphaned_runs, load_step_logs, StepLogEntry, EVENT_EXECUTE,
+        };
+
+        let dir = TempDir::new().expect("temp dir");
+        let playbook = compile(
+            &clicks(&["Send", "Cancel"]),
+            "Has History",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        {
+            let mut conn = scratch_db(&dir);
+            store(&mut conn, &playbook).expect("store playbook");
+        }
+        let conn = scratch_db(&dir);
+
+        // A run with real logged events, so there is history worth keeping.
+        let run_id = journal::start_run(&conn, &playbook.id).expect("start run");
+        for (order, action) in [(1_i64, "click"), (2, "click")] {
+            journal::log_step(
+                &conn,
+                &run_id,
+                &StepLogEntry {
+                    playbook_step_id: None,
+                    step_order: order,
+                    action_type: action.to_string(),
+                    target_ui_context_json: "{}".to_string(),
+                    data_payload: None,
+                    is_sensitive: false,
+                    event_type: EVENT_EXECUTE.to_string(),
+                    model_source: None,
+                    cost: 0.0,
+                    foreground_app: "probe".to_string(),
+                },
+            )
+            .expect("log step");
+        }
+        journal::finish_run(&conn, &run_id, "completed").expect("finish run");
+
+        // Before deletion it is reachable the ordinary way.
+        assert_eq!(
+            journal::load_runs_for_playbook(&conn, &playbook.id)
+                .expect("load runs")
+                .len(),
+            1
+        );
+        assert!(
+            load_orphaned_runs(&conn).expect("load orphans").is_empty(),
+            "nothing is orphaned yet"
+        );
+
+        delete(&conn, &playbook.id).expect("delete playbook");
+
+        // The ordinary reader can no longer see it -- this is the gap.
+        assert!(
+            journal::load_runs_for_playbook(&conn, &playbook.id)
+                .expect("load runs")
+                .is_empty(),
+            "after deletion the run is unreachable by playbook id, which is why \
+             the orphan path exists"
+        );
+
+        // The new path finds it, and it is the same run.
+        let orphans = load_orphaned_runs(&conn).expect("load orphans");
+        assert_eq!(orphans.len(), 1, "the detached run should be readable");
+        assert_eq!(orphans[0].id, run_id);
+        assert_eq!(orphans[0].playbook_id, None);
+        assert_eq!(orphans[0].status, "completed");
+        assert!(
+            orphans[0].started_at.is_some(),
+            "the run's timing should survive with it"
+        );
+
+        // And the step log survived too -- the part that makes history useful.
+        let logs = load_step_logs(&conn, &run_id).expect("load step logs");
+        assert_eq!(logs.len(), 2, "both logged events should survive deletion");
+        assert_eq!(
+            logs.iter().map(|l| l.step_order).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
     /// Layer 2 of the process-name plumbing: it must survive compile, the
     /// store, and the read back. Verified against a real encrypted database
     /// rather than by inspecting the JSON that `compile` builds, because the

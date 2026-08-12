@@ -4,8 +4,8 @@
 and a delete control with a naming confirmation all exist, and deletion was
 driven through the real app UI against a scratch store with the result verified
 in the database. Everything below the "Implemented" section describes the
-original gap. One follow-up remains open: orphaned run history is still
-unreadable.
+original gap. **The last follow-up closed 2026-08-12:** orphaned run history is
+now readable — see "Orphaned run history is readable".
 **Affected:** `src-tauri/src/commands.rs` (no command), `src-tauri/src/compile/
 store.rs` (no SQL), and the frontend's stored-playbooks list (no control).
 **Found:** 2026-08-07, during real user testing.
@@ -275,6 +275,83 @@ before crediting the name. Its first enumeration of the webview also came back
 `Err` and was swallowed by `if let Ok(...)`, reporting an empty list for a UI
 that had rendered perfectly; it now retries and prints the error.
 
+## Orphaned run history is readable (2026-08-12)
+
+The last open item. The schema had already decided the policy — keep the history
+— and that decision is reaffirmed, not revisited. What was missing was a way to
+get it back.
+
+### The gap was reachability, not retention
+
+`migrations/20260803000002_init_runs.sql` gives `runs.playbook_id`
+`ON DELETE SET NULL`, with the comment *"run history must outlive its playbook"*.
+That worked: the existing test
+`deleting_a_playbook_removes_its_steps_but_detaches_rather_than_deletes_runs`
+proves the row survives with a NULL `playbook_id`.
+
+**Surviving is not the same as being reachable.** The only reader was
+`journal::load_runs_for_playbook`, which takes an id to look up — and after
+deletion there is no id to pass. The history was being retained and could not be
+read by anything. That is retention with no purpose, which is why the original
+item offered "or revisit whether retaining them serves any purpose" as the
+alternative. Retention serves a purpose now.
+
+### What was built
+
+* **`journal::load_orphaned_runs(conn)`** — `WHERE playbook_id IS NULL`, most
+  recent first, mirroring `load_runs_for_playbook`'s ordering.
+* **`get_orphaned_run_history`** — a new IPC command taking **no arguments**,
+  which is the honest signature: there is no id to scope by, and that is exactly
+  what makes these runs orphaned. Extending `get_run_history` was considered and
+  rejected — it is keyed on a `playbook_id` that cannot express NULL.
+* Both history commands now share `runs_with_logs`, so they cannot present the
+  same rows differently. The three `runs` readers also share one column list and
+  one row mapper, which previously existed in triplicate.
+
+### Verified, not assumed
+
+`a_deleted_playbooks_run_history_is_still_readable_through_the_orphan_path`
+drives the whole path against a **real encrypted database**: store a playbook,
+start a run, log two real step events, finish it, delete the playbook, read it
+back. It asserts the gap as well as the fix — that after deletion
+`load_runs_for_playbook` returns **empty**, which is why the orphan path has to
+exist — then that `load_orphaned_runs` returns the same run id with
+`playbook_id: None`, status `completed`, its timing intact, and **both step-log
+rows still present**. Step logs matter: a run with no events is not history.
+
+```
+test compile::store::tests::a_deleted_playbooks_run_history_is_still_readable_through_the_orphan_path ... ok
+test result: ok. 105 passed; 0 failed
+```
+
+Reachability over the real IPC boundary is covered by
+`every_registered_command_is_reachable_over_ipc`, which the new command was added
+to — a command can compile and be listed in `generate_handler!` and still be
+unreachable:
+
+```
+test every_registered_command_is_reachable_over_ipc ... ok
+test result: ok. 15 passed; 0 failed
+```
+
+### One limitation, stated rather than papered over
+
+**NULL is overloaded.** The same migration documents NULL as *also* marking an
+ad-hoc run that was never recorded as a playbook, so the schema cannot
+distinguish "orphaned by deletion" from "never had a playbook".
+
+Today that ambiguity is harmless, and for a checkable reason rather than by
+luck: `journal::start_run` takes `&str`, not `Option<&str>`, so every run is
+created attached and a NULL can only have come from a deletion. If an ad-hoc run
+path is ever added, this command starts returning both kinds mixed together, and
+telling them apart needs a column that does not exist yet. Recorded on
+`load_orphaned_runs` itself, where someone adding that path will be reading.
+
+**No frontend surface yet.** The command exists and is reachable; nothing in the
+UI calls it. That is deliberate — the read path is what the schema's retention
+promise required, and where orphaned history belongs in the interface is a
+product question, not a defect.
+
 ## Next steps
 
 - [x] ~~**Add `delete_playbook(playbook_id)`.**~~ Already existed when this was
@@ -299,6 +376,10 @@ that had rendered perfectly; it now retries and prints the error.
       the real UI. Original scope:
       Deletion is irreversible and there is no undo, so the confirmation should
       name the playbook being deleted rather than being a generic prompt.
-- [ ] **Decide what happens to orphaned run history** — see above. Either add a
+- [x] ~~**Decide what happens to orphaned run history** — see above. Either add a
       way to read runs whose playbook is gone, or revisit whether retaining
-      them serves any purpose.
+      them serves any purpose.~~ **Decided and built 2026-08-12: keep them, and
+      make them readable.** `journal::load_orphaned_runs` +
+      `get_orphaned_run_history`, verified end to end against a real encrypted
+      database and over the real IPC boundary. See "Orphaned run history is
+      readable".

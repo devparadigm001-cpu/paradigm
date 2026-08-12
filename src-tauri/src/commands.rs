@@ -475,10 +475,38 @@ pub async fn get_run_history(
 ) -> Result<Vec<RunHistoryEntry>, String> {
     let conn = state.db.lock().await;
     let runs = journal::load_runs_for_playbook(&conn, &playbook_id).map_err(|e| e.to_string())?;
+    runs_with_logs(&conn, runs)
+}
 
+/// Past runs whose playbook has been deleted, with their step logs.
+///
+/// The counterpart to `get_run_history`, which cannot reach these: it takes a
+/// `playbook_id` to look up, and these rows no longer have one. Deleting a
+/// playbook detaches its runs rather than removing them —
+/// `migrations/20260803000002_init_runs.sql` says "run history must outlive its
+/// playbook" — so without this the retained history was unreadable.
+///
+/// Takes no arguments deliberately. There is no id to scope by, which is
+/// precisely what makes these runs orphaned. `RunHistoryEntry` carries no
+/// `playbook_id` because for every row here it would be null.
+#[tauri::command]
+pub async fn get_orphaned_run_history(
+    state: State<'_, AppState>,
+) -> Result<Vec<RunHistoryEntry>, String> {
+    let conn = state.db.lock().await;
+    let runs = journal::load_orphaned_runs(&conn).map_err(|e| e.to_string())?;
+    runs_with_logs(&conn, runs)
+}
+
+/// Attach each run's step log. Shared by both history commands so they cannot
+/// present the same rows differently.
+fn runs_with_logs(
+    conn: &rusqlite::Connection,
+    runs: Vec<journal::StoredRun>,
+) -> Result<Vec<RunHistoryEntry>, String> {
     let mut out = Vec::with_capacity(runs.len());
     for run in runs {
-        let steps = journal::load_step_logs(&conn, &run.id).map_err(|e| e.to_string())?;
+        let steps = journal::load_step_logs(conn, &run.id).map_err(|e| e.to_string())?;
         out.push(RunHistoryEntry {
             run_id: run.id,
             feature: run.feature,

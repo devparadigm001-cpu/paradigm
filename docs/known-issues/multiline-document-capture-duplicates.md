@@ -215,6 +215,45 @@ rather than by a live replay into Notepad; the live-replay leg was run on the
 `<textarea>` ("replay matches exactly", in the fix's verification table). No
 re-run was needed to close this item.
 
+## What a multi-line action carries: settled (2026-08-12)
+
+**The delta since the last flush.** Shipped, tested, and verified on both a web
+`<textarea>` and a real `Document`-role surface. This is the final decision.
+
+The three options this document listed were not equally live. **Replay has no
+clearing mechanism**, and that single fact eliminates two of them.
+
+`replay::type_text` calls `element.type_text(text, false)`. With
+`use_clipboard: false` that routes to the library's `send_text`, which sends the
+string key by key **at the caret, without clearing the surface first**. So what a
+replay writes into a document is the concatenation of the payloads it types.
+Nothing in the replay path can replace a document's contents, and nothing was
+built to.
+
+That makes the decision an identity rather than a preference:
+
+* **Delta since the last flush — chosen.** Payloads concatenate to exactly the
+  recorded document, because each carries only what was added since the previous
+  flush. Verified by concatenation against the live buffer on Notepad
+  (`"alpha line\r"` + `"beta line\r"` + `"gammaburst"` = the buffer, three
+  identical runs) and by a real replay on a `<textarea>`.
+* **Whole document with replace-semantics — rejected.** It requires replay to
+  clear the surface before typing, which does not exist. Building it would mean
+  destroying content in the replay target, which is unsafe whenever the target
+  starts from different contents than the recording did — and a document
+  automation tool cannot assume it starts from empty. Cumulative payloads without
+  clearing are precisely the duplication bug this file documents.
+* **One action per document, emitted at the end — rejected.** It would compose
+  correctly, since one payload trivially concatenates to itself. It was rejected
+  for what it costs elsewhere: a playbook becomes a single opaque blob, losing
+  the per-step structure that makes it reviewable and editable before replay,
+  which is a core property of the product. It also cannot represent a document
+  the user edits, leaves, and returns to.
+
+Note what this decision does **not** cover: a delta is only well-defined for an
+**append**. Mid-edit still emits the full value, which remains open below and is
+unaffected by settling this question.
+
 ## What is not fixed
 
 **Mid-edit still emits the full value.** A delta is only well-defined for an
@@ -264,15 +303,11 @@ content into a real document.
       Evidence sequence; no separate run was needed.
 - [ ] **Decide whether mid-edit deserves a real answer**, or whether
       full-value-on-mid-edit is acceptable indefinitely.
-- [ ] **Decide what a multi-line action should carry — this is the real
-      design question.** Options, none obviously right:
-      *the delta since the last flush* (replay appends; needs the delta to be
-      well-defined when the user edits in the middle rather than only at the
-      end); *the whole document with replace-semantics on replay* (requires
-      replay to clear the surface first, which is destructive if the recording
-      and the replay target start from different contents); or *one action per
-      document, emitted only at the end* (simple, but loses the intermediate
-      structure that makes a playbook reviewable).
+- [x] ~~**Decide what a multi-line action should carry — this is the real
+      design question.**~~ **Decided 2026-08-12: the delta since the last
+      flush**, which is the shipped and tested behaviour. It is not one of three
+      live options — it is the only one consistent with how replay actually
+      works. See "What a multi-line action carries: settled".
 - [ ] **Decide whether Enter should remain a trigger key for multi-line
       surfaces.** In an `<input>`, Enter means "done". In a document it means
       "new line" and is not a completion signal at all — which is why this

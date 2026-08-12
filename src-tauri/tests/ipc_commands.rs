@@ -150,6 +150,7 @@ const REGISTERED_COMMANDS: &[(&str, &str)] = &[
     ("delete_playbook", r#"{"playbookId":"does-not-exist"}"#),
     ("replay_playbook", r#"{"playbookId":"does-not-exist"}"#),
     ("get_run_history", r#"{"playbookId":"does-not-exist"}"#),
+    ("get_orphaned_run_history", "{}"),
 ];
 
 /// The Step 1 regression test, extended to all eight commands.
