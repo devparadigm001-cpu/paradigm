@@ -63,6 +63,9 @@ pub struct CaptureSummary {
     pub action_count: usize,
     pub excluded_count: usize,
     pub unmapped_events: usize,
+    /// Pastes seen. Non-zero means the recording may be missing data movement
+    /// that no action records -- see `CaptureReport::pastes_observed`.
+    pub pastes_observed: usize,
     pub actions: Vec<CapturedActionView>,
 }
 
@@ -271,6 +274,7 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
         action_count: report.actions.len(),
         excluded_count: report.exclusions.len(),
         unmapped_events: report.unmapped_events,
+        pastes_observed: report.pastes_observed,
         actions: view_of(&report.actions, &policy),
     };
 

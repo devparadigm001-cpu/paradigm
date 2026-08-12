@@ -196,6 +196,7 @@ mod tests {
         s.admit(ActionCandidate {
             kind,
             identifiers: vec!["app.exe".into()],
+            process_name: None,
             element_role: role.map(str::to_string),
             element_name: name.map(str::to_string),
             payload: payload.map(str::to_string),

@@ -1,6 +1,11 @@
 # terminator-rs: clicks are refused on secondary monitors
 
-**Status:** confirmed locally, **not yet reported upstream** (mediar-ai/terminator).
+**Status: MITIGATED, and re-verified on real hardware 2026-08-11.** The defect is
+unchanged in `terminator-rs` 0.23.35 and is **not fixed** — the workaround in
+`replay::click` is what makes multi-monitor replay work, and it was measured
+doing so on a genuine two-monitor setup rather than assumed. The decision on
+upstream / vendoring / workaround is recorded under "The decision". Still **not
+reported upstream**.
 **Affected version:** `terminator-rs` 0.23.35 (crate lib name `terminator`).
 **Platform:** Windows, multi-monitor only.
 **Found:** 2026-08-03, during the Phase 1 Step 2 Terminator capability probe.
@@ -209,10 +214,110 @@ primary has negative coordinates, which would produce a negative normalised
 value. We have not tested that layout and it may genuinely break. Worth checking
 before assuming multi-monitor support is complete.
 
+## The decision (2026-08-11)
+
+### Re-measured first, on a real two-monitor machine
+
+This machine has the exact layout the defect needs — a secondary display to the
+right of the primary:
+
+```
+\\.\DISPLAY1 primary=True  bounds={X=0,Y=0,Width=1536,Height=864}
+\\.\DISPLAY4 primary=False bounds={X=1920,Y=0,Width=1920,Height=1080}
+```
+
+(The primary reporting 1536×864 is this document's DPI finding showing up live:
+that reading came from a DPI-unaware shell.)
+
+`text_capture_probe -- multimon` opens the probe page positioned at x=2000 and
+exercises both halves. Nothing in it clicks arbitrary UI:
+
+```
+  FieldA bounds: Some((2180.0, 407.0, 498.0, 41.0))
+  on the secondary display (x >= 1920): true
+
+  is_visible() : Ok(false)   (UIA says on-screen; the check disagrees)
+  click()      : Err Element is not visible: Element not visible
+
+  falling back to a real click at (2429, 428)...
+  focused element afterwards: "FieldA"
+```
+
+Both claims hold: the library **still refuses** the click, and the coordinate
+fallback **still lands it** — proven by what holds focus afterwards, not by the
+call returning `Ok`.
+
+### Why not vendor or patch the dependency
+
+Same reasoning as `press-key-enter-injects-end-keystroke.md`, and it applies more
+strongly here. `Cargo.toml` has no `[patch]` section and no `path`/`git`
+dependencies; patching would be a new pattern to re-apply and re-verify on every
+version bump. And unlike a latent defect, this one is already covered: the
+workaround is in the product path and now has evidence behind it.
+
+### Why upstream is right but cannot be the answer here
+
+`MonitorFromRect` + `GetMonitorInfoW`'s `rcWork` is the correct fix and belongs
+in the library — the "Correct fix (upstream)" section above still stands
+unchanged. But it lands on someone else's timeline against a version this project
+pins, so it cannot be what protects replay today. Filing it stays open.
+
+### So: the workaround, made honest rather than invisible
+
+The workaround already existed in `replay::click`. What this session changed is
+the two things the doc called out as fragile about depending on it.
+
+**The DPI coupling is now checkable.** `replay::is_per_monitor_dpi_aware()`
+reports the process's actual awareness. Note why the obvious version of this
+would have been wrong: `SetProcessDpiAwarenessContext` *fails* when awareness was
+already set, which is exactly what happens under a host that ships a DPI
+manifest — so checking the setter's return value says nothing. Asking for the
+resulting state does.
+
+**The failure is no longer silent.** If the coordinate fallback runs in a process
+that is not per-monitor aware, the step detail now says so. That failure
+otherwise looks like "the click did nothing" rather than like a DPI problem —
+measured previously as a click meant for x=2888 landing at ~3611.
+
+### Item 3 answered: the Tauri app is already per-monitor DPI aware
+
+The app now states it at startup, and it reads:
+
+```
+[paradigm] per-monitor DPI aware: true
+```
+
+That is **before** `replay()` calls `ensure_dpi_aware()` — Tauri's own binary is
+manifested per-monitor aware, so the app was always correct here and
+`ensure_dpi_aware` is a no-op belt-and-braces for it. Reported rather than
+enforced at startup: forcing an awareness there would change how the app's own
+window scales, which is a rendering decision, not an automation one.
+
+One caveat on the probe's own output, so it is not over-read: its `main()` calls
+`ensure_dpi_aware()` before any mode runs, so the "BEFORE: true" line it prints
+says nothing about a fresh process. The app's startup line is the one that
+answers the question.
+
 ## Next steps
 
-- [ ] **Raised priority:** decide whether to report upstream, patch a vendored
-      copy, or carry the workaround. Now blocking clean replay on multi-monitor
-      setups rather than merely inconveniencing probes.
-- [ ] Test a monitor positioned left of / above the primary.
-- [ ] Confirm the Tauri app binary's DPI awareness before Phase 2 automation.
+- [x] ~~**Raised priority:** decide whether to report upstream, patch a vendored
+      copy, or carry the workaround.~~ **Decided: carry the workaround**, which
+      already existed, and make its two fragile parts visible instead of
+      implicit. Vendoring rejected on precedent and maintenance cost; upstream is
+      the correct fix but cannot protect a pinned version on our timeline. See
+      "The decision".
+- [x] ~~Confirm the Tauri app binary's DPI awareness before Phase 2 automation.~~
+      **Confirmed per-monitor aware**, from Tauri's own manifest, before
+      `ensure_dpi_aware()` is reached. The app states it at startup.
+- [ ] **Report it upstream** (mediar-ai/terminator): `is_visible()` should
+      intersect against the work area of the monitor containing the element
+      (`MonitorFromRect` + `GetMonitorInfoW`'s `rcWork`), not `SPI_GETWORKAREA`.
+      Not filable from this session; the fix is written out above.
+- [ ] Test a monitor positioned left of / above the primary. **Not tested** — it
+      needs a display arrangement this machine does not have, and rearranging a
+      user's monitors is not something to do for a test. The concern is real:
+      negative coordinates would produce a negative normalised value in
+      `click_at_coordinates`, and nothing has exercised that.
+- [ ] **Re-check on upgrade.** Pinned to 0.23.35 and re-measured there. If the
+      version moves, re-run `text_capture_probe -- multimon`: if the refusal
+      stops reproducing, the workaround becomes dead weight and should go.

@@ -48,9 +48,66 @@
 //! so a field first focused by Tab alone is not watched. See the known-issues
 //! doc for the follow-up.
 
-use terminator::UIElement;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+use terminator::{Desktop, UIElement};
 
 use super::stream::{ActionCandidate, ActionKind};
+
+// ---------------------------------------------------------- instrumentation --
+//
+// Off by default; when off the cost is one relaxed atomic load.
+//
+// Deliberately an in-memory buffer rather than `tracing`. This defect is a
+// Heisenbug: the original investigation recorded that enabling the recorder's
+// tracing output made it VANISH (4/4 events, all exact), because log I/O shifts
+// the timing. Instrumenting a timing race with writes to stdout would measure
+// the instrument. Pushing a `String` under a mutex is nanoseconds and does no
+// I/O until the run is over.
+static TRACE_ON: AtomicBool = AtomicBool::new(false);
+static TRACE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Turn the in-memory watcher trace on or off. Diagnostics only.
+pub fn set_trace(on: bool) {
+    TRACE_ON.store(on, Ordering::Relaxed);
+}
+
+/// Take everything traced so far, emptying the buffer.
+pub fn take_trace() -> Vec<String> {
+    TRACE
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
+}
+
+fn trace(msg: impl FnOnce() -> String) {
+    if TRACE_ON.load(Ordering::Relaxed) {
+        if let Ok(mut v) = TRACE.lock() {
+            v.push(msg());
+        }
+    }
+}
+
+/// Roles a KEYSTROKE-driven watch may start on.
+///
+/// Narrower than `is_text_role` on purpose, and the difference is the whole
+/// safety argument. Before any click, `focused_element()` resolves to
+/// `role="Document"`. `is_text_role("Document")` is now **true** -- it was false
+/// when this approach was first tried, and was added so Notepad's editing
+/// surface would be recognised. Starting a keystroke-driven watch on a Document
+/// would mean a stray key before any click begins watching the whole page, and
+/// the next click flushes it, emitting the entire page text as a `type` action.
+///
+/// A click-driven watch still accepts Document, because a click names the
+/// element deliberately. A keystroke does not name anything.
+fn keystroke_startable_role(role: &str) -> bool {
+    let role = role.trim().to_lowercase();
+    matches!(
+        role.as_str(),
+        "edit" | "textbox" | "passwordbox" | "password" | "searchbox"
+    )
+}
 
 /// Roles we treat as editable text.
 ///
@@ -92,6 +149,9 @@ struct Watched {
     /// focused it. The exclusion gate needs these, and resolving them later
     /// risks the element being gone.
     identifiers: Vec<String>,
+    /// Executable owning the field, from the same click. Carried so the emitted
+    /// action can be process-scoped at replay time.
+    process_name: Option<String>,
     /// Value when we started watching, so we can emit only on a real change.
     initial: String,
     started_ms: u64,
@@ -121,6 +181,8 @@ struct Watched {
 #[derive(Default)]
 pub struct TextFieldWatcher {
     watching: Option<Watched>,
+    /// Resolved lazily, only when a keystroke-driven start is attempted.
+    desktop: Option<Desktop>,
 }
 
 impl TextFieldWatcher {
@@ -138,11 +200,57 @@ impl TextFieldWatcher {
         role: &str,
         name: Option<String>,
         identifiers: Vec<String>,
+        process_name: Option<String>,
         timestamp_ms: u64,
     ) -> Option<ActionCandidate> {
+        trace(|| {
+            format!(
+                "focus_moved route=click role={role:?} name={:?} already_watching={}",
+                name,
+                self.watching
+                    .as_ref()
+                    .map(|w| w.name.clone().unwrap_or_default())
+                    .unwrap_or_else(|| "<none>".into()),
+            )
+        });
+
         // Re-focusing the same field is not a transition; keep accumulating.
         if let (Some(new), Some(current)) = (element, self.watching.as_ref()) {
             if same_element(new, &current.element) {
+                // Adopt the click's app identity if the watch has none.
+                //
+                // This is what made the first two attempts at the no-settle race
+                // fail, and it took instrumentation to see. A keystroke-driven
+                // watch names no application, because a keystroke carries no
+                // element and no process. The click that follows names the same
+                // element, so this branch used to return here immediately -- and
+                // the identity it was carrying went unused. At flush the
+                // candidate was built correctly, with the right payload, and
+                // `CapturedStream::admit` then dropped it: it fails closed on an
+                // action whose source app cannot be named.
+                //
+                // The trace shows exactly that: `EMITTING payload="A0123..."`
+                // followed by a single `"type" UnidentifiedSource` exclusion and
+                // no FieldA action in the report. That is why trial A read as
+                // 0/5 while every part tested sound in isolation.
+                //
+                // Supplying the fact, not weakening the gate: this is the same
+                // identification a click-started watch would have recorded.
+                if let Some(w) = self.watching.as_mut() {
+                    if w.identifiers.is_empty() && !identifiers.is_empty() {
+                        trace(|| format!("  adopting app identity from the click: {identifiers:?}"));
+                        w.identifiers = identifiers;
+                    }
+                    if w.process_name.is_none() && process_name.is_some() {
+                        w.process_name = process_name;
+                    }
+                }
+                trace(|| {
+                    format!(
+                        "  same element as watched (id={:?}); keeping the watch, no flush",
+                        new.id()
+                    )
+                });
                 return None;
             }
         }
@@ -156,6 +264,7 @@ impl TextFieldWatcher {
                 role: role.to_string(),
                 name,
                 identifiers,
+                process_name,
                 started_ms: timestamp_ms,
                 keystrokes: 0,
                 // Read at click-processing time, which can be later than the
@@ -175,14 +284,44 @@ impl TextFieldWatcher {
     /// is, Tab moves it to the next control. Re-watching after Tab would credit
     /// the *next* field's keystrokes to this one.
     pub fn key_pressed(&mut self, key_code: u32, timestamp_ms: u64) -> Option<ActionCandidate> {
+        self.key_pressed_with_modifiers(key_code, false, timestamp_ms)
+    }
+
+    /// As `key_pressed`, but told whether Ctrl was held.
+    ///
+    /// Ctrl-modified keys are commands, not typing. `Ctrl+V` arrives as key code
+    /// `0x56` — plain `V` — so without this it counts as a typed character,
+    /// inflating the keystroke total and, since the emit condition is "value
+    /// changed OR keystrokes seen", able to trigger an emit for a reason that
+    /// never happened. Same for `Ctrl+A`, `Ctrl+C`, `Ctrl+Z`.
+    pub fn key_pressed_with_modifiers(
+        &mut self,
+        key_code: u32,
+        ctrl_pressed: bool,
+        timestamp_ms: u64,
+    ) -> Option<ActionCandidate> {
         if !is_trigger_key(key_code) {
-            if is_typing_key(key_code) {
+            if is_typing_key(key_code) && !ctrl_pressed {
+                // Follow focus on every typing key, not just when nothing is
+                // watched. Trial E's keystrokes arrive while the PREVIOUS
+                // field's watch is still live, so a "start only if idle" gate
+                // never fires for it -- measured, E stayed 0/5 with that gate
+                // while A-D passed.
+                //
+                // Cost is one `focused_element()` per typing key: measured at
+                // 4-7 ms mean, 21 ms max, and correct 40/40 in both settled and
+                // no-settle shapes by the previous investigation.
+                let leaving = self.follow_focus_on_keystroke(timestamp_ms);
                 if let Some(w) = self.watching.as_mut() {
                     w.keystrokes += 1;
+                }
+                if leaving.is_some() {
+                    return leaving;
                 }
             }
             return None;
         }
+
 
         if key_code == 0x09 {
             // Tab: focus is leaving. Flush and stop watching -- a click will
@@ -203,18 +342,20 @@ impl TextFieldWatcher {
                 w.role.clone(),
                 w.name.clone(),
                 w.identifiers.clone(),
+                w.process_name.clone(),
             )
         });
 
         let candidate = self.flush(timestamp_ms);
 
-        if let Some((element, role, name, identifiers)) = carry {
+        if let Some((element, role, name, identifiers, process_name)) = carry {
             self.watching = Some(Watched {
                 initial: read_text(&element).unwrap_or_default(),
                 element,
                 role,
                 name,
                 identifiers,
+                process_name,
                 started_ms: timestamp_ms,
                 keystrokes: 0,
                 // Read here, immediately after emitting, with no gap for
@@ -233,9 +374,31 @@ impl TextFieldWatcher {
     /// Leaves the watcher empty. Called on focus change, on a trigger key, and
     /// once when the session stops.
     pub fn flush(&mut self, timestamp_ms: u64) -> Option<ActionCandidate> {
-        let watched = self.watching.take()?;
+        let Some(watched) = self.watching.take() else {
+            trace(|| "flush: nothing was being watched".to_string());
+            return None;
+        };
 
-        let current = read_text(&watched.element)?;
+        let Some(current) = read_text(&watched.element) else {
+            trace(|| {
+                format!(
+                    "flush: could NOT read the watched element (name={:?}); dropping",
+                    watched.name
+                )
+            });
+            return None;
+        };
+
+        trace(|| {
+            format!(
+                "flush: name={:?} initial={:?} current={:?} keystrokes={} trusted={}",
+                watched.name,
+                watched.initial,
+                current,
+                watched.keystrokes,
+                watched.baseline_trusted
+            )
+        });
 
         // Two independent reasons to believe this field was typed into.
         //
@@ -253,10 +416,14 @@ impl TextFieldWatcher {
         let changed = current != watched.initial;
         let typed_into = watched.keystrokes > 0;
         if !changed && !typed_into {
+            trace(|| {
+                "  NOT EMITTING: value unchanged and no keystrokes were attributed".to_string()
+            });
             return None;
         }
 
         if current.trim().is_empty() {
+            trace(|| "  NOT EMITTING: field is empty".to_string());
             // Clearing a field is a real edit, but an empty payload carries no
             // information a replay could use, and the recorder skipped these
             // too. Treated the same way rather than silently differing.
@@ -299,14 +466,17 @@ impl TextFieldWatcher {
         };
 
         if payload.is_empty() {
+            trace(|| "  NOT EMITTING: computed payload is empty".to_string());
             return None;
         }
+        trace(|| format!("  EMITTING payload={payload:?}"));
 
         let appended = payload.len() < current.len();
         let duration = timestamp_ms.saturating_sub(watched.started_ms);
         Some(ActionCandidate {
             kind: ActionKind::Type,
             identifiers: watched.identifiers,
+            process_name: watched.process_name,
             element_role: Some(watched.role),
             element_name: watched.name,
             payload: Some(payload),
@@ -318,6 +488,101 @@ impl TextFieldWatcher {
             )),
             timestamp_ms,
         })
+    }
+
+    /// Keep the watch pointed at whatever actually has focus, on each typing key.
+    ///
+    /// The reconstruction of the twice-abandoned `begin_from_keystroke`, this
+    /// time instrumented. Returns a candidate when focus has moved off a field
+    /// that was being watched, since that field's edit is finished.
+    ///
+    /// A click still starts watches too. This exists because a click EVENT can
+    /// be processed long after the click happened -- in trial A, with a 400 ms
+    /// settle, the first keystroke still arrived before the click event did.
+    fn follow_focus_on_keystroke(&mut self, timestamp_ms: u64) -> Option<ActionCandidate> {
+        // Unit tests must not reach out to the real desktop. This resolves
+        // whatever the developer's machine happens to have focused, so without
+        // this guard a hermetic test starts watching the editor the test was
+        // launched from -- and its result depends on which window had focus.
+        // That is not hypothetical: it turned
+        // `a_watcher_with_nothing_watched_flushes_to_nothing` into a test that
+        // passed or failed according to where the mouse had last been. The live
+        // behaviour is covered by the A-E trials and the Notepad runs, which
+        // drive real windows on purpose.
+        if cfg!(test) {
+            return None;
+        }
+        if self.desktop.is_none() {
+            self.desktop = Desktop::new_default().ok();
+            trace(|| {
+                format!(
+                    "keystroke-follow: Desktop::new_default -> {}",
+                    if self.desktop.is_some() { "ok" } else { "FAILED" }
+                )
+            });
+        }
+        let desktop = self.desktop.as_ref()?;
+        let el = match desktop.focused_element() {
+            Ok(el) => el,
+            Err(e) => {
+                trace(|| format!("keystroke-follow: focused_element FAILED: {e}"));
+                return None;
+            }
+        };
+
+        // Already on it: the overwhelmingly common case, and it must stay cheap
+        // and side-effect free.
+        if let Some(w) = self.watching.as_ref() {
+            if same_element(&el, &w.element) {
+                // Traced so "the keystroke path did nothing" is a POSITIVE
+                // observation rather than an absence. Verifying that this path
+                // stays inert in Notepad is otherwise unfalsifiable: the
+                // watched element and the focused element are the same
+                // Document, so the path runs, correctly does nothing, and would
+                // leave no evidence that it ran at all.
+                trace(|| {
+                    format!(
+                        "keystroke-follow: focus is already the watched element (role={:?})",
+                        w.role
+                    )
+                });
+                return None;
+            }
+        }
+
+        let role = el.role();
+        let name = el.name();
+        if !keystroke_startable_role(&role) {
+            trace(|| {
+                format!("keystroke-follow REFUSED: role={role:?} name={name:?} is not startable")
+            });
+            return None;
+        }
+
+        // Focus has moved to a different field. Whatever was being watched is
+        // finished, so flush it before re-pointing.
+        let leaving = self.flush(timestamp_ms);
+        let initial = read_text(&el).unwrap_or_default();
+        trace(|| {
+            format!(
+                "keystroke-follow STARTED: role={role:?} name={name:?} id={:?} initial={initial:?}",
+                el.id()
+            )
+        });
+        self.watching = Some(Watched {
+            initial,
+            element: el,
+            role,
+            name,
+            // A keystroke names no application. The click for this same element
+            // adopts into the watch when it arrives -- see `focus_moved`.
+            identifiers: Vec::new(),
+            process_name: None,
+            started_ms: timestamp_ms,
+            keystrokes: 0,
+            baseline_trusted: false,
+        });
+        leaving
     }
 
     /// Whether a field is currently being watched. For diagnostics.
@@ -377,6 +642,54 @@ pub fn is_typing_key(key_code: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_modified_keys_are_commands_not_typing() {
+        // Ctrl+V arrives as key code 0x56 -- plain `V`. Counting it as a typed
+        // character inflates the keystroke total, and since a field is emitted
+        // when "the value changed OR keystrokes were seen", it can trigger an
+        // action for a reason that never happened. Ctrl+A and Ctrl+C are the
+        // same shape.
+        //
+        // `is_typing_key` still answers only "is this a character key"; the
+        // modifier is applied at the call site, which is why this test pins the
+        // pairing rather than the predicate alone.
+        for code in [0x56u32, 0x41, 0x43, 0x5A] {
+            assert!(
+                is_typing_key(code),
+                "{code:#x} is a character key on its own"
+            );
+        }
+        let counts_as_typing = |code: u32, ctrl: bool| is_typing_key(code) && !ctrl;
+        assert!(counts_as_typing(0x56, false), "plain V is typing");
+        assert!(!counts_as_typing(0x56, true), "Ctrl+V is a paste, not a V");
+        assert!(!counts_as_typing(0x41, true), "Ctrl+A is select-all");
+        assert!(!counts_as_typing(0x43, true), "Ctrl+C is copy");
+    }
+
+    #[test]
+    fn a_keystroke_may_never_start_a_watch_on_a_document() {
+        // The guard that keeps the keystroke path out of Notepad and out of web
+        // pages. `is_text_role("Document")` is TRUE -- added so Notepad's
+        // editing surface is watchable by a CLICK -- and that is exactly why
+        // the keystroke path needs its own, narrower rule: before any click,
+        // `focused_element()` resolves to the page Document, so a stray key
+        // would otherwise start watching the whole page and the next click
+        // would emit its entire text as a `type` action.
+        assert!(is_text_role("Document"));
+        assert!(!keystroke_startable_role("Document"));
+        assert!(!keystroke_startable_role("document"));
+
+        // Not a spreadsheet cell editor either; that has its own watcher.
+        assert!(!keystroke_startable_role("ComboBox"));
+        assert!(!keystroke_startable_role("Button"));
+        assert!(!keystroke_startable_role("Window"));
+
+        // The real text fields stay startable.
+        for ok in ["Edit", "edit", "TextBox", "PasswordBox", "SearchBox"] {
+            assert!(keystroke_startable_role(ok), "{ok} should be startable");
+        }
+    }
 
     #[test]
     fn recognises_editable_roles() {

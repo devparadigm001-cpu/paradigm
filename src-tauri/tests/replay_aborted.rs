@@ -28,6 +28,7 @@ fn actions_with_leading_secret() -> Vec<CapturedAction> {
     stream.admit(ActionCandidate {
         kind: ActionKind::Type,
         identifiers: vec!["msedge.exe".into()],
+        process_name: Some("msedge.exe".into()),
         element_role: Some("Edit".into()),
         element_name: Some("Password".into()),
         payload: Some("hunter2-not-a-real-secret".into()),
@@ -39,6 +40,7 @@ fn actions_with_leading_secret() -> Vec<CapturedAction> {
     stream.admit(ActionCandidate {
         kind: ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
+        process_name: Some("msedge.exe".into()),
         element_role: Some("Button".into()),
         element_name: Some("Cancel".into()),
         payload: None,
@@ -113,6 +115,7 @@ async fn a_genuine_failure_is_still_recorded_as_failed() {
     stream.admit(ActionCandidate {
         kind: ActionKind::Click,
         identifiers: vec!["nosuchapp.exe".into()],
+        process_name: Some("nosuchapp.exe".into()),
         element_role: Some("Button".into()),
         element_name: Some("PARADIGM-NONEXISTENT-CONTROL-9f3a2b".into()),
         payload: None,

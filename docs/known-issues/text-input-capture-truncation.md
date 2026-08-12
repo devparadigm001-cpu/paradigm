@@ -1,28 +1,34 @@
 # Capture: typed text is silently truncated in recorded actions
 
-**Status: root cause identified; value corruption FIXED; a narrower miss
-remains.** Investigated 2026-08-06 — see "Investigation" below for the
-measurements. Typed text is no longer taken from the recorder's
-`TextInputCompleted`; `src/capture/text.rs` reads the field directly.
+**Status: FIXED, 2026-08-11 — including the no-settle race.** Value corruption
+was fixed 2026-08-06 by reading the field directly instead of trusting the
+recorder's `TextInputCompleted`. The narrower miss that survived two further
+attempts — trial E, the pipeline-shaped case — is now closed too: A–E measured
+**25/25 across five consecutive runs**, and
+`tests/ipc_pipeline::full_pipeline_over_ipc`, red for this defect's entire
+history, **passes**. The mechanism behind the two failed attempts was found by
+instrumenting the composition, and it was not in any of the components either
+attempt examined. See "Attempt 3".
 **Affected:** `terminator-workflow-recorder` 0.23.35, text-input event assembly.
 **Platform:** Windows. Observed in Microsoft Edge; other apps still untested.
 **Found:** 2026-08-04, during Phase 1 Step 6 replay testing. Reproduced again
 the same day during Step 7's end-to-end IPC test.
-**Severity: MEDIUM.** The dangerous form of this defect — silently *wrong* text
-that every later stage trusts — was not reproduced after the change: captured
-payloads were exact in 40/40 trials and never partial at any typing speed.
-What remains is a narrower race in which a typed action can be missed
-**entirely** (never wrong), and it still bites `tests/ipc_pipeline.rs`.
-A missing action is visible; a wrong one was not. See "Remaining limitation".
+**Severity: was MEDIUM, now resolved in the measured environment.** The dangerous
+form — silently *wrong* text that every later stage trusts — was never reproduced
+after the 2026-08-06 change. The narrower form, a typed action missed
+**entirely**, is what survived until 2026-08-11; it no longer reproduces and
+`tests/ipc_pipeline.rs` passes. "Remaining limitation" below is kept as the
+historical record of that miss, and "Attempt 3" is what closed it.
 
-**Scope of that claim.** Every measurement here used synthetic `type_text()`
-into web `<input>` elements in Microsoft Edge — the same narrow environment the
-original observations came from. Native Win32 fields, WinUI (Notepad), a second
-browser, and genuine human typing are all untested. Human typing matters most
-and is least like what was measured: it is slower, interleaved with mouse
-movement, and hits a different timing profile than any of these runs. Read
-"FIXED" as "not reproducible in the measured environment", not as "cannot
-happen".
+**Scope of that claim.** Every measurement here used synthetic `type_text()`,
+mostly into web `<input>` elements in Microsoft Edge — the narrow environment the
+original observations came from. **Notepad (WinUI, `Document` role) is now
+covered** as of 2026-08-11, including a no-settle burst: see "Notepad
+verification". Still untested: native Win32 fields, a second browser, and genuine
+human typing. Human typing matters most and is least like what was measured — it
+is slower, interleaved with mouse movement, and hits a different timing profile
+than any of these runs. Read "FIXED" as "not reproducible in the measured
+environments", not as "cannot happen".
 
 ## Summary
 
@@ -347,6 +353,213 @@ starts, via which route, and what each flush observes — and watch it fail. Tha
 is the only remaining way to see the composition break, since none of its parts
 break alone. It is a session's work and should not be rushed into a fix.
 
+## Attempt 3 (2026-08-11): instrument the composition, and the mechanism appears
+
+The previous investigation's own recommendation was the only thing left to try:
+rebuild the reverted fix **with instrumentation** and watch the composition fail,
+since every part tested sound alone. That was done. It took one run.
+
+### The instrumentation
+
+`capture::text` gained an in-memory trace — `set_trace` / `take_trace` — logging,
+per event: which route started a watch (click vs keystroke), the element identity
+at watch-start, and what each flush observed and why it emitted or not. Off by
+default; when off the cost is one relaxed atomic load.
+
+**In-memory, deliberately, not `tracing`.** This defect is a Heisenbug: the
+2026-08-06 investigation recorded that enabling the recorder's tracing made it
+*vanish* (4/4 events, all exact), because log I/O shifts the timing.
+Instrumenting a timing race with writes to stdout would have measured the
+instrument.
+
+### What the trace showed on the very first failing trial A
+
+```
+flush: nothing was being watched
+keystroke-start ACCEPTED: role="Edit" name=Some("FieldA") id=Some("391359") initial="A"
+focus_moved route=click role="edit" name=Some("FieldA") already_watching=FieldA
+  same element as watched (id=Some("391359")); keeping the watch, no flush
+focus_moved route=click role="edit" name=Some("FieldB") already_watching=FieldA
+flush: name=Some("FieldA") initial="A" current="A0123456789abcdefghi" keystrokes=21
+  EMITTING payload="A0123456789abcdefghi"
+```
+
+**The watcher emitted the correct payload.** And the run reported no FieldA
+action at all. The candidate was produced perfectly and then destroyed
+downstream. The exclusion list, printed for the first time in this harness,
+named it:
+
+```
+  "type" UnidentifiedSource
+```
+
+### The mechanism
+
+1. A keystroke-driven watch carries **no application identity** — a keystroke
+   event has no element and no process name, so `identifiers` is empty.
+2. The click for that same field arrives later. `focus_moved` sees
+   `same_element`, correctly declines to flush... and **returns before applying
+   the identity it is holding**.
+3. At flush the candidate is built correctly, with the right payload, and
+   `CapturedStream::admit` **fails closed** on an action whose source app cannot
+   be named. Silently, into the exclusion list nobody was printing.
+
+That is why the settled trials read 0/5 while every component tested sound in
+isolation. Both prior attempts looked at focus resolution, element handles, COM,
+channel lag and pump starvation — all genuinely fine. The failure was not in any
+component; it was one early `return` in the composition, three layers away from
+anything either attempt suspected.
+
+It is also the *same* failure this session hit hours earlier in
+`GridCellWatcher`, from the same cause: a watch started by something that names
+no application, refused by a gate that fails closed.
+
+### The fix
+
+Two lines of behaviour, in two places:
+
+* **`focus_moved` adopts the click's identity** when the watch it is keeping has
+  none. This supplies a fact rather than weakening the gate — it is exactly the
+  identification a click-started watch records.
+* **`follow_focus_on_keystroke` replaces `begin_from_keystroke`.** Gating the
+  keystroke path on "nothing is being watched" fixes A but cannot fix E: E's
+  keystrokes arrive while the *previous* field's watch is still live, so the gate
+  never opens. Measured — with that gate, A–D passed and E stayed 0/5. Following
+  focus on every typing key handles both: if focus is already on the watched
+  element (the overwhelmingly common case) it does nothing; if focus has moved,
+  the old field is finished, so it flushes and re-points.
+
+Two safety properties, both deliberate:
+
+* **A keystroke-driven watch may only start on a narrow role set** —
+  `edit`/`textbox`/`passwordbox`/`password`/`searchbox` — never `Document`. The
+  previous investigation flagged this as a new danger: `is_text_role("Document")`
+  became true (for Notepad), so a keystroke-driven start on Document would watch
+  the whole page and the next click would emit the entire page text as a `type`
+  action. Click-driven watches still accept Document, because a click names its
+  element deliberately.
+* **A non-startable focus never disturbs an existing watch.** The role check
+  returns before the flush, so focus landing on a ComboBox, button or document
+  mid-edit leaves the current watch intact.
+
+### Measurements
+
+| Trial | Shape | Before (shipped) | After, 5 consecutive runs |
+|---|---|---|---|
+| A | click, 400 ms settle, per-char | pass | **5/5** |
+| B | 50 ms per-char | pass | **5/5** |
+| C | 150 ms per-char | pass | **5/5** |
+| D | 300 ms per-char | pass | **5/5** |
+| E | whole string, no settle | ~1/21 historically | **5/5** |
+
+**25 of 25 trials exact, zero exclusions, in every run.** The pre-filled field
+clicked through without typing recorded nothing in all five, so the emit
+condition still does not fabricate actions.
+
+The independent confirmation matters more than the probe's own score:
+
+```
+test full_pipeline_over_ipc ... ok
+```
+
+`tests/ipc_pipeline.rs` is E-shaped and asserts on the captured text. It has
+failed for this defect's entire history — verified still failing at HEAD earlier
+the same day — and it passes. The full suite (124 tests) is green.
+
+### Regressions
+
+`multiline` (2 type actions, buffer reproduced exactly), `windowswitch` (typing
+still ordered before the app switch), and the whole 124-test suite all pass.
+Clippy clean.
+
+**Notepad: verified, three identical runs (2026-08-11).** Initially reported as
+not re-verified; that gap is now closed. See "Notepad verification" below.
+
+### Notepad verification (2026-08-11)
+
+The one gap left by the fix. It took three attempts to get a Notepad probe to
+converge at all, and both obstacles are worth recording because they are not
+about capture.
+
+**Obstacle 1 — the "hang" was harness buffering, again.** Earlier runs produced
+no output for 18+ minutes and were read as stuck. Redirecting the probe's stdout
+to a file *inside the command* and polling that file returned output within
+seconds. The process was never hanging; background-task output was being withheld
+until exit. Same false diagnosis as this morning, second time in one day.
+
+**Obstacle 2 — Windows 11 Notepad restores its session.** After `notepadclose`
+verified **zero** Notepad windows and zero processes, a bare `notepad.exe` launch
+reopened a stale `*paradigm-probe-… - Notepad` tab and produced no `Untitled`
+buffer at all, so the probe had nothing it was willing to type into. Launching
+`notepad.exe <uniquely-named empty file>` fixes both halves: the title is unique,
+so the window is unambiguous, and the buffer is empty **by construction** rather
+than by hope.
+
+With that, three runs, identical:
+
+```
+  anchored on "paradigm-probe-….txt - Notepad", role="Document", verified empty
+
+    type  role=document  name="Text editor"  payload="alpha line\r"
+    type  role=document  name="Text editor"  payload="beta line\r"
+    type  role=document  name="Text editor"  payload="gammaburst"
+
+  concatenated payloads         : "alpha line\rbeta line\rgammaburst"
+  actually in the Notepad buffer: "alpha line\rbeta line\rgammaburst"
+
+  keystroke path ran, focus already watched : 29
+  keystroke path REFUSED (non-startable role): 0
+  keystroke path STARTED a watch             : 0
+```
+
+Both requirements met. The buffer is reconstructed exactly across an Enter,
+including a **no-settle fast burst** typed as one string immediately after a
+click — the shape that reaches the keystroke path in a browser. And the
+keystroke path **never started a watch**.
+
+**Be precise about what the 29 shows.** They are all
+`focus is already the watched element (role="document")`: the path ran, found the
+click-driven watch already pointing at the same Document, and correctly did
+nothing. `keystroke_startable_role`'s Document exclusion was therefore never
+*reached* in these runs — the click won the race every time, so the earlier
+`same_element` branch returned first. The observed outcome is what matters and it
+is confirmed; the guard behind it is pinned separately by
+`a_keystroke_may_never_start_a_watch_on_a_document`, which asserts that
+`is_text_role("Document")` is true while `keystroke_startable_role("Document")`
+is false.
+
+That distinction is the whole reason the trace gained a line for the
+already-watched case. Without it, "the keystroke path did nothing in Notepad"
+would have been an absence of evidence rather than evidence — the exact reading
+error this project has now made five times.
+
+### What this does not establish
+
+* **The trace shows why the composition failed. It does not prove the original
+  `begin_from_keystroke` failed for exactly this reason** — that code was never
+  committed and cannot be re-run. The reconstruction reproduced the same symptom
+  (settled trials at zero while parts test sound), and the mechanism explains it
+  completely, but it is a reconstruction.
+* **Still Edge and web `<input>` only** for the A–E trials; Notepad is covered
+  separately (see "Notepad verification"). A second browser, native Win32 fields
+  and genuine human typing all remain untested -- the scope caveat at the top of
+  this document stands.
+* **One `focused_element()` per typing key-down**, in every application. The
+  previous investigation measured that call at 4–7 ms mean / 21 ms max and
+  correct 40/40, which is why it was judged safe to put in the event path — but
+  no throughput measurement was taken under load.
+
+### The lesson worth carrying
+
+Two thorough investigations examined every component and found each one sound,
+because the failure was not in a component. What finally found it was printing
+the **exclusion list** next to the actions — distinguishing "the watcher produced
+nothing" from "the watcher produced something that was thrown away". Those are
+opposite diagnoses with opposite fixes, and until this run the harness could not
+tell them apart. This is the fifth time in this project that reading an absence
+as data cost real time; see the pattern catalogue in
+`replay-window-selector-ambiguity.md`.
+
 ## Why it matters
 
 Capture is the root of the pipeline, and every later stage inherits its errors
@@ -385,20 +598,22 @@ bite that run.
 - [x] **Determine whether it is timing or assembly.** Timing: a race on a
       `try_lock`, plus a live UIA read at emit. Not assembly — there is no
       buffer to assemble.
-- [ ] **Re-establish E's baseline before anything else.** 4/10 does not
-      replicate (1/21 on 2026-08-08, including 0/5 on the identical code), so
-      there is currently no trustworthy figure to measure a fix against. Use a
-      much larger sample than n=10.
-- [ ] **Close the no-settle race (trial E).** This is the one that still
-      bites `tests/ipc_pipeline.rs`. Note that `Desktop::focused_element` on the
-      first keystroke has already been tried and made things worse.
-- [ ] **Make `ipc_pipeline` assert on captured text.** It currently checks only
-      `action_count > 0` and `step_count == action_count`, so it passed green
-      through every variant of this defect, including capturing no typing at
-      all. A test that cannot fail on the bug it covers is worse than no test.
-- [ ] **Check field-type and browser sensitivity.** Only Edge, and only web
-      `<input>` elements, have been observed. Test native Win32 fields, WinUI
-      fields (Notepad's editor), and a second browser.
+- [x] ~~**Re-establish E's baseline before anything else.**~~ Superseded: E now
+      passes 5/5 across five consecutive runs, and `ipc_pipeline` passes. A
+      trustworthy failure baseline is no longer needed to measure against, though
+      note the fix is measured at n=5 runs rather than the large sample this item
+      originally called for.
+- [x] ~~**Close the no-settle race (trial E).**~~ **Closed** -- see "Attempt 3".
+      `focused_element` on keystroke was indeed the right direction; what broke
+      the earlier attempts was the emitted candidate being dropped as
+      `UnidentifiedSource`, not the focus resolution.
+- [x] ~~**Make `ipc_pipeline` assert on captured text.**~~ Done earlier; that
+      assertion is what made this fix verifiable by something other than its own
+      probe. It now passes.
+- [ ] **Check field-type and browser sensitivity.** Partly done: Notepad's WinUI
+      editor (`Document` role) is verified, three runs, including a no-settle
+      burst — see "Notepad verification". Native Win32 fields and a second
+      browser remain untested.
 - [ ] **Check whether synthetic input is a factor.** Every observation so far
       came from `type_text()` driving the field rather than a human typing.
       Synthetic input arrives far faster than human keystrokes and may hit a

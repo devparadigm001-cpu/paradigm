@@ -143,6 +143,7 @@ mod tests {
             stream.admit(ActionCandidate {
                 kind,
                 identifiers: vec!["notepad.exe".into()],
+                process_name: None,
                 element_role: Some(role.to_string()),
                 element_name: Some(name.to_string()),
                 payload: payload.map(str::to_string),

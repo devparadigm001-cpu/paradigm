@@ -25,6 +25,7 @@
 
 pub mod exclusion;
 pub mod stream;
+pub mod grid;
 pub mod text;
 
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,7 @@ pub use exclusion::ExclusionList;
 pub use stream::{
     ActionCandidate, ActionKind, Admission, CapturedAction, CapturedStream, ExclusionRecord,
 };
+pub use grid::GridCellWatcher;
 pub use text::TextFieldWatcher;
 
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +61,20 @@ pub struct CaptureReport {
     /// Events the recorder emitted that this step does not map to an action
     /// (raw mouse moves, individual keystrokes, clipboard, and so on).
     pub unmapped_events: usize,
+    /// Paste operations (`Ctrl+V`) seen during the session.
+    ///
+    /// Counted, never read. Clipboard content is deliberately not captured, so
+    /// this exists to make the resulting gap **visible** rather than silent: a
+    /// recording with pastes may be missing data movement that no action
+    /// records. Measured — a paste into a Google Sheets cell reaches the
+    /// document while capture holds no record of it at all.
+    ///
+    /// A paste into an ordinary text field is a different matter and IS
+    /// captured, because the destination's new value is read directly. So a
+    /// non-zero count here means "check whether the destinations were fields",
+    /// not "data was definitely lost".
+    /// See docs/known-issues/complex-web-grid-capture-unreliable.md.
+    pub pastes_observed: usize,
 }
 
 /// One Record Mode capture session.
@@ -67,9 +83,12 @@ pub struct CaptureSession {
     recorder: WorkflowRecorder,
     stream: Arc<Mutex<CapturedStream>>,
     unmapped: Arc<Mutex<usize>>,
+    /// Ctrl+V occurrences. See `CaptureReport::pastes_observed`.
+    pastes: Arc<Mutex<usize>>,
     /// Produces the `Type` actions. Shared with the pump so `stop_session` can
     /// flush a field the user was still in when they stopped recording.
     watcher: Arc<Mutex<TextFieldWatcher>>,
+    grid: Arc<Mutex<GridCellWatcher>>,
     pump: Option<JoinHandle<()>>,
 }
 
@@ -101,11 +120,15 @@ impl CaptureSession {
 
         let stream = Arc::new(Mutex::new(CapturedStream::new(exclusions)));
         let unmapped = Arc::new(Mutex::new(0usize));
+        let pastes = Arc::new(Mutex::new(0usize));
         let watcher = Arc::new(Mutex::new(TextFieldWatcher::new()));
+        let grid = Arc::new(Mutex::new(GridCellWatcher::new()));
 
         let pump_stream = Arc::clone(&stream);
         let pump_unmapped = Arc::clone(&unmapped);
+        let pump_pastes = Arc::clone(&pastes);
         let pump_watcher = Arc::clone(&watcher);
+        let pump_grid = Arc::clone(&grid);
         let pump = tokio::spawn(async move {
             while let Some(event) = events.next().await {
                 // Typed text is synthesised from focus transitions rather than
@@ -116,6 +139,26 @@ impl CaptureSession {
                 if let Some(typed) = observe_text(&pump_watcher, &event) {
                     if let Ok(mut s) = pump_stream.lock() {
                         s.admit(typed);
+                    }
+                }
+
+                // A grid cell has no element for the watcher above to follow --
+                // it is created by typing and destroyed by committing -- so it
+                // gets its own path. See `capture::grid`.
+                if let Some(cell) = observe_grid(&pump_grid, &event) {
+                    if let Ok(mut s) = pump_stream.lock() {
+                        s.admit(cell);
+                    }
+                }
+
+                // Count pastes. Their CONTENT is deliberately not captured, so
+                // this is the only trace that data may have moved without an
+                // action to show for it.
+                if let WorkflowEvent::Keyboard(e) = &event {
+                    if e.is_key_down && e.ctrl_pressed && e.key_code == 0x56 {
+                        if let Ok(mut n) = pump_pastes.lock() {
+                            *n += 1;
+                        }
                     }
                 }
 
@@ -146,7 +189,9 @@ impl CaptureSession {
             recorder,
             stream,
             unmapped,
+            pastes,
             watcher,
+            grid,
             pump: Some(pump),
         })
     }
@@ -175,6 +220,16 @@ impl CaptureSession {
             }
         }
 
+        // Same for a cell edit left uncommitted. Note this emits the last
+        // SAMPLED value rather than re-reading -- by now the editor may be gone,
+        // and re-reading it is exactly the mistake that produced U+FEFF
+        // payloads. See `capture::grid`.
+        if let (Ok(mut grid), Ok(mut stream)) = (self.grid.lock(), self.stream.lock()) {
+            if let Some(candidate) = grid.flush(now_ms()) {
+                stream.admit(candidate);
+            }
+        }
+
         let (actions, exclusions) = {
             let guard = self
                 .stream
@@ -189,6 +244,7 @@ impl CaptureSession {
             actions,
             exclusions,
             unmapped_events,
+            pastes_observed: *self.pastes.lock().unwrap_or_else(|e| e.into_inner()),
         })
     }
 
@@ -231,13 +287,16 @@ fn observe_text(
                 &e.element_role,
                 non_empty(&e.element_text),
                 identifiers,
+                e.process_name.clone(),
                 e.metadata.timestamp.unwrap_or_else(now_ms),
             )
         }
 
-        WorkflowEvent::Keyboard(e) if e.is_key_down => {
-            watcher.key_pressed(e.key_code, e.metadata.timestamp.unwrap_or_else(now_ms))
-        }
+        WorkflowEvent::Keyboard(e) if e.is_key_down => watcher.key_pressed_with_modifiers(
+            e.key_code,
+            e.ctrl_pressed,
+            e.metadata.timestamp.unwrap_or_else(now_ms),
+        ),
 
         // Switching applications means focus has left whatever was being
         // watched, even though nothing in the old window announced it -- the
@@ -258,6 +317,49 @@ fn observe_text(
         // actually happened in.
         WorkflowEvent::ApplicationSwitch(e) => {
             watcher.flush(e.metadata.timestamp.unwrap_or_else(now_ms))
+        }
+
+        _ => None,
+    }
+}
+
+/// Feed one event to the grid watcher, returning a `Type` candidate when a cell
+/// edit finishes.
+///
+/// Separate from `observe_text` because the two disagree about when to read.
+/// `TextFieldWatcher` reads its element when the edit ends; a grid cell's editor
+/// does not survive that moment, so this samples on the way through and emits
+/// what it last saw. See `capture::grid` for the measurements.
+fn observe_grid(
+    grid: &Arc<Mutex<GridCellWatcher>>,
+    event: &WorkflowEvent,
+) -> Option<ActionCandidate> {
+    let mut grid = grid.lock().ok()?;
+
+    match event {
+        // Keyboard events carry no `ui_element` -- measured, 0 of 15 key-downs
+        // in a driven Sheets session -- so the watcher resolves focus itself.
+        WorkflowEvent::Keyboard(e) if e.is_key_down => {
+            grid.observe_key(e.key_code, e.metadata.timestamp.unwrap_or_else(now_ms))
+        }
+
+        // Clicks never name the editor, but they do say which app is in play,
+        // and the exclusion gate needs that.
+        WorkflowEvent::Click(e) => {
+            let mut identifiers = Vec::new();
+            if let Some(p) = &e.process_name {
+                identifiers.push(p.clone());
+            }
+            identifiers.extend(app_identifiers(e.metadata.ui_element.as_ref()));
+            if let Some(url) = &e.page_url {
+                identifiers.push(url.clone());
+            }
+            grid.note_context(identifiers, e.process_name.clone());
+            None
+        }
+
+        WorkflowEvent::ApplicationSwitch(e) => {
+            grid.flush(e.metadata.timestamp.unwrap_or_else(now_ms))
         }
 
         _ => None,
@@ -292,6 +394,7 @@ fn to_candidate(event: &WorkflowEvent) -> Option<ActionCandidate> {
 
             Some(ActionCandidate {
                 kind: ActionKind::Click,
+                process_name: e.process_name.clone(),
                 identifiers,
                 element_role: Some(e.element_role.clone()),
                 element_name: non_empty(&e.element_text),
@@ -329,6 +432,11 @@ fn to_candidate(event: &WorkflowEvent) -> Option<ActionCandidate> {
             Some(ActionCandidate {
                 kind: ActionKind::Navigate,
                 identifiers,
+                // The destination's executable. `element_name` below is the
+                // window TITLE, which changes as the user works -- a Notepad
+                // window is "Untitled - Notepad" until the first keystroke.
+                // This is the part that does not move.
+                process_name: e.to_process_name.clone(),
                 element_role: Some("Window".to_string()),
                 element_name: Some(e.to_window_and_application_name.clone()),
                 payload: None,
