@@ -8081,15 +8081,26 @@ async fn deleteui_mode() -> ExitCode {
         println!("  !! the confirmation did not name the playbook");
     }
 
+    // The dialog's confirm button. Matched by EXACT name against two spellings:
+    // the Radix AlertDialog on this branch labels it "Delete", while the
+    // short-lived PlaybookList on backend-dev said "Delete permanently". Exact
+    // match matters -- every row's own Delete button is also a Button whose name
+    // begins with "Delete", and containment would pick one of those instead,
+    // clicking a row rather than confirming the dialog.
     let confirm = desktop
-        .locator("role:Button|name:Delete permanently")
+        .locator("role:Button")
         .within(window.clone())
         .all(Some(Duration::from_secs(5)), None)
         .await
         .ok()
-        .and_then(|all| all.into_iter().next());
+        .and_then(|all| {
+            all.into_iter().find(|b| {
+                let n = b.name().unwrap_or_default();
+                n == "Delete" || n == "Delete permanently"
+            })
+        });
     let Some(confirm) = confirm else {
-        println!("\n  INCONCLUSIVE: no 'Delete permanently' button appeared.");
+        println!("\n  INCONCLUSIVE: no confirm button ('Delete' / 'Delete permanently') appeared.");
         return ExitCode::FAILURE;
     };
     println!("-- confirming --");
