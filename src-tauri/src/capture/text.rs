@@ -284,8 +284,24 @@ impl TextFieldWatcher {
     /// is, Tab moves it to the next control. Re-watching after Tab would credit
     /// the *next* field's keystrokes to this one.
     pub fn key_pressed(&mut self, key_code: u32, timestamp_ms: u64) -> Option<ActionCandidate> {
+        self.key_pressed_with_modifiers(key_code, false, timestamp_ms)
+    }
+
+    /// As `key_pressed`, but told whether Ctrl was held.
+    ///
+    /// Ctrl-modified keys are commands, not typing. `Ctrl+V` arrives as key code
+    /// `0x56` — plain `V` — so without this it counts as a typed character,
+    /// inflating the keystroke total and, since the emit condition is "value
+    /// changed OR keystrokes seen", able to trigger an emit for a reason that
+    /// never happened. Same for `Ctrl+A`, `Ctrl+C`, `Ctrl+Z`.
+    pub fn key_pressed_with_modifiers(
+        &mut self,
+        key_code: u32,
+        ctrl_pressed: bool,
+        timestamp_ms: u64,
+    ) -> Option<ActionCandidate> {
         if !is_trigger_key(key_code) {
-            if is_typing_key(key_code) {
+            if is_typing_key(key_code) && !ctrl_pressed {
                 // Follow focus on every typing key, not just when nothing is
                 // watched. Trial E's keystrokes arrive while the PREVIOUS
                 // field's watch is still live, so a "start only if idle" gate
@@ -484,6 +500,18 @@ impl TextFieldWatcher {
     /// be processed long after the click happened -- in trial A, with a 400 ms
     /// settle, the first keystroke still arrived before the click event did.
     fn follow_focus_on_keystroke(&mut self, timestamp_ms: u64) -> Option<ActionCandidate> {
+        // Unit tests must not reach out to the real desktop. This resolves
+        // whatever the developer's machine happens to have focused, so without
+        // this guard a hermetic test starts watching the editor the test was
+        // launched from -- and its result depends on which window had focus.
+        // That is not hypothetical: it turned
+        // `a_watcher_with_nothing_watched_flushes_to_nothing` into a test that
+        // passed or failed according to where the mouse had last been. The live
+        // behaviour is covered by the A-E trials and the Notepad runs, which
+        // drive real windows on purpose.
+        if cfg!(test) {
+            return None;
+        }
         if self.desktop.is_none() {
             self.desktop = Desktop::new_default().ok();
             trace(|| {
@@ -614,6 +642,30 @@ pub fn is_typing_key(key_code: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_modified_keys_are_commands_not_typing() {
+        // Ctrl+V arrives as key code 0x56 -- plain `V`. Counting it as a typed
+        // character inflates the keystroke total, and since a field is emitted
+        // when "the value changed OR keystrokes were seen", it can trigger an
+        // action for a reason that never happened. Ctrl+A and Ctrl+C are the
+        // same shape.
+        //
+        // `is_typing_key` still answers only "is this a character key"; the
+        // modifier is applied at the call site, which is why this test pins the
+        // pairing rather than the predicate alone.
+        for code in [0x56u32, 0x41, 0x43, 0x5A] {
+            assert!(
+                is_typing_key(code),
+                "{code:#x} is a character key on its own"
+            );
+        }
+        let counts_as_typing = |code: u32, ctrl: bool| is_typing_key(code) && !ctrl;
+        assert!(counts_as_typing(0x56, false), "plain V is typing");
+        assert!(!counts_as_typing(0x56, true), "Ctrl+V is a paste, not a V");
+        assert!(!counts_as_typing(0x41, true), "Ctrl+A is select-all");
+        assert!(!counts_as_typing(0x43, true), "Ctrl+C is copy");
+    }
 
     #[test]
     fn a_keystroke_may_never_start_a_watch_on_a_document() {

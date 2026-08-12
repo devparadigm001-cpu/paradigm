@@ -6,8 +6,12 @@ captures cell edits with correct attribution and clean text, and `replay`'s
 `grid_type` reproduces them into a different document through the Name Box, with
 no coordinates involved. Both verified against CSV exports. See "Finding 2 FIXED"
 and "Replay of grid edits: implemented".
-**Finding 1 (clipboard) remains open.** Its cause is established from the code;
-no fix attempted.
+**Finding 1 (clipboard) is now scoped and partly closed, 2026-08-11.** It turned
+out to be **narrower than recorded**: pasting into an ordinary text field is
+already captured. What remains is pasting into a grid cell, which is confirmed
+still lost — and is now *counted and surfaced* rather than silent. Modelling
+clipboard content itself is deliberately not done; the reasoning is under
+"Finding 1, re-measured".
 **Affected:** `src-tauri/src/capture` — clipboard handling (absent) and typed
 text against `combobox`-role grid cells.
 **Platform:** Windows. Observed in Google Sheets. Other grid UIs untested.
@@ -36,6 +40,11 @@ Both were found by a human doing a real task, not by a probe.
 ## Evidence
 
 ### Finding 1 — clipboard operations are not captured
+
+> **Partly superseded 2026-08-11.** The session evidence below is accurate, but
+> the generalisation is not: pasting into an ordinary text field **is** captured
+> now, as a side effect of the 2026-08-06 direct-read change. Only grid-cell
+> pastes are still lost. Re-measured both ways — see "Finding 1, re-measured".
 
 Session `record-17bbca6a-4baf-4fe2-bfba-dbb1df918e24`:
 
@@ -859,6 +868,97 @@ Not a fix, but the constraints any fix inherits:
   on: no grid roles, no cell-reference names, focus still static. The
   no-per-cell-element constraint is not something a setting can lift.
 
+## Finding 1, re-measured (2026-08-11)
+
+The brief asked for the design decision first and the fix second, and to confirm
+what capture actually does with a paste before designing around the recorded
+belief. Doing that in the other order would have designed for a problem half of
+which no longer exists.
+
+### What capture actually does now — two different answers
+
+**Pasting into an ordinary text field is already captured.**
+`text_capture_probe -- clipboardcheck` types into `FieldA`, copies, and pastes
+into `FieldB`:
+
+```
+  FieldB actually contains: "clipsource42"
+    type  role=edit  name="FieldA"  payload="clipsource42"
+    type  role=edit  name="FieldB"  payload="clipsource42"
+```
+
+Not as a clipboard action — capture reads the destination's *value* directly, so
+the data movement is recorded and replay can reproduce it by typing. This is a
+side effect of the 2026-08-06 change that stopped trusting the recorder's
+`TextInputCompleted`, and nobody re-checked Finding 1 afterwards. **The doc's
+"clipboard operations produce no captured action at all" has been wrong for
+ordinary fields for some time.**
+
+**Pasting into a Sheets cell is still lost.** `-- sheetspaste` sets the clipboard
+from outside the browser, pastes into a cell, and checks the exported CSV:
+
+```
+  saved document contains the pasted value: true
+  capture recorded its content            : false
+```
+
+Confirmed in the context Finding 1 was originally observed in. The reason is
+structural: a cell paste does not open the editor overlay, so the mechanism that
+captures *typed* cell edits has nothing to sample, and there is no cell element
+whose value could be read instead.
+
+### The design question, and why clipboard content is not modelled
+
+Capturing "user copied X, then pasted it into Y" as an action type is feasible
+for a *single* cell — the Name Box gives the destination reference, and replay's
+`grid_type` could reproduce it by typing. It was rejected anyway, on three
+grounds:
+
+1. **The realistic case is multi-cell and it would be silently wrong.** The
+   session that produced Finding 1 was copying from Notepad into Sheets, which
+   pastes a block across many cells. Recording that as one type action against
+   the anchor cell reproduces something different from what the user did — and
+   plausibly, which is the failure mode this project keeps finding hardest to
+   catch.
+2. **It puts clipboard contents into the store.** Capture is system-wide, so the
+   clipboard may hold anything the user copied for unrelated reasons. That is a
+   redaction-policy decision, not an implementation detail, and it is a
+   meaningful privacy escalation to make as a side effect of a capture fix.
+3. **A paste is not the same kind of thing as every other action here.** Every
+   other action names an element it acted on. A paste is a data transfer whose
+   source has no bearing on replay and whose destination may be a region rather
+   than an element.
+
+So the honest answer is option 2 from the brief: **do not capture clipboard
+content, but stop losing the fact that a paste happened.**
+
+### What was built
+
+`CaptureReport::pastes_observed` counts `Ctrl+V` occurrences, surfaced through
+`CaptureSummary` to the frontend. A recording with a non-zero count may be
+missing data movement no action records. Deliberately a count and not a claim:
+because field pastes *are* captured, a non-zero value means "check whether the
+destinations were fields", not "data was definitely lost".
+
+Also fixed, which the doc listed separately as wrong on its own terms:
+**Ctrl-modified keys no longer count as typing.** `Ctrl+V` arrives as key code
+`0x56` — plain `V` — so it was inflating keystroke totals, and since a field is
+emitted when "the value changed OR keystrokes were seen", it could trigger an
+action for a reason that never happened. `ctrl_pressed` was previously read
+nowhere in `src/`.
+
+### Verified
+
+| Case | Paste landed | Content captured | `pastes_observed` |
+|---|---|---|---|
+| web `<input>` | yes | **yes**, as a `type` on the destination | 1 |
+| Sheets cell | yes (CSV) | no | **1** |
+
+The Sheets row is the point: the gap is unchanged, but it is now visible in the
+capture summary instead of being indistinguishable from a session where nothing
+happened. Re-running `clipboardcheck` after the Ctrl change confirmed no
+regression — both fields still captured exactly.
+
 ## Not the same bug as the Gmail picker (tested 2026-08-09)
 
 These findings and the Gmail recipient picker
@@ -916,14 +1016,20 @@ immediately. Probe coverage has been measuring the environment it was built for.
 
 ## Next steps
 
-- [ ] **Decide how clipboard operations should be modelled at all.** Enabling
+- [x] ~~**Decide how clipboard operations should be modelled at all.**~~
+      **Decided: do not model clipboard content.** Multi-cell pastes would be
+      recorded plausibly-but-wrongly, and storing clipboard contents is a
+      redaction decision rather than a capture detail. Pastes are counted and
+      surfaced instead. Original scope: Enabling
       `record_clipboard` is necessary but not sufficient: there is no `paste`
       value in the schema's `action_type` enum (`click`, `type`, `navigate`,
       `read`). Either a paste compiles down to a `type` carrying the pasted
       text — which puts clipboard contents into the store and therefore through
       the redaction policy — or the enum grows, which is a locked-schema
       migration. This is a design decision, not a code fix.
-- [ ] **Stop treating `Ctrl`-modified keys as typing.** Independent of the
+- [x] ~~**Stop treating `Ctrl`-modified keys as typing.**~~ Done --
+      `ctrl_pressed` is now threaded into the watcher and Ctrl-modified keys no
+      longer count as keystrokes. Original scope: Independent of the
       above, `is_typing_key` counting `Ctrl+V` as a literal `V` is wrong on its
       own terms. `KeyboardEvent` carries `ctrl_pressed`; `capture` currently
       ignores it.

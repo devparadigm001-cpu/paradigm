@@ -7456,6 +7456,310 @@ async fn closewins_mode() -> ExitCode {
 // Nothing here clicks arbitrary UI. It opens the probe's own page positioned on
 // the secondary monitor and clicks a field in it, then proves the click landed
 // by checking what has focus afterwards.
+// -------------------------------------------------- clipboardcheck mode ----
+// What does capture ACTUALLY do when the user pastes?
+//
+// The known-issues doc says clipboard operations "produce no captured action at
+// all", from a session recorded before capture stopped trusting the recorder's
+// TextInputCompleted and started reading field values directly. That change may
+// have altered the answer for ordinary text fields without anyone re-checking,
+// so this measures it instead of designing around the old finding.
+//
+// Copy from FieldA, paste into FieldB, and see what the pipeline emits.
+// Paste into a Google Sheets CELL -- the context Finding 1 was actually
+// observed in. A cell paste does not open the editor overlay, so the grid
+// watcher's per-keystroke sampling has nothing to sample.
+async fn sheetspaste_mode() -> ExitCode {
+    use paradigm_lib::capture::{CaptureSession, ExclusionList};
+
+    println!("== what capture does with a paste into a Sheets cell ==\n");
+
+    const SECRET: &str = "pastedvalue7";
+    // Clipboard set from outside Sheets, so nothing about Sheets' own copy path
+    // is involved -- this is the user's real shape: copy elsewhere, paste here.
+    let set = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &format!("Set-Clipboard -Value '{SECRET}'")])
+        .status();
+    println!("  clipboard set: {:?}", set.map(|s| s.success()));
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("  waiting 30s for Sheets...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = desktop
+        .locator("role:Window|name:Untitled spreadsheet")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    let mut doc_id = String::new();
+    if let Ok(bars) = desktop
+        .locator("role:Edit|name:Address and search bar")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for b in &bars {
+            let t = b.text(0).unwrap_or_default();
+            if let Some(rest) = t.split("/d/").nth(1) {
+                doc_id = rest.split('/').next().unwrap_or("").to_string();
+            }
+        }
+    }
+    println!("  DOCUMENT ID: {doc_id}");
+
+    let session = match CaptureSession::start_session(
+        "sheets-paste",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{ctrl}{home}");
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    println!("-- pasting into the current cell --");
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{ctrl}v");
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Move off the cell so anything pending would flush.
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{Tab}");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n  {} action(s), {} exclusion(s), {} unmapped, {} paste(s) observed",
+        report.actions.len(), report.exclusions.len(), report.unmapped_events,
+        report.pastes_observed);
+    for a in &report.actions {
+        println!(
+            "    {:<9} role={:<9} name={:?} payload={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-"),
+            a.payload.as_deref().unwrap_or("-")
+        );
+    }
+
+    // Ground truth: did the paste reach the document at all?
+    println!("\n  waiting 10s for Sheets to sync, then exporting...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let before_csv = newest_csv().map(|(p, _)| p);
+    let export = format!("https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, &export])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    let mut saved = String::new();
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some((p, _)) = newest_csv() {
+            if Some(&p) != before_csv.as_ref() {
+                saved = std::fs::read_to_string(&p).unwrap_or_default();
+                break;
+            }
+        }
+    }
+    let landed = saved.contains(SECRET);
+    println!("  saved document contains the pasted value: {landed}");
+    for line in saved.lines().take(3) {
+        println!("    {line:?}");
+    }
+
+    let captured = report
+        .actions
+        .iter()
+        .any(|a| a.payload.as_deref().map(|p| p.contains(SECRET)).unwrap_or(false));
+
+    println!("\n================ VERDICT ================\n");
+    println!("  paste reached the spreadsheet   : {landed}");
+    println!("  capture recorded its content    : {captured}");
+    if !landed {
+        println!("\n  INCONCLUSIVE: the paste never happened, so this says nothing.");
+    } else if captured {
+        println!("\n  Sheets cell pastes ARE captured.");
+    } else {
+        println!("\n  CONFIRMED GAP: the value reached the spreadsheet and capture holds");
+        println!("  no record of it. This is Finding 1, still real, in the context it was");
+        println!("  originally observed in.");
+    }
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
+async fn clipboardcheck_mode() -> ExitCode {
+    use paradigm_lib::capture::{CaptureSession, ExclusionList};
+
+    println!("== what capture does with a real copy/paste ==\n");
+    println!("WARNING: performs real clicks, typing and clipboard use. Hands off.\n");
+
+    let page = std::env::temp_dir().join("paradigm-text-capture-probe.html");
+    if std::fs::write(&page, PAGE).is_err() {
+        eprintln!("could not write probe page");
+        return ExitCode::FAILURE;
+    }
+    let url = format!("file:///{}", page.to_string_lossy().replace('\\', "/"));
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", &url])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 12s for the browser...");
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let find = |name: &str| {
+        let d = &desktop;
+        let sel = format!("role:Edit|name:{name}");
+        async move { d.locator(sel.as_str()).first(Some(Duration::from_secs(10))).await.ok() }
+    };
+    let (Some(field_a), Some(field_b)) = (find("FieldA").await, find("FieldB").await) else {
+        println!("  INCONCLUSIVE: probe fields not found");
+        return ExitCode::FAILURE;
+    };
+
+    let session = match CaptureSession::start_session(
+        "clipboard-check",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    const SECRET: &str = "clipsource42";
+    println!("-- typing {SECRET:?} into FieldA --");
+    robust_click(&desktop, &field_a);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    for ch in SECRET.chars() {
+        let _ = field_a.type_text(&ch.to_string(), false);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    println!("-- Ctrl+A, Ctrl+C on FieldA --");
+    let _ = field_a.press_key("{ctrl}a");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let _ = field_a.press_key("{ctrl}c");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    println!("-- clicking FieldB and pasting --");
+    robust_click(&desktop, &field_b);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let _ = field_b.press_key("{ctrl}v");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Click away so the watcher flushes FieldB.
+    if let Ok(done) = desktop
+        .locator("role:Button|name:Done")
+        .first(Some(Duration::from_secs(8)))
+        .await
+    {
+        robust_click(&desktop, &done);
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let pasted = field_b.text(0).unwrap_or_default();
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n================ RESULTS ================\n");
+    println!("  FieldB actually contains: {pasted:?}");
+    println!("  paste really happened   : {}", pasted.contains(SECRET));
+    println!(
+        "\n  {} action(s), {} exclusion(s), {} unmapped, {} paste(s) observed",
+        report.actions.len(),
+        report.exclusions.len(),
+        report.unmapped_events,
+        report.pastes_observed
+    );
+    for a in &report.actions {
+        println!(
+            "    {:<9} role={:<9} name={:?} payload={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-"),
+            a.payload.as_deref().unwrap_or("-")
+        );
+    }
+
+    let captured_for_b = report.actions.iter().any(|a| {
+        a.kind.as_str() == "type"
+            && a.element_name.as_deref() == Some("FieldB")
+            && a.payload.as_deref().map(|p| p.contains(SECRET)).unwrap_or(false)
+    });
+
+    println!("\n================ VERDICT ================\n");
+    println!("  a `type` action carries the pasted text for FieldB: {captured_for_b}");
+    if !pasted.contains(SECRET) {
+        println!("\n  INCONCLUSIVE: the paste itself did not land, so this says nothing");
+        println!("  about what capture does with one.");
+    } else if captured_for_b {
+        println!("\n  Pasting into an ORDINARY FIELD is already captured -- not as a");
+        println!("  clipboard action, but the destination's new value is read directly, so");
+        println!("  the data movement is recorded and replay can reproduce it by typing.");
+    } else {
+        println!("\n  The paste landed and capture recorded nothing for it. The doc's");
+        println!("  Finding 1 still holds for this case.");
+    }
+    ExitCode::SUCCESS
+}
+
 async fn multimon_mode() -> ExitCode {
     println!("== secondary-monitor click refusal, re-measured ==\n");
 
@@ -7842,6 +8146,12 @@ async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "sheetspaste") {
+        return sheetspaste_mode().await;
+    }
+    if std::env::args().any(|a| a == "clipboardcheck") {
+        return clipboardcheck_mode().await;
+    }
     if std::env::args().any(|a| a == "multimon") {
         return multimon_mode().await;
     }

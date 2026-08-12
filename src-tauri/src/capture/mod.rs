@@ -61,6 +61,20 @@ pub struct CaptureReport {
     /// Events the recorder emitted that this step does not map to an action
     /// (raw mouse moves, individual keystrokes, clipboard, and so on).
     pub unmapped_events: usize,
+    /// Paste operations (`Ctrl+V`) seen during the session.
+    ///
+    /// Counted, never read. Clipboard content is deliberately not captured, so
+    /// this exists to make the resulting gap **visible** rather than silent: a
+    /// recording with pastes may be missing data movement that no action
+    /// records. Measured — a paste into a Google Sheets cell reaches the
+    /// document while capture holds no record of it at all.
+    ///
+    /// A paste into an ordinary text field is a different matter and IS
+    /// captured, because the destination's new value is read directly. So a
+    /// non-zero count here means "check whether the destinations were fields",
+    /// not "data was definitely lost".
+    /// See docs/known-issues/complex-web-grid-capture-unreliable.md.
+    pub pastes_observed: usize,
 }
 
 /// One Record Mode capture session.
@@ -69,6 +83,8 @@ pub struct CaptureSession {
     recorder: WorkflowRecorder,
     stream: Arc<Mutex<CapturedStream>>,
     unmapped: Arc<Mutex<usize>>,
+    /// Ctrl+V occurrences. See `CaptureReport::pastes_observed`.
+    pastes: Arc<Mutex<usize>>,
     /// Produces the `Type` actions. Shared with the pump so `stop_session` can
     /// flush a field the user was still in when they stopped recording.
     watcher: Arc<Mutex<TextFieldWatcher>>,
@@ -104,11 +120,13 @@ impl CaptureSession {
 
         let stream = Arc::new(Mutex::new(CapturedStream::new(exclusions)));
         let unmapped = Arc::new(Mutex::new(0usize));
+        let pastes = Arc::new(Mutex::new(0usize));
         let watcher = Arc::new(Mutex::new(TextFieldWatcher::new()));
         let grid = Arc::new(Mutex::new(GridCellWatcher::new()));
 
         let pump_stream = Arc::clone(&stream);
         let pump_unmapped = Arc::clone(&unmapped);
+        let pump_pastes = Arc::clone(&pastes);
         let pump_watcher = Arc::clone(&watcher);
         let pump_grid = Arc::clone(&grid);
         let pump = tokio::spawn(async move {
@@ -130,6 +148,17 @@ impl CaptureSession {
                 if let Some(cell) = observe_grid(&pump_grid, &event) {
                     if let Ok(mut s) = pump_stream.lock() {
                         s.admit(cell);
+                    }
+                }
+
+                // Count pastes. Their CONTENT is deliberately not captured, so
+                // this is the only trace that data may have moved without an
+                // action to show for it.
+                if let WorkflowEvent::Keyboard(e) = &event {
+                    if e.is_key_down && e.ctrl_pressed && e.key_code == 0x56 {
+                        if let Ok(mut n) = pump_pastes.lock() {
+                            *n += 1;
+                        }
                     }
                 }
 
@@ -160,6 +189,7 @@ impl CaptureSession {
             recorder,
             stream,
             unmapped,
+            pastes,
             watcher,
             grid,
             pump: Some(pump),
@@ -214,6 +244,7 @@ impl CaptureSession {
             actions,
             exclusions,
             unmapped_events,
+            pastes_observed: *self.pastes.lock().unwrap_or_else(|e| e.into_inner()),
         })
     }
 
@@ -261,9 +292,11 @@ fn observe_text(
             )
         }
 
-        WorkflowEvent::Keyboard(e) if e.is_key_down => {
-            watcher.key_pressed(e.key_code, e.metadata.timestamp.unwrap_or_else(now_ms))
-        }
+        WorkflowEvent::Keyboard(e) if e.is_key_down => watcher.key_pressed_with_modifiers(
+            e.key_code,
+            e.ctrl_pressed,
+            e.metadata.timestamp.unwrap_or_else(now_ms),
+        ),
 
         // Switching applications means focus has left whatever was being
         // watched, even though nothing in the old window announced it -- the
