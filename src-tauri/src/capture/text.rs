@@ -506,6 +506,18 @@ impl TextFieldWatcher {
         // and side-effect free.
         if let Some(w) = self.watching.as_ref() {
             if same_element(&el, &w.element) {
+                // Traced so "the keystroke path did nothing" is a POSITIVE
+                // observation rather than an absence. Verifying that this path
+                // stays inert in Notepad is otherwise unfalsifiable: the
+                // watched element and the focused element are the same
+                // Document, so the path runs, correctly does nothing, and would
+                // leave no evidence that it ran at all.
+                trace(|| {
+                    format!(
+                        "keystroke-follow: focus is already the watched element (role={:?})",
+                        w.role
+                    )
+                });
                 return None;
             }
         }
@@ -602,6 +614,30 @@ pub fn is_typing_key(key_code: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_keystroke_may_never_start_a_watch_on_a_document() {
+        // The guard that keeps the keystroke path out of Notepad and out of web
+        // pages. `is_text_role("Document")` is TRUE -- added so Notepad's
+        // editing surface is watchable by a CLICK -- and that is exactly why
+        // the keystroke path needs its own, narrower rule: before any click,
+        // `focused_element()` resolves to the page Document, so a stray key
+        // would otherwise start watching the whole page and the next click
+        // would emit its entire text as a `type` action.
+        assert!(is_text_role("Document"));
+        assert!(!keystroke_startable_role("Document"));
+        assert!(!keystroke_startable_role("document"));
+
+        // Not a spreadsheet cell editor either; that has its own watcher.
+        assert!(!keystroke_startable_role("ComboBox"));
+        assert!(!keystroke_startable_role("Button"));
+        assert!(!keystroke_startable_role("Window"));
+
+        // The real text fields stay startable.
+        for ok in ["Edit", "edit", "TextBox", "PasswordBox", "SearchBox"] {
+            assert!(keystroke_startable_role(ok), "{ok} should be startable");
+        }
+    }
 
     #[test]
     fn recognises_editable_roles() {

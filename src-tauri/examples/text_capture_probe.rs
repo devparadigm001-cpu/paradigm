@@ -6512,8 +6512,33 @@ async fn notepadgrid_mode() -> ExitCode {
     println!("== Notepad capture with GridCellWatcher in the pipeline ==\n");
     println!("WARNING: performs real clicks and typing. Hands off.\n");
 
-    let existing = std::process::Command::new("notepad.exe").spawn();
-    if existing.is_err() {
+    // Launch an EMPTY, uniquely-named file rather than a bare Notepad.
+    //
+    // `notepad.exe` with no argument does not reliably give a fresh buffer on
+    // Windows 11: it restores the previous session's tabs. Measured here --
+    // after closing every Notepad window, a bare launch reopened a stale
+    // `*paradigm-probe-…` document and no `Untitled - Notepad` existed at all,
+    // so the probe had nothing it was willing to type into.
+    //
+    // A named empty file fixes both halves: the title is unique, so the window
+    // is unambiguous, and the buffer is empty by construction rather than by
+    // hope. The `paradigm-probe-` prefix is what `notepadclose` recognises.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let doc_name = format!("paradigm-probe-{stamp}");
+    let doc_path = std::env::temp_dir().join(format!("{doc_name}.txt"));
+    if std::fs::write(&doc_path, "").is_err() {
+        eprintln!("could not create the probe document");
+        return ExitCode::FAILURE;
+    }
+    println!("  probe document: {}", doc_path.display());
+    if std::process::Command::new("notepad.exe")
+        .arg(&doc_path)
+        .spawn()
+        .is_err()
+    {
         eprintln!("could not launch Notepad");
         return ExitCode::FAILURE;
     }
@@ -6571,12 +6596,11 @@ async fn notepadgrid_mode() -> ExitCode {
 
         // Title first, before ANY text read. `text(0)` walks the element's
         // subtree, and on a Notepad holding a large document that read does not
-        // return in any usable time -- it is what hung the first two attempts.
-        // "Untitled - Notepad" with no modified marker is a fresh buffer, so the
-        // read below is guaranteed to be cheap. This also keeps the probe away
-        // from a window holding real work.
-        if !title.starts_with("Untitled - Notepad") {
-            println!("    skipping {title:?}: not a fresh untitled buffer");
+        // return in any usable time. Matching the document this probe just
+        // created keeps the read cheap AND keeps the probe away from a window
+        // holding somebody's work.
+        if !title.starts_with(&doc_name) && !title.starts_with(&format!("*{doc_name}")) {
+            println!("    skipping {title:?}: not the document this probe created");
             continue;
         }
 
@@ -6638,6 +6662,9 @@ async fn notepadgrid_mode() -> ExitCode {
     println!("  accepted by is_text_role: {}", text::is_text_role(&role));
 
     // ---- capture ------------------------------------------------------------
+    // In-memory trace, so the keystroke-focus path can be OBSERVED rather than
+    // assumed inert here. See `capture::text`.
+    text::set_trace(true);
     let session = match CaptureSession::start_session(
         "notepad-grid-regression",
         ExclusionList::from_patterns(["!never-matches!"]),
@@ -6666,6 +6693,16 @@ async fn notepadgrid_mode() -> ExitCode {
         let _ = element.type_text(&ch.to_string(), false);
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Phase 2: NO SETTLE, whole string at once -- the shape that reaches the
+    // keystroke-focus path in a browser. If that path can misbehave in Notepad,
+    // this is where it would.
+    println!("-- driving: Enter, then a no-settle fast burst --");
+    let _ = element.press_key("{Enter}");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    robust_click(&desktop, &element);
+    let _ = element.type_text("gammaburst", false);
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let actual = element.text(0).unwrap_or_default();
@@ -6714,18 +6751,52 @@ async fn notepadgrid_mode() -> ExitCode {
         .filter(|a| a.element_role.as_deref() == Some("ComboBox"))
         .count();
 
+    // ---- the keystroke-focus path, observed --------------------------------
+    let watcher_trace = text::take_trace();
+    let ks_inert = watcher_trace
+        .iter()
+        .filter(|l| l.contains("focus is already the watched element"))
+        .count();
+    let ks_refused = watcher_trace
+        .iter()
+        .filter(|l| l.contains("keystroke-follow REFUSED"))
+        .count();
+    let ks_started = watcher_trace
+        .iter()
+        .filter(|l| l.contains("keystroke-follow STARTED"))
+        .count();
+
+    println!("\n================ WATCHER TRACE ================\n");
+    for line in watcher_trace.iter().take(60) {
+        println!("  {line}");
+    }
+    if watcher_trace.len() > 60 {
+        println!("  ... {} more lines", watcher_trace.len() - 60);
+    }
+
     println!("\n================ VERDICT ================\n");
     println!("  type actions captured        : {}", types.len());
     println!("  concatenated payloads        : {combined:?}");
     println!("  actually in the Notepad buffer: {actual:?}");
     println!("  actions from the GRID path    : {grid_actions}  (must be 0)");
+    println!("\n  keystroke path ran, focus already watched : {ks_inert}");
+    println!("  keystroke path REFUSED (non-startable role): {ks_refused}");
+    println!("  keystroke path STARTED a watch             : {ks_started}  (must be 0)");
+    if ks_inert + ks_refused == 0 {
+        println!("  !! the keystroke path left no trace at all -- it may not have run,");
+        println!("     so this run does NOT establish that it is inert in Notepad.");
+    }
 
     let norm = |s: &str| s.replace("\r\n", "\n").replace('\r', "\n");
     let text_ok = !types.is_empty() && norm(&combined) == norm(&actual);
     let grid_ok = grid_actions == 0;
-    if text_ok && grid_ok {
-        println!("\n  PASS: Document-role capture is unchanged, and the grid path stayed");
-        println!("  inert -- it contributed no action and no exclusion.");
+    let ks_ok = ks_started == 0 && (ks_inert + ks_refused) > 0;
+    if text_ok && grid_ok && ks_ok {
+        println!("\n  PASS: Document-role capture is unchanged, the grid path stayed inert,");
+        println!("  and the keystroke-focus path ran but never started a watch on Document.");
+    } else if text_ok && grid_ok {
+        println!("\n  PARTIAL: capture is correct, but the keystroke path was not observed");
+        println!("  behaving as required -- see the counts above.");
     } else if !text_ok {
         println!("\n  REGRESSION: Notepad text capture no longer reproduces the buffer.");
     } else {

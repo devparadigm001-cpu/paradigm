@@ -20,14 +20,15 @@ after the 2026-08-06 change. The narrower form, a typed action missed
 `tests/ipc_pipeline.rs` passes. "Remaining limitation" below is kept as the
 historical record of that miss, and "Attempt 3" is what closed it.
 
-**Scope of that claim.** Every measurement here used synthetic `type_text()`
-into web `<input>` elements in Microsoft Edge — the same narrow environment the
-original observations came from. Native Win32 fields, WinUI (Notepad), a second
-browser, and genuine human typing are all untested. Human typing matters most
-and is least like what was measured: it is slower, interleaved with mouse
-movement, and hits a different timing profile than any of these runs. Read
-"FIXED" as "not reproducible in the measured environment", not as "cannot
-happen".
+**Scope of that claim.** Every measurement here used synthetic `type_text()`,
+mostly into web `<input>` elements in Microsoft Edge — the narrow environment the
+original observations came from. **Notepad (WinUI, `Document` role) is now
+covered** as of 2026-08-11, including a no-settle burst: see "Notepad
+verification". Still untested: native Win32 fields, a second browser, and genuine
+human typing. Human typing matters most and is least like what was measured — it
+is slower, interleaved with mouse movement, and hits a different timing profile
+than any of these runs. Read "FIXED" as "not reproducible in the measured
+environments", not as "cannot happen".
 
 ## Summary
 
@@ -471,15 +472,66 @@ the same day — and it passes. The full suite (124 tests) is green.
 still ordered before the app switch), and the whole 124-test suite all pass.
 Clippy clean.
 
-**Notepad was not re-verified against this change.** `notepadgrid` was run twice;
-one attempt could not confirm a fresh empty buffer and refused to proceed, the
-other had not produced output after ~18 minutes — the slow-but-buffered behaviour
-recorded in `complex-web-grid-capture-unreliable.md`. What holds without it:
-`keystroke_startable_role` excludes `Document`, so the keystroke path cannot fire
-in Notepad at all, and the click path is unchanged; `multiline` covers the same
-flush-and-re-baseline logic on an `Edit`. That is an argument plus adjacent
-coverage, not a Notepad measurement, and it should be run on a machine where that
-probe completes.
+**Notepad: verified, three identical runs (2026-08-11).** Initially reported as
+not re-verified; that gap is now closed. See "Notepad verification" below.
+
+### Notepad verification (2026-08-11)
+
+The one gap left by the fix. It took three attempts to get a Notepad probe to
+converge at all, and both obstacles are worth recording because they are not
+about capture.
+
+**Obstacle 1 — the "hang" was harness buffering, again.** Earlier runs produced
+no output for 18+ minutes and were read as stuck. Redirecting the probe's stdout
+to a file *inside the command* and polling that file returned output within
+seconds. The process was never hanging; background-task output was being withheld
+until exit. Same false diagnosis as this morning, second time in one day.
+
+**Obstacle 2 — Windows 11 Notepad restores its session.** After `notepadclose`
+verified **zero** Notepad windows and zero processes, a bare `notepad.exe` launch
+reopened a stale `*paradigm-probe-… - Notepad` tab and produced no `Untitled`
+buffer at all, so the probe had nothing it was willing to type into. Launching
+`notepad.exe <uniquely-named empty file>` fixes both halves: the title is unique,
+so the window is unambiguous, and the buffer is empty **by construction** rather
+than by hope.
+
+With that, three runs, identical:
+
+```
+  anchored on "paradigm-probe-….txt - Notepad", role="Document", verified empty
+
+    type  role=document  name="Text editor"  payload="alpha line\r"
+    type  role=document  name="Text editor"  payload="beta line\r"
+    type  role=document  name="Text editor"  payload="gammaburst"
+
+  concatenated payloads         : "alpha line\rbeta line\rgammaburst"
+  actually in the Notepad buffer: "alpha line\rbeta line\rgammaburst"
+
+  keystroke path ran, focus already watched : 29
+  keystroke path REFUSED (non-startable role): 0
+  keystroke path STARTED a watch             : 0
+```
+
+Both requirements met. The buffer is reconstructed exactly across an Enter,
+including a **no-settle fast burst** typed as one string immediately after a
+click — the shape that reaches the keystroke path in a browser. And the
+keystroke path **never started a watch**.
+
+**Be precise about what the 29 shows.** They are all
+`focus is already the watched element (role="document")`: the path ran, found the
+click-driven watch already pointing at the same Document, and correctly did
+nothing. `keystroke_startable_role`'s Document exclusion was therefore never
+*reached* in these runs — the click won the race every time, so the earlier
+`same_element` branch returned first. The observed outcome is what matters and it
+is confirmed; the guard behind it is pinned separately by
+`a_keystroke_may_never_start_a_watch_on_a_document`, which asserts that
+`is_text_role("Document")` is true while `keystroke_startable_role("Document")`
+is false.
+
+That distinction is the whole reason the trace gained a line for the
+already-watched case. Without it, "the keystroke path did nothing in Notepad"
+would have been an absence of evidence rather than evidence — the exact reading
+error this project has now made five times.
 
 ### What this does not establish
 
@@ -488,8 +540,10 @@ probe completes.
   committed and cannot be re-run. The reconstruction reproduced the same symptom
   (settled trials at zero while parts test sound), and the mechanism explains it
   completely, but it is a reconstruction.
-* **Still Edge and web `<input>` only** for the A–E trials. The scope caveat at
-  the top of this document stands.
+* **Still Edge and web `<input>` only** for the A–E trials; Notepad is covered
+  separately (see "Notepad verification"). A second browser, native Win32 fields
+  and genuine human typing all remain untested -- the scope caveat at the top of
+  this document stands.
 * **One `focused_element()` per typing key-down**, in every application. The
   previous investigation measured that call at 4–7 ms mean / 21 ms max and
   correct 40/40, which is why it was judged safe to put in the event path — but
@@ -556,9 +610,10 @@ bite that run.
 - [x] ~~**Make `ipc_pipeline` assert on captured text.**~~ Done earlier; that
       assertion is what made this fix verifiable by something other than its own
       probe. It now passes.
-- [ ] **Check field-type and browser sensitivity.** Only Edge, and only web
-      `<input>` elements, have been observed. Test native Win32 fields, WinUI
-      fields (Notepad's editor), and a second browser.
+- [ ] **Check field-type and browser sensitivity.** Partly done: Notepad's WinUI
+      editor (`Document` role) is verified, three runs, including a no-settle
+      burst — see "Notepad verification". Native Win32 fields and a second
+      browser remain untested.
 - [ ] **Check whether synthetic input is a factor.** Every observation so far
       came from `type_text()` driving the field rather than a human typing.
       Synthetic input arrives far faster than human keystrokes and may hit a
