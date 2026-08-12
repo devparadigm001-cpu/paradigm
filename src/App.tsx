@@ -122,7 +122,7 @@ function StoredPlaybooksSection({
         </p>
       ) : (
         <ul className="flex flex-col gap-2">
-          {data.map((playbook) => (
+          {data.map((playbook, index) => (
             <li
               key={playbook.id}
               className="flex items-center justify-between gap-2 text-sm"
@@ -149,6 +149,19 @@ function StoredPlaybooksSection({
                 <Button
                   variant="destructive"
                   size="sm"
+                  // Every row's Delete otherwise has the accessible name
+                  // "Delete", so nothing can tell them apart -- not a screen
+                  // reader, and not this product's own automation, which drives
+                  // the UI through the accessibility tree and refuses to act
+                  // when a selector matches more than one element
+                  // (StepResult::FailedAmbiguous).
+                  //
+                  // The position is what makes it unique. The NAME alone does
+                  // not: playbook names are not unique -- nothing enforces it at
+                  // any layer -- so two recordings called the same thing would
+                  // still produce two identical labels. Measured with two
+                  // same-named playbooks before settling on this.
+                  aria-label={`Delete ${playbook.name}, ${index + 1} of ${data.length}`}
                   disabled={actionsBusy}
                   onClick={() => handleDelete(playbook)}
                 >
