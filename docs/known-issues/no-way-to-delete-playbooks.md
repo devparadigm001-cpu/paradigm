@@ -182,6 +182,33 @@ specifically, whose own tooling drives the UI through the accessibility tree, an
 whose replay refuses to act on exactly this condition (`FailedAmbiguous`). The
 labels are now unique — see "Disambiguating the delete controls".
 
+### Disambiguating the delete controls (`frontend-dev` `945a2b2`)
+
+Every row's Delete button carried the accessible name "Delete". Nothing could
+tell them apart — not a screen reader, and not this product's own automation,
+which drives the UI through the accessibility tree and refuses to act when a
+selector matches more than one element (`StepResult::FailedAmbiguous`, see
+`replay-window-selector-ambiguity.md`).
+
+**The name alone would not have fixed it, which is why the label carries the
+position.** Playbook names are not unique — nothing enforces uniqueness at any
+layer — so `Delete <name>` produces two identical labels for two recordings
+called the same thing. That is not hypothetical; it is the case the fix was
+tested against.
+
+Two playbooks both named `"Duplicate Name Probe"`, seeded into a scratch store
+and driven through the real app:
+
+```
+  playbooks listed: ["Duplicate Name Probe, 1 of 2", "Duplicate Name Probe, 2 of 2"]
+```
+
+Distinct, and readable aloud — which a UUID suffix would not have been.
+
+The change lives on `frontend-dev`, since that is where the UI is. It was
+committed on its own: that worktree had an unrelated in-progress edit to
+`confidence-calibration-never-recorded.md`, left untouched.
+
 ### The UI test found a real defect that no unit test would have
 
 > Applies to the **removed** `PlaybookList.tsx`, not to `frontend-dev`'s dialog,
