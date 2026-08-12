@@ -114,3 +114,72 @@ button {
     background-color: #0f0f0f69;
   }
 }
+
+/* Playbook list and its delete confirmation.
+ *
+ * The confirmation is FIXED and centred, not inline. Rendered in normal flow it
+ * appeared below the fold on a short window -- UI automation reported
+ * "Element is offscreen" and the click never landed, which is exactly what a
+ * user would experience as "I pressed Delete and nothing happened". A
+ * confirmation that can scroll out of view is worse than none, because the
+ * destructive action looks broken rather than guarded. */
+.playbooks {
+  margin-top: 2rem;
+  text-align: left;
+}
+
+.playbook-list {
+  list-style: none;
+  padding: 0;
+}
+
+.playbook-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 0;
+}
+
+.playbook-name {
+  font-weight: 600;
+}
+
+.playbook-meta {
+  opacity: 0.7;
+  font-size: 0.85em;
+  margin-right: auto;
+}
+
+.playbooks-error {
+  color: #b00020;
+}
+
+.confirm-delete {
+  position: fixed;
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000;
+  max-width: 28rem;
+  padding: 1.25rem 1.5rem;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #0f0f0f;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+  text-align: left;
+}
+
+.confirm-delete .confirm-detail {
+  opacity: 0.75;
+  font-size: 0.9em;
+}
+
+.confirm-delete button {
+  margin-right: 0.5rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .confirm-delete {
+    background: #1f1f1f;
+    color: #f6f6f6;
+  }
+}

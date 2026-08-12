@@ -7432,11 +7432,308 @@ async fn closewins_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------- deleteui modes ----
+// End-to-end verification of the delete-playbook control through the REAL app.
+//
+// Pointed at a scratch store via `PARADIGM_DATA_DIR`, never the user's real
+// database. The whole point of the feature is removing recordings, so a test
+// that practised on real ones would be a poor trade.
+//
+//   seedplaybooks <dir>   put two known playbooks in a scratch store
+//   deleteui              drive the running app: delete one, keep the other
+//
+// The control playbook is the point. "The row disappeared" is also what a
+// delete-everything bug looks like.
+
+async fn seedplaybooks_mode() -> ExitCode {
+    use paradigm_lib::capture::stream::{ActionCandidate, CapturedStream};
+    use paradigm_lib::capture::{ActionKind, ExclusionList};
+    use paradigm_lib::compile::{compile, store, ReversibilityPolicy};
+    use paradigm_lib::labeling::RedactionPolicy;
+
+    let dir = match std::env::args().skip_while(|a| a != "seedplaybooks").nth(1) {
+        Some(d) => std::path::PathBuf::from(d),
+        None => {
+            eprintln!("usage: seedplaybooks <data-dir>");
+            return ExitCode::FAILURE;
+        }
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("could not create {}", dir.display());
+        return ExitCode::FAILURE;
+    }
+
+    let (db_path, key_path) = paradigm_lib::db::paths_in(&dir);
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("could not open scratch db: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
+    stream.admit(ActionCandidate {
+        kind: ActionKind::Click,
+        identifiers: vec!["probe.exe".into()],
+        process_name: Some("probe.exe".into()),
+        element_role: Some("Button".into()),
+        element_name: Some("Go".into()),
+        payload: None,
+        detail: None,
+        timestamp_ms: 0,
+    });
+    let actions = stream.actions().to_vec();
+
+    for name in ["DeleteMe Probe", "KeepMe Probe"] {
+        let pb = compile(
+            &actions,
+            name,
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        if let Err(e) = store::store(&mut conn, &pb) {
+            eprintln!("store failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!("  seeded {name:?} id={}", pb.id);
+    }
+    match store::list(&conn) {
+        Ok(rows) => println!("  scratch store now holds {} playbook(s)", rows.len()),
+        Err(e) => println!("  could not list: {e}"),
+    }
+    ExitCode::SUCCESS
+}
+
+/// Names of playbooks that currently have a Delete control on screen.
+async fn delete_controls(desktop: &Desktop, window: &UIElement) -> Vec<(String, UIElement)> {
+    // Retried, and errors are REPORTED rather than swallowed. The first version
+    // used `if let Ok(all)`, and the first enumeration against a freshly
+    // activated webview came back Err -- so it returned an empty list that was
+    // indistinguishable from "the UI rendered nothing". It had rendered fine.
+    for attempt in 1..=3 {
+        match desktop
+            .locator("role:Button")
+            .within(window.clone())
+            .all(Some(Duration::from_secs(6)), None)
+            .await
+        {
+            Ok(all) => {
+                let found: Vec<(String, UIElement)> = all
+                    .iter()
+                    .filter_map(|b| {
+                        let n = b.name().unwrap_or_default();
+                        n.strip_prefix("Delete ")
+                            .filter(|rest| *rest != "permanently")
+                            .map(|rest| (rest.to_string(), b.clone()))
+                    })
+                    .collect();
+                if !found.is_empty() || attempt == 3 {
+                    return found;
+                }
+                println!("    (attempt {attempt}: {} buttons, none a delete control)", all.len());
+            }
+            Err(e) => println!("    (attempt {attempt}: enumerating buttons failed: {e})"),
+        }
+        tokio::time::sleep(Duration::from_millis(800)).await;
+    }
+    Vec::new()
+}
+
+async fn deleteui_mode() -> ExitCode {
+    println!("== delete a playbook through the real app UI ==\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let window = match desktop
+        .locator("role:Window|name:paradigm")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(10)), Some(3))
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    {
+        Some(w) => w,
+        None => {
+            println!("  INCONCLUSIVE: the app window was not found. Is the dev app running,");
+            println!("  with PARADIGM_DATA_DIR pointed at the scratch store?");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  app window: {:?}", window.name().unwrap_or_default());
+    let _ = window.activate_window();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let before = delete_controls(&desktop, &window).await;
+    println!(
+        "  playbooks listed: {:?}",
+        before.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()
+    );
+    let Some((_, delete_btn)) = before.iter().find(|(n, _)| n.starts_with("DeleteMe")) else {
+        // Distinguish "the UI did not render the list" from "the search did not
+        // see it" -- opposite problems, and an empty result looks identical.
+        println!("\n  no delete control found; dumping what the window DOES expose:");
+        for sel in ["role:Text", "role:Button", "role:Document"] {
+            if let Ok(all) = desktop
+                .locator(sel)
+                .within(window.clone())
+                .all(Some(Duration::from_secs(5)), None)
+                .await
+            {
+                println!("    {sel} -> {} element(s)", all.len());
+                for el in all.iter().take(12) {
+                    let n = el.name().unwrap_or_default();
+                    let t = el.text(0).unwrap_or_default();
+                    if !n.trim().is_empty() || !t.trim().is_empty() {
+                        println!("      name={n:?} text={:?}", t.chars().take(80).collect::<String>());
+                    }
+                }
+            } else {
+                println!("    {sel} -> Err");
+            }
+        }
+        println!("\n  INCONCLUSIVE: no 'DeleteMe Probe' row on screen.");
+        return ExitCode::FAILURE;
+    };
+    if !before.iter().any(|(n, _)| n.starts_with("KeepMe")) {
+        println!("\n  INCONCLUSIVE: the control playbook is missing, so this run could not");
+        println!("  tell a correct delete from one that removed everything.");
+        return ExitCode::FAILURE;
+    }
+
+    println!("\n-- clicking Delete --");
+    robust_click(&desktop, delete_btn);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // The confirmation must NAME the playbook, and this has to be checked
+    // against the DIALOG rather than the page: the list row also contains the
+    // name, so a whole-window search reports success even if no dialog opened.
+    // "This cannot be undone" appears only inside the dialog, so it is what
+    // proves the dialog is what was read.
+    let mut named = false;
+    let mut dialog_seen = false;
+    if let Ok(texts) = desktop
+        .locator("role:Text")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for t in &texts {
+            let n = t.name().unwrap_or_default();
+            if n.contains("This cannot be undone") {
+                dialog_seen = true;
+            }
+            if n.contains("DeleteMe Probe") && n.contains("Delete") {
+                println!("  confirmation names it: {n:?}");
+                named = true;
+            }
+        }
+    }
+    if !dialog_seen {
+        println!("  !! the confirmation dialog was not detected on screen");
+    }
+    named = named && dialog_seen;
+    if !named {
+        println!("  !! the confirmation did not name the playbook");
+    }
+
+    let confirm = desktop
+        .locator("role:Button|name:Delete permanently")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next());
+    let Some(confirm) = confirm else {
+        println!("\n  INCONCLUSIVE: no 'Delete permanently' button appeared.");
+        return ExitCode::FAILURE;
+    };
+    println!("-- confirming --");
+    // Prefer the element's own invoke over a coordinate click: a webview button
+    // is a DOM node, and hit-testing it by screen position is the part most
+    // likely to miss. Fall back only if invoke errors.
+    match confirm.click() {
+        Ok(_) => println!("  clicked via UIA invoke"),
+        Err(e) => {
+            println!("  invoke failed ({e}); falling back to a coordinate click");
+            robust_click(&desktop, &confirm);
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Whatever the app is saying now -- an error here is the difference between
+    // "the click missed" and "the delete was refused".
+    if let Ok(texts) = desktop
+        .locator("role:Text")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for t in &texts {
+            let n = t.name().unwrap_or_default();
+            if n.contains("Could not delete") || n.contains("error") {
+                println!("  app reports: {n:?}");
+            }
+        }
+    }
+
+    let after = delete_controls(&desktop, &window).await;
+    let names: Vec<String> = after.iter().map(|(n, _)| n.clone()).collect();
+    println!("\n  playbooks after delete: {names:?}");
+
+    let gone = !names.iter().any(|n| n.starts_with("DeleteMe"));
+    let kept = names.iter().any(|n| n.starts_with("KeepMe"));
+
+    println!("\n================ VERDICT ================\n");
+    println!("  confirmation named the playbook : {named}");
+    println!("  deleted row is gone from the UI : {gone}");
+    println!("  the other playbook survived     : {kept}");
+    if named && gone && kept {
+        println!("\n  PASS: deleting through the real UI removed exactly the chosen");
+        println!("  playbook, and the list re-read the store to prove it.");
+    } else {
+        println!("\n  NOT A CLEAN PASS -- see above.");
+    }
+    ExitCode::SUCCESS
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     paradigm_lib::replay::ensure_dpi_aware();
     init_tracing();
 
+    if std::env::args().any(|a| a == "seedplaybooks") {
+        return seedplaybooks_mode().await;
+    }
+    // Ground truth for the UI test: what the scratch store actually holds.
+    if std::env::args().any(|a| a == "listplaybooks") {
+        let dir = std::env::args()
+            .skip_while(|a| a != "listplaybooks")
+            .nth(1)
+            .unwrap_or_default();
+        let (db, key) = paradigm_lib::db::paths_in(std::path::Path::new(&dir));
+        match paradigm_lib::db::open(&db, &key)
+            .and_then(|c| paradigm_lib::compile::store::list(&c).map_err(Into::into))
+        {
+            Ok(rows) => {
+                println!("  store holds {} playbook(s):", rows.len());
+                for r in &rows {
+                    println!("    {:?}", r.name);
+                }
+            }
+            Err(e) => println!("  could not read store: {e}"),
+        }
+        return ExitCode::SUCCESS;
+    }
+    if std::env::args().any(|a| a == "deleteui") {
+        return deleteui_mode().await;
+    }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
     }
