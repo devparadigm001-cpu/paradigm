@@ -131,25 +131,62 @@ above states there is no delete at any layer. By the time it was picked up,
 registration, three store tests and two IPC tests were **already present**. The
 doc had gone stale; the store and IPC halves needed no work.
 
-What genuinely did not exist was the **UI**, and the reason is worth recording:
-there is no stored-playbooks screen on any branch. `src/App.tsx` is the Tauri
-scaffold, and `frontend-dev` is rooted at `src-tauri/` with no React at all. So
-"add a delete control to the stored-playbooks list" had no list to attach to —
-the minimal surface had to be built with it.
+### The UI already existed too — on `frontend-dev`
 
-### What was added
+**This section originally claimed there was no stored-playbooks screen on any
+branch, and that `frontend-dev` had no React at all. Both were false.**
+`frontend-dev` carries a complete implementation:
 
-`src/PlaybookList.tsx`: lists playbooks from `list_playbooks`, a Delete button
-per row, and a confirmation that **names the playbook** and states that run
-history is kept. After a successful delete the list re-reads the store rather
-than removing the row locally, so what is shown is the store's answer rather
-than the component's guess.
+* `src/App.tsx` → `StoredPlaybooksSection`: lists via TanStack Query
+  (`useQuery(["playbooks"], list_playbooks)`), a Delete and a Replay per row,
+  loading/empty/error states, a manual Refresh, per-row "Deleting…" state, and
+  `await refetch()` after a successful delete so the list reflects the store.
+* `src/components/delete-playbook/DeletePlaybookDialog.tsx` — a Radix
+  `AlertDialog` naming the playbook and its step count, with ESC and
+  click-outside disabled so only the explicit buttons resolve it.
+* `src/components/delete-playbook/useDeletePlaybookConfirmation.tsx` — a
+  reusable hook matching the codebase's existing
+  `useAutomationPreview` / `useAccessibilityPermissionGate` pattern.
 
-The confirmation names the target deliberately. A generic "are you sure?" is the
-prompt most likely to be clicked through by reflex, and the mistake it would wave
-past — deleting the wrong recording — cannot be undone.
+**How the wrong conclusion was reached, because the mechanism matters more than
+the mistake.** The check was `git ls-tree -r --name-only origin/frontend-dev |
+grep '\.tsx$'`, run from inside `src-tauri/`. Git resolves `ls-tree` paths
+relative to the current directory, so it silently searched only that subtree and
+returned nothing. Empty output was read as "no such files". That is the
+absence-as-data error catalogued in `replay-window-selector-ambiguity.md` — made
+here for the sixth time, while writing a document that records the pattern. The
+correct invocation needs `--full-tree`, or to be run from the repository root.
+
+### What was built, and then removed
+
+A `src/PlaybookList.tsx` was added on `backend-dev` (commit `dbf33b7`) — list,
+per-row Delete, and a confirmation naming the playbook. It was **removed again**
+once `frontend-dev`'s implementation came to light, because it duplicated it and
+was worse in every respect that was compared: a hand-rolled `<div role="dialog">`
+instead of Radix (no focus trap, no ESC handling), a locally redeclared
+`PlaybookSummary` type instead of importing the shared `PlaybookSummaryView`, and
+no Replay, error state, or manual refresh. Its one apparent advantage —
+re-reading the store after a delete rather than dropping the row locally — turned
+out to be present already, as `await refetch()`.
+
+It is recorded rather than quietly erased because the sequence is the useful
+part: a duplicate implementation is what a bad cross-branch check produces, and
+the duplicate would have merged **silently** — `PlaybookList.tsx` existed only on
+one side, so a merge adds it with no conflict to force anyone to look.
+
+### The one thing carried across
+
+Per-row delete controls on `frontend-dev` all had the same accessible name
+("Delete"), so nothing could tell them apart. That matters for this product
+specifically, whose own tooling drives the UI through the accessibility tree, and
+whose replay refuses to act on exactly this condition (`FailedAmbiguous`). The
+labels are now unique — see "Disambiguating the delete controls".
 
 ### The UI test found a real defect that no unit test would have
+
+> Applies to the **removed** `PlaybookList.tsx`, not to `frontend-dev`'s dialog,
+> which is a Radix `AlertDialog` and was never in document flow. Kept because the
+> lesson is about the method, not the component.
 
 First run through the real app: the confirm button was unreachable.
 
@@ -164,6 +201,11 @@ guarded, which is worse than no confirmation at all. Fixed by making it a fixed,
 centred overlay. Every layer had passed its own tests while this was true.
 
 ### Verified end to end, against a scratch store
+
+> Run against the removed `PlaybookList.tsx`. What it establishes that outlives
+> the component is the **backend** path: `delete_playbook` over real IPC removes
+> exactly one playbook and the store agrees. `frontend-dev`'s UI calls the same
+> command.
 
 Driven through the real app with `PARADIGM_DATA_DIR` pointed at a throwaway
 directory — never the real database, since the feature's whole purpose is
