@@ -6,7 +6,7 @@ path to the assert is identified, and the failing-grammar characterisation below
 turned out to be **wrong** and is corrected. Still reproduces on the newest
 release (0.1.154). The workaround is sufficient for how the product actually uses
 this, so the remaining work is an upstream report — drafted under "Upstream
-report", not filed. See "Second investigation".
+report, ready to file", not filed. See "Second investigation".
 **Affected:** `llama-cpp-2` 0.1.153 / `llama-cpp-sys-2` 0.1.153 (vendored llama.cpp).
 **Platform:** Windows 11, MSVC, CPU-only build. Not tested elsewhere.
 **Found:** 2026-08-04, during the Phase 1 Step 4a inference probe.
@@ -194,9 +194,10 @@ rather than about the bug:
   llama.cpp's test suite is speculative work on a third-party defect, on top of
   a 16-minute rebuild already spent, when the report can be filed without it.
 
-## Upstream report (drafted, not filed)
+## Upstream report, ready to file
 
-Everything needed is here; it could not be submitted from this session.
+Everything needed is here; it could not be submitted from this session (filing
+needs a personal GitHub account).
 
 **Where:** `utilityai/llama-cpp-rs` (the `llama-cpp-2` crate). Possibly
 `ggml-org/llama.cpp` if the maintainers confirm the vendored source is at fault —

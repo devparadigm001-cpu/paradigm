@@ -6,7 +6,10 @@ into it silently. `press_key` is now called in `src/` (it was not when this doc
 was written), so the exposure moved from latent to real-but-contained, and the
 containment is a test rather than a comment. See "The decision".
 **Affected:** `terminator-rs` 0.23.35,
-`platforms/windows/element.rs:1160-1169`. Any caller of
+`platforms/windows/element.rs:1161-1170` (line numbers re-verified against the
+published 0.23.35 source, 2026-08-12). The upstream report is drafted and ready
+to paste under "Upstream report, ready to file"; only submission remains, which
+needs a personal GitHub account. Any caller of
 `UIElement::press_key` with a key naming Enter or Return, against a target where
 `End` means something.
 **Platform:** Windows. Demonstrated in Google Sheets; the mechanism is not
@@ -207,6 +210,151 @@ it does not need to be: it is harmless wherever this codebase calls it today. Th
 whole risk was that a future edit would reintroduce it *silently*. A failing test
 at that exact edit removes the silence, which is the property that mattered.
 
+## Upstream report, ready to file
+
+Everything needed is below; it could not be submitted from this session (filing
+needs a personal GitHub account). Paste as-is.
+
+**Where:** `mediar-ai/terminator` — **confirmed, not assumed.** The crate
+manifest for `terminator-rs` 0.23.35 gives
+`repository = "https://github.com/mediar-ai/terminator"`, and the injection is
+terminator's own code at `src/platforms/windows/element.rs:1161-1170`. It is
+*not* in the `uiautomation` crate: that crate only provides `send_keys`, which
+sends exactly what it is given. The `{LEFT}{END}` preamble is added by
+terminator before calling it.
+
+**Title:** `press_key` silently injects `{LEFT}{END}` before any Enter/Return,
+relocating the cursor in grids and spreadsheets
+
+**Version:** `terminator-rs` 0.23.35. Verified present in the published source.
+
+**Platform:** Windows. Demonstrated in Google Sheets; the mechanism is not
+Sheets-specific — it affects any target where `End` is a navigation key.
+
+### The defect
+
+`UIElement::press_key` sends two extra keystrokes before the requested key
+whenever the key name contains `ENTER` or `RETURN`:
+
+```rust
+// Dismiss inline autocomplete before pressing Enter/Return
+// This prevents unwanted autocomplete suggestions (e.g., Chrome address bar) from being accepted
+let key_upper = key.to_uppercase();
+if key_upper.contains("ENTER") || key_upper.contains("RETURN") {
+    let _ = self.element.0.send_keys("{LEFT}", 10);
+    let _ = self.element.0.send_keys("{END}", 10);
+}
+
+self.element.0.send_keys(key, 10)
+```
+
+The intent is clear from the comment and is reasonable **for its stated case**:
+in a browser address bar, `Left` then `End` dismisses an inline autocomplete
+suggestion and restores the caret. In a single-line text field it is invisible
+and harmless.
+
+**In a grid it is neither.** `End` is a navigation key there — in Google Sheets
+it moves the cursor toward the last column of the data region. So
+`press_key("{Enter}")` does not mean "commit this cell"; it means "move
+somewhere else, then commit".
+
+**There is no way to opt out through the public API.** The condition is a
+substring test on the key name, and the only two spellings the underlying crate
+accepts for that key — `ENTER` and `RETURN` — both match. There is no other name
+that reaches `VK_RETURN`.
+
+### Expected vs actual
+
+**Expected:** `press_key("{Enter}")` sends Enter.
+
+**Actual:** it sends `{LEFT}`, then `{END}`, then Enter — and reports success.
+Nothing in the signature, the name, or the documentation suggests three
+keystrokes are sent.
+
+### Reproduction
+
+1. Open a Google Sheets document (any grid where `End` navigates).
+2. Select cell `A1`.
+3. With terminator, type a value into the cell editor and commit it with
+   `element.press_key("{Enter}")`.
+4. Repeat for a second value.
+5. **Export the sheet as CSV** — do not read the position back from the UI that
+   produced it.
+
+### Measured evidence
+
+Ground truth is Sheets' own CSV export, not the accessibility tree:
+
+```
+  "111,,,,,,,,,,,,,,,,,,,,,,,,,alpha"
+  ",,,,,,,,,,,,,,,,,,,,,,,,,betagamma"
+```
+
+`111` is in `A1`, where it was typed. `alpha` is in **column 26 — `Z1`** — and
+`betagamma` in `Z2`. **Twenty-five empty columns of drift**, in a document where
+the only navigation performed between edits was a commit.
+
+**The control isolates the cause to exactly one variable.** An identical run
+committing with `{Tab}` instead — which also commits a cell edit, and contains
+neither `ENTER` nor `RETURN`, so it is sent verbatim:
+
+```
+    row 1   "apple,banana,cherry"
+```
+
+`A1`, `B1`, `C1`. No drift, three runs, identical. The only difference between
+the two experiments is which key committed the edit.
+
+This was initially misdiagnosed as a phantom accessibility element reporting a
+fake position, because the element carried a stable runtime id across documents.
+The CSV settles it: the data physically went to column Z. The position was real,
+and the automation put it there.
+
+### Why this is particularly dangerous for an automation library
+
+1. **It is silent.** The key is sent, `press_key` returns `Ok`, and the run
+   reports success. There is no error to catch and nothing in the return value
+   distinguishes a correct commit from a commit 25 columns away.
+2. **It corrupts data rather than failing.** In a spreadsheet the result is a
+   write to the wrong cell in a real document — not a no-op, not an exception, a
+   wrong value in the wrong place that persists.
+3. **It is invisible from the call site.** `press_key("{Enter}")` reads as one
+   keystroke, so the behaviour cannot be inferred from the calling code and will
+   not be found by review.
+4. **It cost real investigation time.** It corrupted every cell-targeting
+   measurement in an unrelated investigation and made a working prototype look
+   unreliable, until the CSV export was used as ground truth.
+5. **Automation is exactly the context where the workaround is least needed.** A
+   programmatic `press_key` on a spreadsheet cell has no inline autocomplete to
+   dismiss; the workaround targets a browser address bar interaction that a grid
+   commit never involves.
+
+### Suggested fix
+
+Any of these resolves it; they are listed cheapest-first:
+
+1. **Make it opt-in.** A `press_key_raw()`, or a parameter/builder flag such as
+   `dismiss_inline_autocomplete: bool` defaulting to `false`. Callers that want
+   the address-bar behaviour ask for it.
+2. **Scope it to the case it was written for.** `press_key` already fetches
+   `control_type` immediately above this block (`element.rs:1155`). Applying the
+   preamble only for an address-bar-like target — e.g. an `Edit`/`ComboBox` in a
+   browser window, and never for a grid, document, or spreadsheet control —
+   would keep the intended benefit and remove the damage.
+3. **At minimum, document it.** If the behaviour must stay unconditional, say so
+   in the `press_key` doc comment, since it cannot currently be discovered
+   without reading the source.
+
+Option 1 is preferable: the current behaviour is correct for a narrow case and
+wrong applied universally, which is what a flag expresses.
+
+### Note for the maintainer
+
+A caller that needs a genuine Enter today has no workaround through the public
+API — every accepted spelling of the key matches the substring test. Downstream
+code must avoid the key entirely (committing with `{Tab}` where the target
+allows it), which is not always possible.
+
 ## What to do about it
 
 Not fixed this session; this is the record, not the change.
@@ -216,11 +364,15 @@ Not fixed this session; this is the record, not the change.
       test that was verified to fail when the key is swapped for Enter.
 - [x] ~~**Add a guard if replay ever grows a key-press path.**~~ It grew one —
       `grid_type` — and the guard landed with it.
-- [ ] **Raise it upstream.** Still worth a `terminator-rs` issue: the workaround
-      is right for a browser address bar and wrong applied to every Enter, so it
-      belongs behind an opt-in. Not something this session can file, and
-      deliberately not the containment — an upstream fix arrives on someone
-      else's timeline against a version this project pins.
+- [ ] **Raise it upstream.** Still worth a `mediar-ai/terminator` issue: the
+      workaround is right for a browser address bar and wrong applied to every
+      Enter, so it belongs behind an opt-in. **The report is now written and
+      ready to paste** — see "Upstream report, ready to file", including the
+      repo confirmation that the injection is terminator's own code and not the
+      `uiautomation` crate's. Still not filable from this session: submitting
+      needs a personal GitHub account. Deliberately not the containment — an
+      upstream fix arrives on someone else's timeline against a version this
+      project pins.
 - [ ] **Re-check on upgrade.** Pinned to 0.23.35 by observation. If the version
       moves, confirm whether the preamble is still unconditional — and note the
       guard above would NOT notice if upstream silently widened the injection to
