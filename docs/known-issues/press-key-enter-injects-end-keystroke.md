@@ -1,9 +1,10 @@
 # `press_key` with Enter injects a hidden `{END}`, which moves the cursor in a grid
 
-**Status:** confirmed in the library source and reproduced against live Google
-Sheets, with the resulting misplacement verified in the saved document.
-**Latent in Paradigm, not live** — see "Is this shipping today?", which corrects
-the assumption this doc was opened with.
+**Status: CLOSED, 2026-08-11 — guarded, not fixed upstream.** The defect is real
+and remains in `terminator-rs`; what changed is that Paradigm can no longer walk
+into it silently. `press_key` is now called in `src/` (it was not when this doc
+was written), so the exposure moved from latent to real-but-contained, and the
+containment is a test rather than a comment. See "The decision".
 **Affected:** `terminator-rs` 0.23.35,
 `platforms/windows/element.rs:1160-1169`. Any caller of
 `UIElement::press_key` with a key naming Enter or Return, against a target where
@@ -80,6 +81,11 @@ the two experiments is which key committed the edit.
 
 ## Is this shipping today?
 
+> **Superseded later the same day.** This section was true when written and is
+> kept for the severity correction it records. It is no longer accurate: `src/`
+> now calls `press_key` in `replay::grid_type`, so the "zero occurrences" finding
+> below has expired. See "The decision" for the current position.
+
 **No, and the reason is worth stating precisely rather than assuming either way.**
 
 `grep -rn "press_key" src/` returns **zero occurrences**. Paradigm's replay never
@@ -126,21 +132,99 @@ Three reasons this is worth a document rather than a footnote:
    keystroke. Nothing in the signature, the name, or the documentation suggests
    three are sent.
 
+## The decision (2026-08-11)
+
+### The premise changed first: this is no longer unreachable
+
+This doc concluded that `press_key` appears zero times in `src/`. **That is no
+longer true.** `replay::grid_type`, added later the same day to replay Sheets
+cell edits, calls it twice:
+
+| Call | Injects `{LEFT}{END}`? | Safe? |
+|---|---|---|
+| `name_box.press_key("{Enter}")` | **yes** | yes — inside a text field those are caret moves |
+| `committer.press_key("{Tab}")` | no — "Tab" contains neither ENTER nor RETURN | yes |
+
+So the injection now fires on **every grid replay**, harmlessly, by design. The
+exposure is not "some future call site might do this"; it is "one edit to an
+existing call site turns a working replay into a silent wrong-cell write". That
+is a materially different risk from the one this doc was opened with, and it
+narrows the choice.
+
+### Not patching the dependency
+
+Vendoring or `[patch]`-ing `terminator-rs` was rejected on two grounds, neither
+of them squeamishness:
+
+* **No precedent.** `Cargo.toml` has no `[patch]` section and no `path`/`git`
+  dependencies; everything is a pinned registry version. (`rusqlite`'s
+  `bundled-sqlcipher-vendored-openssl` is a crate feature, not a patched
+  dependency.) Introducing dependency patching means re-applying and re-verifying
+  it on every version bump, forever.
+* **Disproportionate to the exposure.** Both existing call sites are already
+  correct. A patch would buy nothing today and cost maintenance indefinitely.
+
+### Not fixing it upstream either — though it should be reported
+
+The workaround is correct for its stated case and wrong applied unconditionally;
+it belongs behind an opt-in flag. That is a real upstream bug and worth filing.
+But an upstream fix lands on someone else's timeline, against a version this
+project pins, so it cannot be the thing that protects this codebase. **Filing it
+remains a genuine open item** — see below — it is just not the containment.
+
+### What was done: a guard that fails, where the mistake would be made
+
+A comment cannot fail, and this doc already had one at the exact call site. So
+the rule is now executable:
+
+* `press_key_injects_navigation(key)` states the rule — any key naming ENTER or
+  RETURN is prefixed with `{LEFT}{END}` — with the measurement behind it.
+* `GRID_COMMIT_KEY` names the commit key instead of hard-coding `"{Tab}"` inline.
+* `the_grid_commit_key_cannot_relocate_the_cursor` asserts the commit key is not
+  one that injects, and separately pins the rule itself so the assertion cannot
+  rot into a tautology.
+* `the_name_box_enter_is_deliberate_and_safe` records why the *same key* is
+  correct in one call and wrong in the other — the distinction most likely to be
+  lost by someone later "making the two consistent".
+* A `debug_assert!` at the call site, for anyone reading the code rather than the
+  tests.
+
+**The guard was verified to fail.** Substituting `"{Enter}"` for
+`GRID_COMMIT_KEY` produces:
+
+```
+test replay::tests::the_grid_commit_key_cannot_relocate_the_cursor ... FAILED
+assertion failed: !press_key_injects_navigation(GRID_COMMIT_KEY)
+```
+
+A green test that cannot go red would have been the same as the comment it
+replaced.
+
+### Why this is the proportionate answer
+
+The defect cannot be removed from a pinned dependency without owning a patch, and
+it does not need to be: it is harmless wherever this codebase calls it today. The
+whole risk was that a future edit would reintroduce it *silently*. A failing test
+at that exact edit removes the silence, which is the property that mattered.
+
 ## What to do about it
 
 Not fixed this session; this is the record, not the change.
 
-- [ ] **Do not use `press_key` with Enter against grids.** Use `{Tab}` where it
-      commits, or `type_text`, which sends exactly what it is given. If Enter is
-      genuinely required, the injection has to be worked around at a lower level.
-- [ ] **Add a guard if replay ever grows a key-press path.** The cheapest form is
-      a lint or a wrapper that refuses `press_key` with Enter, so the decision is
-      forced at the call site rather than discovered in a spreadsheet.
-- [ ] **Raise it upstream.** The workaround is correct for its stated case and
-      wrong in general; it belongs behind an opt-in flag rather than applied to
-      every Enter unconditionally. Worth a `terminator-rs` issue.
+- [x] ~~**Do not use `press_key` with Enter against grids.**~~ Encoded as
+      `GRID_COMMIT_KEY` plus `press_key_injects_navigation`, and enforced by a
+      test that was verified to fail when the key is swapped for Enter.
+- [x] ~~**Add a guard if replay ever grows a key-press path.**~~ It grew one —
+      `grid_type` — and the guard landed with it.
+- [ ] **Raise it upstream.** Still worth a `terminator-rs` issue: the workaround
+      is right for a browser address bar and wrong applied to every Enter, so it
+      belongs behind an opt-in. Not something this session can file, and
+      deliberately not the containment — an upstream fix arrives on someone
+      else's timeline against a version this project pins.
 - [ ] **Re-check on upgrade.** Pinned to 0.23.35 by observation. If the version
-      moves, confirm whether the preamble is still unconditional.
+      moves, confirm whether the preamble is still unconditional — and note the
+      guard above would NOT notice if upstream silently widened the injection to
+      other keys, since it only knows about ENTER and RETURN.
 
 ## Related
 

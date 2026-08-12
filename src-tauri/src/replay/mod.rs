@@ -90,6 +90,33 @@ const WINDOW_LOCATE_TIMEOUT: Duration = Duration::from_secs(8);
 /// to expire.
 const ELEMENT_LOCATE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Does `press_key` send this key verbatim, or inject navigation first?
+///
+/// `terminator-rs` 0.23.35 sends `{LEFT}` then `{END}` before any key naming
+/// Enter or Return (`platforms/windows/element.rs:1163`) as a workaround for
+/// inline autocomplete in a browser address bar. In a text field those are
+/// harmless caret moves. **In a grid `{END}` is navigation** -- it jumps to the
+/// last column of the data region, so the sequence becomes "move somewhere else,
+/// then commit". Reproduced against live Google Sheets with the misplacement
+/// confirmed in the CSV export: values typed into consecutive cells landed 25
+/// columns away. See docs/known-issues/press-key-enter-injects-end-keystroke.md.
+///
+/// There is no way to opt out through the public API -- the condition is a
+/// substring test, and both spellings the underlying crate accepts for that key
+/// match it.
+fn press_key_injects_navigation(key: &str) -> bool {
+    let key = key.to_uppercase();
+    key.contains("ENTER") || key.contains("RETURN")
+}
+
+/// The key that commits a grid cell edit.
+///
+/// Tab, not Enter, and the difference is load-bearing rather than stylistic --
+/// see `press_key_injects_navigation`. Named as a constant so the choice is
+/// pinned by `the_grid_commit_key_cannot_relocate_the_cursor` instead of living
+/// only in a comment that an edit can quietly step past.
+const GRID_COMMIT_KEY: &str = "{Tab}";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayError {
     #[error(transparent)]
@@ -810,7 +837,11 @@ async fn grid_type(
     // step's Name Box navigation rather than by its own Tab -- and the final
     // step has no next step. Measured 2/3, twice, before this line changed.
     let committer = desktop.focused_element().unwrap_or(target);
-    if let Err(e) = committer.press_key("{Tab}") {
+    debug_assert!(
+        !press_key_injects_navigation(GRID_COMMIT_KEY),
+        "the grid commit key must not be one press_key prefixes with {{LEFT}}{{END}}"
+    );
+    if let Err(e) = committer.press_key(GRID_COMMIT_KEY) {
         return mk(
             StepResult::FailedAction,
             format!("typed into cell {cell:?} but committing it failed: {e}"),
@@ -1138,6 +1169,37 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn the_grid_commit_key_cannot_relocate_the_cursor() {
+        // The guard for a latent defect in `terminator-rs`: `press_key` prefixes
+        // any Enter with `{LEFT}{END}`, and `{END}` in a grid jumps to the last
+        // column of the data region. Changing `GRID_COMMIT_KEY` to Enter would
+        // silently write to the wrong cell -- measured, values landed 25 columns
+        // away and the CSV export proved it.
+        //
+        // This test exists because a comment cannot fail. If someone swaps the
+        // commit key, this goes red with a name that explains why.
+        assert!(!press_key_injects_navigation(GRID_COMMIT_KEY));
+
+        // The rule itself, so the guard cannot rot into a tautology.
+        assert!(press_key_injects_navigation("{Enter}"));
+        assert!(press_key_injects_navigation("{ENTER}"));
+        assert!(press_key_injects_navigation("{Return}"));
+        assert!(!press_key_injects_navigation("{Tab}"));
+        assert!(!press_key_injects_navigation("{Escape}"));
+    }
+
+    #[test]
+    fn the_name_box_enter_is_deliberate_and_safe() {
+        // `grid_type` DOES send Enter to the Name Box, and that is not an
+        // oversight. The injected `{LEFT}{END}` are caret moves inside a text
+        // field there, not grid navigation -- which is exactly why the same key
+        // is correct in one place and wrong in the other, a distinction easy to
+        // lose when someone later "makes the two consistent".
+        assert!(press_key_injects_navigation("{Enter}"));
+        assert_ne!(GRID_COMMIT_KEY, "{Enter}");
     }
 
     #[test]
