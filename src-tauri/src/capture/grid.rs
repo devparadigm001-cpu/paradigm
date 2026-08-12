@@ -45,9 +45,34 @@
 //! typed, but nothing here makes that replayable -- there is no element for a
 //! selector to resolve to. See the known-issues doc.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use terminator::Desktop;
 
 use super::stream::{ActionCandidate, ActionKind};
+
+// ------------------------------------------------------------------ timing --
+//
+// Two relaxed atomic adds per keystroke. This exists because the cost of
+// resolving the focused element on every key-down was flagged as suspected --
+// the observation came from a machine in an unusually loaded state, with no
+// user-facing symptom -- and "suspected" is not a number.
+static GRID_CALLS: AtomicU64 = AtomicU64::new(0);
+static GRID_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// (calls, total microseconds) spent in `observe_key` since the last reset.
+pub fn timing() -> (u64, u64) {
+    (
+        GRID_CALLS.load(Ordering::Relaxed),
+        GRID_MICROS.load(Ordering::Relaxed),
+    )
+}
+
+/// Zero the counters, so one run's numbers are its own.
+pub fn reset_timing() {
+    GRID_CALLS.store(0, Ordering::Relaxed);
+    GRID_MICROS.store(0, Ordering::Relaxed);
+}
 
 /// Does this name look like a spreadsheet cell reference (`A1`, `BC12`)?
 ///
@@ -144,6 +169,18 @@ impl GridCellWatcher {
     /// reporting a *different* cell than the one being tracked, which is how a
     /// click into another cell mid-edit shows up.
     pub fn observe_key(&mut self, key_code: u32, timestamp_ms: u64) -> Option<ActionCandidate> {
+        let started = std::time::Instant::now();
+        let out = self.observe_key_inner(key_code, timestamp_ms);
+        GRID_CALLS.fetch_add(1, Ordering::Relaxed);
+        GRID_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        out
+    }
+
+    fn observe_key_inner(
+        &mut self,
+        key_code: u32,
+        timestamp_ms: u64,
+    ) -> Option<ActionCandidate> {
         // Sample first: on a trigger key the editor is typically still alive at
         // key-down, but relying on that is the mistake this module exists to
         // avoid, so the sample that gets emitted is from an earlier keystroke.

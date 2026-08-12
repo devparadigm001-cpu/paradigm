@@ -795,6 +795,41 @@ fired on something other than a scenario built to trigger it.
 * **Sheet-agnostic.** The reference carries no sheet name, so a multi-tab
   workbook replays into whichever sheet is active.
 
+### The per-keystroke cost, measured (2026-08-11)
+
+`GridCellWatcher` resolves the focused element on every printable key-down, in
+every application, not just grids. That was flagged as *suspected* overhead after
+the Notepad runs took minutes for ~25 seconds of scripted activity — on a machine
+with seven Notepad windows open, with no user-facing symptom reported.
+
+The A/B: the same driven A–E web trial suite, run twice, once with the grid
+watcher compiled out (temporarily, via a `cfg` on its call in the pump).
+
+| | `observe_key` calls | total | mean/keystroke | trial score | actions |
+|---|---|---|---|---|---|
+| grid watcher **in** | 105 | 233.1 ms | **2.22 ms** | 5/5 | 13 |
+| grid watcher **out** | 0 | 0 ms | — | 5/5 | 13 |
+
+**Confirmed non-issue.** 2.22 ms sits against human inter-keystroke intervals of
+roughly 100–250 ms, so it is on the order of 1–2% of the gap between keys — and
+the work happens in the async pump, which is not what the typist waits on.
+Capture quality was byte-identical between the arms: same score, same action
+count.
+
+So the earlier suspicion was wrong, and the reason it looked plausible is worth
+keeping: the Notepad slowness that prompted it was never attributed to anything.
+It coincided with seven open Notepad windows, one holding a ~198 MB document, and
+this measurement makes the grid watcher an unlikely explanation for minutes of
+wall-clock.
+
+Two honest limits. This is a **mean over 105 keystrokes**; no maximum was
+captured, so a rare slow resolution would not show here. And it was measured in a
+browser — the non-grid context the question was about — not on the loaded machine
+where the original observation came from.
+
+The counters that produced these numbers (`grid::timing`, two relaxed atomics)
+are kept, so the question can be re-answered rather than re-argued.
+
 ### What is NOT fixed
 
 * **Replay.** A captured Sheets edit records the cell and the text, and nothing
@@ -806,7 +841,9 @@ fired on something other than a scenario built to trigger it.
   works for grids that name their editor after the cell. Excel Online and other
   grids remain untested.
 * **Cost.** One focused-element resolution per printable key-down, in every
-  application. Not measured under load.
+  application — measured at 2.22 ms mean and judged a non-issue; see "The
+  per-keystroke cost, measured". Still no maximum captured, and not measured on a
+  heavily loaded machine.
 
 ### What this means for a fix
 
@@ -944,15 +981,9 @@ immediately. Probe coverage has been measuring the environment it was built for.
 - [ ] **Carry the sheet name.** A reference alone replays into whichever tab is
       active, so a multi-sheet workbook can be written to the wrong sheet with
       everything reporting success.
-- [ ] **LOW PRIORITY — measure the per-keystroke cost.** One focused-element
-      resolution per printable key-down, in every application. The Notepad runs
-      took several minutes for ~25 seconds of scripted activity on a machine with
-      seven Notepad windows open, which makes this suspected rather than merely
-      theoretical — but it is not established, because the grid path was in the
-      build for every run and there is no before/after. Settling it needs a real
-      A/B: the same driven session with the grid watcher compiled out.
-      Deliberately deprioritised — no user-facing symptom has been reported, and
-      the observation comes from a machine in an unusually loaded state.
+- [x] ~~**Measure the per-keystroke cost.**~~ **Measured: 2.22 ms per keystroke,
+      and a confirmed non-issue.** The suspicion did not survive an A/B — see
+      "The per-keystroke cost, measured".
 - [ ] **Confirm the accessor mismatch on the recorder side.** Cell identity lives
       in `text()` on the Name Box input and in `name` on the editor, never in
       `value`. Capture reads `e.element_text` for clicks and `watched.name` for

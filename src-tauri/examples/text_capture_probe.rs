@@ -7554,6 +7554,7 @@ async fn main() -> ExitCode {
     // timing race measures the instrument: enabling the recorder's tracing was
     // recorded making this very defect vanish.
     paradigm_lib::capture::text::set_trace(true);
+    paradigm_lib::capture::grid::reset_timing();
 
     // ---- put the page on screen ------------------------------------------
     let page = std::env::temp_dir().join("paradigm-text-capture-probe.html");
@@ -7719,6 +7720,18 @@ async fn main() -> ExitCode {
     // The instrumented watcher trace. This is the evidence both prior attempts
     // at the no-settle race lacked: which route started each watch, on which
     // element, and what each flush actually saw.
+    // What the grid watcher cost, in a context with no grid in it at all.
+    let (grid_calls, grid_micros) = paradigm_lib::capture::grid::timing();
+    println!("\n================ GridCellWatcher COST ================\n");
+    println!("  observe_key calls   : {grid_calls}");
+    println!("  total time          : {:.1} ms", grid_micros as f64 / 1000.0);
+    if grid_calls > 0 {
+        println!(
+            "  mean per keystroke  : {:.3} ms",
+            grid_micros as f64 / grid_calls as f64 / 1000.0
+        );
+    }
+
     // Exclusions distinguish "the watcher produced nothing" from "it produced a
     // candidate the gate refused" -- opposite diagnoses, and the A-trial trace
     // shows an EMITTING line for a field that has no action in the report.
