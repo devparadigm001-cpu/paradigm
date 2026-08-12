@@ -1161,6 +1161,115 @@ mod tests {
         assert!(!resolved_is_recorded_target("To", "Write your prompt to Claude"));
     }
 
+    /// The library's candidate rule, mirrored so the tests below can reason
+    /// about it without a live desktop.
+    ///
+    /// `role:R|name:N` reaches an element whose name CONTAINS N, compared
+    /// case-INsensitively. Chain of evidence: terminator-rs 0.23.35
+    /// `platforms/windows/engine.rs:1205` builds `contains_name(name)`;
+    /// uiautomation-0.22.2 `core.rs:1823` makes that
+    /// `NameFilter { casesensitive: false, partial: true }`; `filters.rs:85-93`
+    /// evaluates it as
+    /// `element_name.to_lowercase().contains(&condition_name.to_lowercase())`.
+    fn library_would_yield(recorded: &str, name: &str) -> bool {
+        name.to_lowercase().contains(&recorded.to_lowercase())
+    }
+
+    #[test]
+    fn every_accepted_name_is_one_the_library_could_have_produced() {
+        // The load-bearing invariant of the two-layer design, stated as code.
+        //
+        // Resolution is a generator and an acceptor. The generator is the
+        // library's containment match, which decides the candidate set C. The
+        // acceptor is `resolved_is_recorded_target`, which decides the accepted
+        // set A. Replay acts on the single member of C n A.
+        //
+        // Correctness needs A subset-of C: a name the acceptor would accept must
+        // be one the generator can actually hand it. The generator being WIDER
+        // is not a defect, it is the required direction -- a narrower generator
+        // could only withhold candidates the acceptor wanted.
+        //
+        // This is what makes containment the right library-level behaviour and
+        // exact matching the right product-level behaviour, and it is why moving
+        // exact matching EARLIER cannot change a single outcome: any generator
+        // still containing A yields the same C n A. See
+        // docs/known-issues/selector-matching-precision.md.
+        //
+        // The failure this guards is silent. A future tolerance added here that
+        // is not a containment-subset -- stripping a leading "Draft ", say --
+        // would be dead code: it would read as working while the generator never
+        // produced such a candidate for it to accept.
+        const ALPHABET: [char; 4] = ['a', 'B', '*', ' '];
+        let mut corpus: Vec<String> = vec![String::new()];
+        for a in ALPHABET {
+            corpus.push(a.to_string());
+            for b in ALPHABET {
+                corpus.push(format!("{a}{b}"));
+                for c in ALPHABET {
+                    corpus.push(format!("{a}{b}{c}"));
+                }
+            }
+        }
+
+        for recorded in &corpus {
+            for resolved in &corpus {
+                if resolved_is_recorded_target(recorded, resolved) {
+                    assert!(
+                        library_would_yield(recorded, resolved),
+                        "acceptor takes {resolved:?} for recorded {recorded:?}, but the \
+                         library's containment match would never produce it -- the rule \
+                         can never fire"
+                    );
+                }
+            }
+        }
+
+        // The real measured names, not just the generated alphabet.
+        for (recorded, resolved) in [
+            ("Untitled - Notepad", "Untitled - Notepad"),
+            ("Untitled - Notepad", "*Untitled - Notepad"),
+            (
+                "DriftProbe - Personal - Microsoft Edge",
+                "*DriftProbe - Personal - Microsoft Edge",
+            ),
+            ("Text editor", "Text editor"),
+        ] {
+            assert!(resolved_is_recorded_target(recorded, resolved));
+            assert!(
+                library_would_yield(recorded, resolved),
+                "{resolved:?} is accepted for {recorded:?} but unreachable by containment"
+            );
+        }
+    }
+
+    #[test]
+    fn anchoring_would_not_have_rejected_the_measured_collision() {
+        // Records why the acceptor stayed at equality-modulo-'*' instead of
+        // moving to the prefix/suffix anchoring the known-issues doc proposed.
+        //
+        // Anchoring is strictly WEAKER than the shipped rule, and prefix
+        // anchoring fails against the very collision that motivated it: the
+        // recorded name is a PREFIX of the browser title, so "recorded name
+        // matches the beginning of the element name" accepts it.
+        let recorded = "Paradigm";
+        let collided = "Paradigm Text Capture Probe and 63 more pages - Personal - Microsoft Edge";
+
+        assert!(
+            collided.starts_with(recorded),
+            "the measured collision is a prefix match, so prefix anchoring would ACCEPT it"
+        );
+        assert!(
+            !resolved_is_recorded_target(recorded, collided),
+            "the shipped rule must reject what prefix anchoring would have allowed"
+        );
+
+        // Suffix anchoring rejects that one, but readmits a collision the
+        // shipped rule already rejects -- so neither anchoring direction is an
+        // improvement, in either direction.
+        assert!("Untitled - Notepad".ends_with("Notepad"));
+        assert!(!resolved_is_recorded_target("Notepad", "Untitled - Notepad"));
+    }
+
     #[test]
     fn identical_names_on_different_windows_are_not_detectable_by_the_name_check_alone() {
         // Pins the division of labour between the two checks at each resolution
