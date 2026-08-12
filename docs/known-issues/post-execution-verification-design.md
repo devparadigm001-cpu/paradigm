@@ -291,7 +291,14 @@ browser window title.
       end-state must be redacted for sensitive fields, B cannot verify those
       fields at all, and it is worth knowing that before paying for the
       implementation.
-- [ ] **Do not treat 3-of-4 as the coverage of a shipped feature.** It is the
-      coverage of three separate checks against four bugs already understood.
-      Bugs not yet found are not represented, and the checks were designed with
-      these four in view.
+
+### Standing note — not a task
+
+Deliberately not a checkbox: there is no work here to complete, and leaving it
+as one implied pending work that does not exist.
+
+**Do not treat 3-of-4 as the coverage of a shipped feature.** It is the coverage
+of three separate checks against four bugs already understood. Bugs not yet found
+are not represented, and the checks were designed with these four in view. The
+number describes what was measured against a known set, not a reliability rate —
+quoting it as one would overstate what any of this has established.

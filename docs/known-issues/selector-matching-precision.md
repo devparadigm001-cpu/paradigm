@@ -272,6 +272,15 @@ than what ships. Pinned by `anchoring_would_not_have_rejected_the_measured_colli
 - [x] ~~Decide whether selectors should match names exactly.~~ Decided above.
 - [x] ~~Consider anchoring instead of exact matching.~~ Rejected above, on this
       file's own evidence.
-- [ ] **Do not treat this as fixed by the ambiguity work.** They interact but are
-      separate defects with separate remedies. Both are now closed, by two
-      different properties of the same enumeration.
+
+### Standing note — not a task
+
+Deliberately not a checkbox: there is no work here to complete, and leaving it
+as one implied pending work that does not exist.
+
+**Do not treat this as fixed by the ambiguity work.** They interact but are
+separate defects with separate remedies. Both are now closed, by two different
+properties of the same enumeration — `resolved_is_recorded_target` decides
+*which* element is the recorded one, and the candidate count decides whether
+that answer is unique. A future change that removes one because "the other
+already covers it" reopens a defect. See `replay-window-selector-ambiguity.md`.

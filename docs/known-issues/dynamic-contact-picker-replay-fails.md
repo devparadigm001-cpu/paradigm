@@ -510,12 +510,21 @@ a large share of the obvious use cases for this product are unavailable.
       **Answered: they do not.** `role:Edit|name:To` resolves to Claude Code's
       prompt input and `role:Button|name:To` to a Windows taskbar button, both
       outside the browser entirely. Capture is not ignoring a faster selector.
-- [ ] **Consider whether substring name matching is a liability elsewhere.**
-      Surfaced by the above: `name:To` matched "Write your prompt **to** Claude"
-      and "Microsoft S**to**re pinned". Every selector the product builds uses
-      the same matching, and short element names are common, so a selector can
-      resolve fast and confidently onto the wrong element with nothing in the
-      result to signal it. Untested beyond this instance; worth its own look.
+- [x] ~~**Consider whether substring name matching is a liability elsewhere.**~~
+      **Done — it was, and it is now closed.** This question got its own
+      investigation and its own file:
+      `docs/known-issues/selector-matching-precision.md`, **RESOLVED 2026-08-12**.
+      What it found went beyond this bullet's framing. The suspicion recorded
+      here was that *short* names are the risk; the measured collision was an
+      8-character name that is a **prefix of a longer window title**
+      (`role:Window|name:Paradigm` resolving onto a browser window), so name
+      length turned out not to be the variable — whether the name appears inside
+      other on-screen text is. The remedy is
+      `replay::resolved_is_recorded_target`, which *selects* the element whose
+      name equals the recorded one rather than accepting whatever containment
+      reached first, and refuses when several qualify.
+      The original observation stands as recorded: `name:To` matched "Write your
+      prompt **to** Claude" and "Microsoft S**to**re pinned".
 - [x] ~~**Decide whether the JS-widget pattern warrants a general
       investigation.**~~ **Done, and the answer is no** — see "That question was
       tested". The shared-cause theory was refuted; these are two independent
