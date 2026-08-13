@@ -1,11 +1,11 @@
 //! Write a validated playbook to the encrypted local store, and read it back.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::db::DbError;
 
 use super::validate::{validate, ValidationError};
-use super::{CompiledPlaybook, ControlRole};
+use super::{CompiledPlaybook, CompiledTemplate, ControlRole};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -35,6 +35,40 @@ pub fn store(conn: &mut Connection, playbook: &CompiledPlaybook) -> Result<(), S
         "INSERT INTO playbooks (id, name, source) VALUES (?1, ?2, ?3)",
         (&playbook.id, &playbook.name, &playbook.source),
     )?;
+
+    // Additive: written only when a template was attached, so an ordinary
+    // recording produces exactly the rows it always did, in exactly the same
+    // transaction. Before the steps, so the field mappings' foreign key has a
+    // template to point at.
+    if let Some(template) = &playbook.template {
+        tx.execute(
+            "INSERT INTO workflow_templates
+                 (playbook_id, source_id, destination_id, source_step,
+                  destination_step, examples)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                &playbook.id,
+                &template.source_id,
+                &template.destination_id,
+                template.source_step,
+                template.destination_step,
+                template.examples as i64,
+            ),
+        )?;
+        for field in &template.fields {
+            tx.execute(
+                "INSERT INTO workflow_field_mappings
+                     (id, playbook_id, source_field, destination_field)
+                 VALUES (?1, ?2, ?3, ?4)",
+                (
+                    uuid::Uuid::new_v4().to_string(),
+                    &playbook.id,
+                    &field.source_field,
+                    &field.destination_field,
+                ),
+            )?;
+        }
+    }
 
     for step in &playbook.steps {
         tx.execute(
@@ -180,6 +214,64 @@ pub fn list(conn: &Connection) -> Result<Vec<PlaybookSummary>, DbError> {
 /// Deleting an id that is not there is an error, not a no-op: `DELETE` succeeds
 /// while affecting zero rows, and silently reporting success to a caller who
 /// asked to remove something nonexistent hides a real mistake.
+/// Read a stored template back, if the playbook has one.
+///
+/// Separate from [`load`] rather than folded into `StoredPlaybook`: replay does
+/// not need it, and widening the type every existing caller already uses would
+/// make an additive change ripple.
+pub fn load_template(
+    conn: &Connection,
+    playbook_id: &str,
+) -> Result<Option<CompiledTemplate>, DbError> {
+    let row = conn
+        .query_row(
+            "SELECT source_id, destination_id, source_step, destination_step, examples
+               FROM workflow_templates WHERE playbook_id = ?1",
+            [playbook_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((source_id, destination_id, source_step, destination_step, examples)) = row else {
+        return Ok(None);
+    };
+
+    // Sorted, so a round trip compares equal regardless of insertion order --
+    // §4.12's "field order doesn't matter, field identity does", applied to
+    // reading as well as to detection.
+    let mut stmt = conn.prepare(
+        "SELECT source_field, destination_field
+           FROM workflow_field_mappings
+          WHERE playbook_id = ?1
+          ORDER BY source_field, destination_field",
+    )?;
+    let fields = stmt
+        .query_map([playbook_id], |r| {
+            Ok(crate::detect::FieldMapping {
+                source_field: r.get(0)?,
+                destination_field: r.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Some(CompiledTemplate {
+        source_id,
+        destination_id,
+        source_step,
+        destination_step,
+        examples: examples as usize,
+        fields,
+    }))
+}
+
 pub fn delete(conn: &Connection, playbook_id: &str) -> Result<(), DbError> {
     let affected = conn.execute("DELETE FROM playbooks WHERE id = ?1", [playbook_id])?;
 
@@ -376,6 +468,200 @@ mod tests {
         assert_eq!(
             orphaned, None,
             "the surviving run's playbook_id should be NULL, not the dead id"
+        );
+    }
+
+    fn template() -> CompiledTemplate {
+        CompiledTemplate {
+            source_id: "orders-doc".into(),
+            destination_id: "shipping-doc".into(),
+            source_step: 1,
+            destination_step: 1,
+            examples: 3,
+            fields: vec![
+                crate::detect::FieldMapping {
+                    source_field: "C".into(),
+                    destination_field: "B".into(),
+                },
+                crate::detect::FieldMapping {
+                    source_field: "D".into(),
+                    destination_field: "E".into(),
+                },
+            ],
+        }
+    }
+
+    fn count_all(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).expect("count")
+    }
+
+    /// The regression that matters most, and the reason this test exists at all.
+    ///
+    /// `compile` and `store` are shared by every playbook in the product. A
+    /// change here that quietly altered ordinary recordings would be invisible
+    /// until a replay went wrong, so "the templated path is additive" is
+    /// asserted rather than assumed: an ordinary recording produces no
+    /// template, writes no row to either new table, and stores exactly the
+    /// steps and payloads it always did.
+    #[test]
+    fn an_ordinary_recording_is_completely_unaffected() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut conn = scratch_db(&dir);
+
+        let playbook = compile(
+            &clicks(&["Send", "Cancel", "Back"]),
+            "Ordinary",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        assert!(
+            playbook.template.is_none(),
+            "compile must never attach a template on its own"
+        );
+        store(&mut conn, &playbook).expect("store");
+
+        // Nothing in either new table.
+        assert_eq!(count_all(&conn, "SELECT COUNT(*) FROM workflow_templates"), 0);
+        assert_eq!(
+            count_all(&conn, "SELECT COUNT(*) FROM workflow_field_mappings"),
+            0
+        );
+        assert_eq!(load_template(&conn, &playbook.id).expect("load"), None);
+
+        // And the playbook itself is exactly what it was: three steps, in
+        // order, with their payloads intact.
+        let loaded = load(&conn, &playbook.id).expect("load");
+        assert_eq!(loaded.steps.len(), 3);
+        assert_eq!(
+            loaded.steps.iter().map(|s| s.step_order).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        for step in &loaded.steps {
+            let payload: serde_json::Value =
+                serde_json::from_str(&step.action_payload_json).expect("payload is json");
+            assert!(payload["target"]["selector"].is_string());
+            assert_eq!(payload["target"]["raw_role"].as_str(), Some("Button"));
+        }
+    }
+
+    #[test]
+    fn a_template_survives_compile_store_and_load() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut conn = scratch_db(&dir);
+
+        let playbook = compile(
+            &clicks(&["One", "Two", "Three"]),
+            "Templated",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        )
+        .with_template(template());
+        store(&mut conn, &playbook).expect("store");
+
+        assert_eq!(
+            load_template(&conn, &playbook.id).expect("load"),
+            Some(template()),
+            "the mapping and advancement rule must round-trip intact"
+        );
+
+        // The literal example steps are still there -- §5 item 5's "alongside",
+        // not "instead of".
+        assert_eq!(load(&conn, &playbook.id).expect("load").steps.len(), 3);
+    }
+
+    #[test]
+    fn deleting_a_templated_playbook_removes_its_template_and_mappings() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut conn = scratch_db(&dir);
+        let playbook = compile(
+            &clicks(&["One"]),
+            "Doomed",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        )
+        .with_template(template());
+        store(&mut conn, &playbook).expect("store");
+        assert_eq!(
+            count_all(&conn, "SELECT COUNT(*) FROM workflow_field_mappings"),
+            2
+        );
+
+        delete(&conn, &playbook.id).expect("delete");
+
+        // Both cascades fire -- the mappings hang off the template, which hangs
+        // off the playbook, so this also proves the two-step chain works.
+        assert_eq!(count_all(&conn, "SELECT COUNT(*) FROM workflow_templates"), 0);
+        assert_eq!(
+            count_all(&conn, "SELECT COUNT(*) FROM workflow_field_mappings"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_detection_would_refuse_cannot_be_stored() {
+        // The two judgements detection makes, enforced again at the schema so
+        // they cannot be bypassed by a caller assembling a template by hand.
+        let dir = TempDir::new().expect("temp dir");
+        let mut conn = scratch_db(&dir);
+
+        // §2: a source that never moved is inconclusive, not a pattern.
+        let still = compile(
+            &clicks(&["One"]),
+            "Still Source",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        )
+        .with_template(CompiledTemplate {
+            source_step: 0,
+            ..template()
+        });
+        assert!(
+            store(&mut conn, &still).is_err(),
+            "a zero source step must be rejected"
+        );
+
+        // The Rule of 3.
+        let thin = compile(
+            &clicks(&["One"]),
+            "Two Examples",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        )
+        .with_template(CompiledTemplate {
+            examples: 2,
+            ..template()
+        });
+        assert!(
+            store(&mut conn, &thin).is_err(),
+            "fewer than three examples must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_playbook_can_carry_only_one_pattern() {
+        // §4.12's "one pattern per workflow", made unrepresentable by the
+        // primary key rather than left to callers to remember.
+        let dir = TempDir::new().expect("temp dir");
+        let mut conn = scratch_db(&dir);
+        let playbook = compile(
+            &clicks(&["One"]),
+            "Single",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        )
+        .with_template(template());
+        store(&mut conn, &playbook).expect("store");
+
+        assert!(
+            conn.execute(
+                "INSERT INTO workflow_templates
+                     (playbook_id, source_id, destination_id, source_step,
+                      destination_step, examples)
+                 VALUES (?1, 'other', 'other', 1, 1, 3)",
+                [&playbook.id],
+            )
+            .is_err(),
+            "a second pattern for one workflow must be impossible"
         );
     }
 

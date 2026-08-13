@@ -43,6 +43,44 @@ pub struct CompiledStep {
     pub payload_redacted: bool,
 }
 
+/// The learned mapping and advancement rule, for a templated workflow.
+///
+/// **Structure only.** §3 permits the durable mapping to record "source column
+/// C -> destination column E, advance one row each run" and nothing about
+/// specific past rows or their content. There is no value here and no row
+/// index, and the schema has no column that could hold one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompiledTemplate {
+    pub source_id: String,
+    pub destination_id: String,
+    pub source_step: i64,
+    pub destination_step: i64,
+    pub examples: usize,
+    pub fields: Vec<crate::detect::FieldMapping>,
+}
+
+impl CompiledTemplate {
+    /// Build one from what detection established, plus the surfaces it ran
+    /// against -- which detection does not carry, because a [`Pattern`] is
+    /// deliberately structure with no identity attached.
+    ///
+    /// [`Pattern`]: crate::detect::Pattern
+    pub fn from_pattern(
+        pattern: &crate::detect::Pattern,
+        source_id: impl Into<String>,
+        destination_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            source_id: source_id.into(),
+            destination_id: destination_id.into(),
+            source_step: pattern.source_step,
+            destination_step: pattern.destination_step,
+            examples: pattern.examples,
+            fields: pattern.fields.clone(),
+        }
+    }
+}
+
 /// A playbook ready to be validated and stored.
 #[derive(Debug, Clone)]
 pub struct CompiledPlaybook {
@@ -50,9 +88,25 @@ pub struct CompiledPlaybook {
     pub name: String,
     pub source: String,
     pub steps: Vec<CompiledStep>,
+    /// The template, when this recording was confirmed as a repeating pattern.
+    ///
+    /// `None` for every ordinary recording, which is every recording Phase 1
+    /// produces. [`compile`] always sets it to `None`; attaching one is a
+    /// separate, deliberate act via [`CompiledPlaybook::with_template`], so the
+    /// existing compile path is additive-only and cannot acquire a template by
+    /// accident.
+    pub template: Option<CompiledTemplate>,
 }
 
 impl CompiledPlaybook {
+    /// Attach a template. The literal example steps are untouched -- §5 item 5:
+    /// the mapping is stored "alongside the literal example steps captured
+    /// during recording -- additive to the existing schema, not a replacement."
+    pub fn with_template(mut self, template: CompiledTemplate) -> Self {
+        self.template = Some(template);
+        self
+    }
+
     pub fn irreversible_count(&self) -> usize {
         self.steps.iter().filter(|s| !s.reversible).count()
     }
@@ -85,6 +139,10 @@ pub fn compile(
         name: label.trim().to_string(),
         source: SOURCE_RECORD_MODE.to_string(),
         steps,
+        // Always. Detection runs separately and a template is attached
+        // afterwards, so this function behaves exactly as it did before
+        // templated workflows existed.
+        template: None,
     }
 }
 
