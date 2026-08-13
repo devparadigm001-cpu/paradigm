@@ -1068,27 +1068,138 @@ That is the silent-wrong-target failure class this project has now hit five time
 — not a design choice, and not something to bundle with the relative-replay
 feature above. Bundling them would let a real defect inherit a feature's priority.
 
-**Why it is not fixed today, stated honestly.** The likely fix is cheap *if* one
-assumption holds: Sheets' Name Box accepts a **qualified** reference
-(`Sheet2!B2`), in which case replay needs no separate sheet-selection step and
-`grid_type` changes by one string. That assumption is **untested**. Both halves
-need measurement against live Google Sheets:
-
-1. **Does the Name Box accept `Sheet2!B2`** and move the cursor across tabs?
-   Verified the way the rest of this document verifies things — by CSV export,
-   not by reading the UI that produced it.
-2. **Can capture obtain the active sheet name** at edit time? The sheet tabs are
-   in the accessibility tree, but which element reports the *selected* one, and
-   whether it is readable at the moment the editor appears, has not been checked.
-
-Guessing either would produce exactly the kind of confident, unverified claim
-this file has already had to retract once. The measurement is a `sheetsedit`-style
-probe run, which creates a real spreadsheet in the signed-in Drive account — a
-deliberate act, not something to fold into a routine sweep.
-
 **Until then, the exposure is bounded and worth stating:** single-sheet
 workbooks, which is what every measurement in this document used, are unaffected.
 The gap needs a multi-sheet workbook *and* a tab change between record and replay.
+
+## The sheet-name gap, measured (2026-08-12)
+
+Both assumptions were measured live, on real multi-sheet Google Sheets documents
+created and then trashed. `text_capture_probe -- sheetsmulti`.
+
+**One holds and one does not, and the one that fails is the harder half.**
+
+### Q2 — the Name Box DOES take a qualified reference. Confirmed.
+
+With the *first* sheet active, so a cross-tab jump was actually required:
+
+```
+  Name Box <- "Sheet2!B2", Enter
+  address before : …/edit?gid=0#gid=0
+  address after  : …/edit?gid=23428486#gid=23428486     <- the second sheet
+  Name Box reads : "B2"
+```
+
+Then `crosssheetmarker` was typed and committed with `{Tab}`. Ground truth is
+the per-sheet CSV export, not the UI that produced the edit:
+
+```
+  Sheet1 (gid=0)         : 0 bytes -- empty
+  Sheet2 (gid=23428486)  : ",\n,crosssheetmarker"   -> column B, row 2 = B2
+```
+
+Both legs are required and both hold. Checking only Sheet2 would pass if the
+write had landed on *both* sheets; checking only Sheet1 would pass if nothing had
+been written at all.
+
+**So the replay half is solved**, and it is as small as hoped: `grid_type` would
+navigate with `Sheet!Cell` instead of a bare `Cell`.
+
+### Q1 — capture CANNOT read the active sheet. This is the blocker.
+
+The sheet tabs *are* in the tree, named exactly, as `Button` elements:
+
+```
+  Group "Sheet tab bar"
+    ToolBar ""
+      Button "Add Sheet"
+      Button "All Sheets"
+    ToolBar ""
+      Button "Sheet1"
+        Group ""
+          Text "Sheet1"
+      Button "Sheet2"
+        Group ""
+          Text "Sheet2"
+```
+
+**But nothing marks which one is current.** Measured in both states, on every
+tab element:
+
+```
+  with Sheet2 active : selected=None toggled=None focused=None desc=""   (both tabs)
+  with Sheet1 active : selected=None toggled=None focused=None desc=""   (both tabs)
+  elements marked selected/toggled: []   <- in BOTH states
+```
+
+A full dump of the `Sheet tab bar` subtree confirms no wrapper carries the state
+either. Switching sheets changes nothing observable in the accessibility tree.
+
+The only signal that moved is the **browser address bar's `#gid=`**, and it is
+not a usable substitute:
+
+* it is a **number**, and the Name Box needs a **name** — nothing in the tree
+  maps one to the other;
+* it lives in the **browser chrome**, not the document. Capture would be reading
+  Microsoft Edge rather than Sheets, which breaks the element-based model the
+  whole capture path is built on and would not survive a different browser.
+
+### What this actually means for the fix
+
+The two halves are now cleanly separated:
+
+| Half | Status |
+|---|---|
+| Replay navigates to a named sheet | **Solved** — `Sheet2!B2` works, CSV-confirmed |
+| Capture knows which sheet to record | **Blocked** — Sheets publishes no such signal |
+
+**This corrects this document's own hypothesis.** The earlier entry guessed the
+fix was "one string in `grid_type`" *if* the Name Box accepted a qualified
+reference. The Name Box half is confirmed — and the fix is still not one string,
+because the navigation was never the hard part. Capture has nothing to record.
+
+Three routes remain, none free, none measured:
+
+1. **Record a sheet switch as an action.** When a user clicks a tab, that is a
+   click on `Button "Sheet2"` — an ordinary, capturable element, and replay
+   reproducing it would switch sheets before the cell edits. **Not measured:**
+   whether capture currently admits that click. And it only covers switches that
+   happen *inside* the recording — a recording that simply starts on a non-default
+   sheet still carries nothing. This is the cheapest route to test next.
+2. **Read the browser URL's `gid` plus a `gid` → name map.** Browser-specific and
+   off-tree, for the reasons above.
+3. **Screen-reader mode.** `ctrl+alt+z` materialises more of the grid (see
+   "sheetsa11y"); whether it also exposes tab selection is unmeasured.
+
+**No implementation was forced.** Building the replay half alone would produce a
+`Sheet!Cell` navigator with nothing able to tell it which sheet — working code
+that cannot be reached, which this project has removed twice before.
+
+### Two probe defects found while measuring, both self-inflicted
+
+Recorded because each produced a confident verdict from evidence that did not
+exist, which is the failure shape this project keeps rediscovering.
+
+1. **The first version under-searched and reported absence.** It walked the tree
+   with a hand-rolled `children()` recursion and a node budget, found no sheet
+   tabs, and printed "sheet names present in the tree: false". Wrong — the budget
+   ran out before reaching the tab bar, while `find_named` located a `"Sheet1"`
+   tab *in the same run*. Replaced with the locator, which searches to depth 50
+   and does not silently truncate. A measurement that stops early and reports
+   "not there" is indistinguishable from a real absence.
+2. **The CSV ground truth silently measured nothing, twice.** The export URL
+   `export?format=csv&gid=<n>` contains `&`, which `cmd` treats as a command
+   separator. Unquoted, it tried to execute `gid=0` as a program; quoted, it
+   dropped the parameter. **Both times both exports returned the default sheet**,
+   downloading two files named `… - Sheet1.csv`, while the probe printed
+   "landed on sheet 2: false" from files it had never read. Now uses
+   `Start-Process`, which takes the URL as one argument with no shell re-parsing.
+
+   Worth noting: **`sheetsedit` has the same unquoted `&gid=0` URL** at
+   `text_capture_probe.rs:5673`. Its published evidence still stands, because
+   those documents had exactly one sheet — so the parameter-less export returned
+   the right sheet anyway. Latent there, fatal here. Left unchanged rather than
+   edited blind, since re-verifying it costs another live document.
 
 ## Next steps
 
@@ -1161,14 +1272,21 @@ The gap needs a multi-sheet workbook *and* a tab change between record and repla
       writes `B2`, and that is the intended final behaviour — see "Absolute cell
       references are the decision". Relative/offset replay is a **future
       feature**, not a defect in this behaviour.
-- [ ] **Carry the sheet name — reclassified as a defect, 2026-08-12.** A
+- [ ] **Carry the sheet name — a defect, and now MEASURED (2026-08-12).** A
       reference alone replays into whichever tab is active, so a multi-sheet
       workbook can be written to the wrong sheet with everything reporting
       success. Deliberately **not** deferred alongside relative replay: that is a
       choice between two valid behaviours, this is the silent-wrong-target
-      failure class. Deferred because the fix is unmeasured, not because it is
-      minor — see "The sheet-name gap" for the hypothesis and what must be
-      measured.
+      failure class. Measured live — see "The sheet-name gap, measured": the
+      **replay** half is solved (`Sheet2!B2` through the Name Box works,
+      CSV-confirmed), the **capture** half is blocked because Sheets exposes no
+      accessibility signal for which sheet is active. Not implemented, because
+      the navigator would have nothing to tell it which sheet.
+- [ ] **Test whether a sheet-tab click is captured.** The cheapest remaining
+      route to the capture half, and untested. A tab is a `Button` named
+      `"Sheet2"`, so a user switching sheets mid-recording may already produce a
+      replayable action. Would not cover a recording that merely *starts* on a
+      non-default sheet. See "The sheet-name gap, measured", route 1.
 - [x] ~~**Measure the per-keystroke cost.**~~ **Measured: 2.22 ms per keystroke,
       and a confirmed non-issue.** The suspicion did not survive an A/B — see
       "The per-keystroke cost, measured".

@@ -7128,6 +7128,421 @@ async fn sheetsentry_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ----------------------------------------------------- sheetsmulti mode ----
+//
+// The wrong-sheet gap: a captured grid edit carries a bare cell reference, so
+// replay writes into whichever tab happens to be active. A playbook recorded on
+// Sheet2 and replayed with Sheet1 in front writes to the wrong sheet, and every
+// step reports success.
+// See docs/known-issues/complex-web-grid-capture-unreliable.md.
+//
+// Two assumptions have to hold before that is a small fix, and BOTH are measured
+// here rather than assumed:
+//
+//   1. Can capture read the ACTIVE sheet's name? A list of sheet names is not
+//      enough -- the tree has to say which one is current, or capture cannot
+//      record what it was. So this switches sheets and checks the marker MOVES.
+//   2. Does the Name Box accept a qualified `Sheet2!B2` and cross tabs?
+//
+// Ground truth is the per-sheet CSV export (`export?format=csv&gid=<n>`), never
+// the UI that produced the edit. Sheet1 must be EMPTY and Sheet2 must hold the
+// value -- checking only that Sheet2 has it would pass if the write landed in
+// both, and checking only Sheet1 would pass if nothing was written at all.
+
+/// Everything the tree offers that could mark a tab as the current one.
+fn describe_tab(el: &UIElement) -> String {
+    let a = el.attributes();
+    format!(
+        "role={:<13} name={:?} selected={:?} toggled={:?} focused={:?} desc={:?}",
+        a.role,
+        a.name.unwrap_or_default(),
+        a.is_selected,
+        a.is_toggled,
+        a.is_focused,
+        a.description.unwrap_or_default(),
+    )
+}
+
+/// The browser address bar's text, which carries `#gid=<n>` for the open sheet.
+async fn address_of(desktop: &Desktop, window: &UIElement) -> String {
+    if let Ok(bars) = desktop
+        .locator("role:Edit|name:Address and search bar")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+    {
+        for b in &bars {
+            let t = b.text(0).unwrap_or_default();
+            if !t.is_empty() {
+                return t;
+            }
+        }
+    }
+    String::new()
+}
+
+fn gid_in(addr: &str) -> Option<String> {
+    let rest = addr.split("gid=").nth(1)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    (!digits.is_empty()).then_some(digits)
+}
+
+/// Every sheet tab, found the way the rest of this file finds elements.
+///
+/// Deliberately the locator and not a hand-rolled `children()` walk. The first
+/// version of this probe walked the tree itself with a node budget, reported
+/// "no sheet tabs exist", and was WRONG -- the budget ran out before reaching
+/// the tab bar while `find_named` located a "Sheet1" tab in the same run. The
+/// locator searches to depth 50 and does not silently truncate.
+async fn sheet_tabs(desktop: &Desktop, window: &UIElement) -> Vec<UIElement> {
+    let mut out: Vec<UIElement> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for role in ["role:Tab", "role:TabItem", "role:Button", "role:ListItem"] {
+        if let Ok(all) = desktop
+            .locator(role)
+            .within(window.clone())
+            .all(Some(Duration::from_secs(5)), None)
+            .await
+        {
+            for el in all {
+                let n = el.name().unwrap_or_default();
+                let t = n.trim();
+                let looks_like_tab = t.len() > 5
+                    && t.starts_with("Sheet")
+                    && t[5..].chars().all(|c| c.is_ascii_digit());
+                if looks_like_tab {
+                    let key = format!("{}/{}", el.role(), t);
+                    if !seen.contains(&key) {
+                        seen.push(key);
+                        out.push(el);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Download one sheet's CSV export and return its body.
+async fn download_csv(browser: &str, doc_id: &str, gid: &str) -> Option<String> {
+    let before = newest_csv().map(|(p, _)| p);
+    let export =
+        format!("https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv&gid={gid}");
+    // NOT `cmd /C start`. A `gid=` export URL contains `&`, which cmd treats as
+    // a command separator -- measured twice: unquoted it tried to run `gid=0`
+    // as a program, and quoted it silently dropped the parameter, so BOTH
+    // exports came back as the default sheet named "…- Sheet1.csv". Either way
+    // the ground-truth check was measuring nothing while reporting a verdict.
+    //
+    // `Start-Process` takes the URL as one argument with no shell re-parsing.
+    // Verified: gid=23428486 downloaded "…- Sheet2.csv" carrying the marker,
+    // gid=0 downloaded an empty "…- Sheet1.csv".
+    if let Ok(mut c) = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Start-Process",
+            browser,
+            "-ArgumentList",
+            &format!("'{export}'"),
+        ])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    // 45s, not 30: the first corrected run reported "did not download" for two
+    // exports that were sitting in Downloads seconds later.
+    for _ in 0..45 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if let Some((p, _)) = newest_csv() {
+            if Some(&p) != before.as_ref() {
+                return std::fs::read_to_string(&p).ok();
+            }
+        }
+    }
+    None
+}
+
+async fn sheetsmulti_mode() -> ExitCode {
+    println!("== the wrong-sheet gap: can it even be fixed? ==\n");
+    println!("Creates a blank 'Untitled spreadsheet' in the signed-in Drive account");
+    println!("and adds a second sheet. The DOCUMENT ID is printed at the end for");
+    println!("cleanup via `sheetstrash <id>`.\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = desktop
+        .locator("role:Window|name:Untitled spreadsheet")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        println!("\n  INCONCLUSIVE: no 'Untitled spreadsheet' window found. Not signed in,");
+        println!("  or the document did not load. Nothing below would be measuring Sheets.");
+        return ExitCode::FAILURE;
+    };
+    println!("  window: {:?}", window.name().unwrap_or_default());
+
+    let addr0 = address_of(&desktop, &window).await;
+    let doc_id = addr0
+        .split("/d/")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    println!("  DOCUMENT ID: {doc_id}");
+    println!("  address: {addr0:?}");
+    let gid_sheet1 = gid_in(&addr0).unwrap_or_else(|| "0".to_string());
+    println!("  gid of the first sheet: {gid_sheet1}");
+
+    // ---- Q1a: what does the tree show for ONE sheet? -----------------------
+    println!("\n================ Q1a. sheet tabs, one sheet ================\n");
+    let found = sheet_tabs(&desktop, &window).await;
+    if found.is_empty() {
+        println!("  no sheet-tab element found.");
+    }
+    for el in found.iter().take(15) {
+        println!("  {}", describe_tab(el));
+    }
+
+    // ---- add a second sheet -------------------------------------------------
+    println!("\n================ adding a second sheet ================\n");
+    let add = find_named(&desktop, &window, &["role:Button"], |n| {
+        n.trim().eq_ignore_ascii_case("Add Sheet")
+    })
+    .await;
+    match &add {
+        Some(b) => {
+            println!("  clicking {:?}", b.name().unwrap_or_default());
+            robust_click(&desktop, b);
+        }
+        None => {
+            println!("  no 'Add Sheet' button found; falling back to {{shift}}{{f11}}");
+            if let Ok(el) = desktop.focused_element() {
+                let _ = el.press_key("{shift}{f11}");
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let addr_after_add = address_of(&desktop, &window).await;
+    let gid_sheet2 = gid_in(&addr_after_add).unwrap_or_default();
+    println!("  address now: {addr_after_add:?}");
+    println!("  gid of the new sheet: {gid_sheet2:?}");
+
+    // ---- Q1b: does the tree say WHICH sheet is active? ---------------------
+    //
+    // The whole question. Two names in a list are useless to capture; the
+    // marker has to move when the active sheet changes.
+    println!("\n================ Q1b. with TWO sheets, second active ================\n");
+    let found2 = sheet_tabs(&desktop, &window).await;
+    for el in found2.iter().take(15) {
+        println!("  {}", describe_tab(el));
+    }
+    // Everything under the tab bar, including unnamed nodes, in case the
+    // selected-state lives on a wrapper rather than on the tab itself.
+    if let Some(bar) = find_named(&desktop, &window, &["role:Group"], |n| {
+        n.trim() == "Sheet tab bar"
+    })
+    .await
+    {
+        println!("\n  full 'Sheet tab bar' subtree:");
+        let mut b = 120usize;
+        dump_tree(&bar, 0, 8, &mut b);
+    }
+    let marked_when_sheet2: Vec<String> = found2
+        .iter()
+        .filter(|e| {
+            let a = e.attributes();
+            a.is_selected == Some(true) || a.is_toggled == Some(true)
+        })
+        .filter_map(|e| e.name())
+        .collect();
+    println!("\n  marked selected/toggled: {marked_when_sheet2:?}");
+
+    // Switch back to the first sheet and re-read. If the marker does not move,
+    // it is not an active-sheet signal.
+    println!("\n================ Q1c. switching back to the first sheet ================\n");
+    let tab1 = find_named(&desktop, &window, &["role:Tab", "role:Button", "role:ListItem"], |n| {
+        n.trim() == "Sheet1"
+    })
+    .await;
+    match &tab1 {
+        Some(t) => {
+            println!("  clicking tab {:?}", t.name().unwrap_or_default());
+            robust_click(&desktop, t);
+        }
+        None => println!("  could not find a 'Sheet1' tab element to click"),
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let addr_back = address_of(&desktop, &window).await;
+    println!("  address now: {addr_back:?}");
+    println!("  gid now: {:?}", gid_in(&addr_back));
+
+    let found3 = sheet_tabs(&desktop, &window).await;
+    for el in found3.iter().take(15) {
+        println!("  {}", describe_tab(el));
+    }
+    let marked_when_sheet1: Vec<String> = found3
+        .iter()
+        .filter(|e| {
+            let a = e.attributes();
+            a.is_selected == Some(true) || a.is_toggled == Some(true)
+        })
+        .filter_map(|e| e.name())
+        .collect();
+    println!("\n  marked selected/toggled: {marked_when_sheet1:?}");
+
+    let q1_names_present = found3.iter().filter_map(|e| e.name()).any(|n| n.trim() == "Sheet2");
+    let q1_marker_moves = !marked_when_sheet1.is_empty()
+        && !marked_when_sheet2.is_empty()
+        && marked_when_sheet1 != marked_when_sheet2;
+    let q1_gid_moves = gid_in(&addr_back) != gid_in(&addr_after_add)
+        && gid_in(&addr_after_add).is_some();
+
+    // ---- Q2: does the Name Box take a qualified reference? -----------------
+    println!("\n================ Q2. Name Box with 'Sheet2!B2' ================\n");
+    println!("  (the first sheet is active, so a cross-sheet jump is required)");
+
+    let name_box = desktop
+        .locator("name:Name box")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+        .and_then(|g| {
+            g.children()
+                .ok()
+                .and_then(|c| c.into_iter().find(|e| e.role() == "Edit"))
+        });
+    let Some(name_box) = name_box else {
+        println!("  Name Box input not found -- Q2 cannot be answered.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::FAILURE;
+    };
+
+    const MARKER: &str = "crosssheetmarker";
+    let _ = name_box.set_value("Sheet2!B2");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let _ = name_box.press_key("{Enter}");
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+
+    let box_reads = name_box.text(0).unwrap_or_default();
+    let addr_after_jump = address_of(&desktop, &window).await;
+    println!("  Name Box reads afterwards : {box_reads:?}");
+    println!("  address afterwards        : {addr_after_jump:?}");
+    println!("  gid afterwards            : {:?}", gid_in(&addr_after_jump));
+
+    let jumped_by_gid = gid_in(&addr_after_jump).is_some()
+        && !gid_sheet2.is_empty()
+        && gid_in(&addr_after_jump) == Some(gid_sheet2.clone());
+
+    // Type into wherever the cursor landed, and commit with Tab.
+    // NOT Enter: press_key injects {LEFT}{END} and {END} relocates the cursor in
+    // a grid -- see docs/known-issues/press-key-enter-injects-end-keystroke.md.
+    if let Ok(target) = desktop.focused_element() {
+        let _ = target.type_text(MARKER, false);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let committer = desktop.focused_element().ok();
+    if let Some(c) = &committer {
+        let _ = c.press_key("{Tab}");
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // ---- ground truth: which sheet actually holds it? ----------------------
+    println!("\n================ ground truth: per-sheet CSV ================\n");
+    let csv1 = download_csv(browser, &doc_id, &gid_sheet1).await;
+    match &csv1 {
+        Some(b) => {
+            println!("  sheet 1 (gid={gid_sheet1}) contents:");
+            for line in b.lines().take(6) {
+                println!("    {line:?}");
+            }
+        }
+        None => println!("  sheet 1 export did not download"),
+    }
+    let csv2 = if gid_sheet2.is_empty() {
+        println!("  no gid captured for the second sheet -- cannot export it");
+        None
+    } else {
+        let c = download_csv(browser, &doc_id, &gid_sheet2).await;
+        match &c {
+            Some(b) => {
+                println!("  sheet 2 (gid={gid_sheet2}) contents:");
+                for line in b.lines().take(6) {
+                    println!("    {line:?}");
+                }
+            }
+            None => println!("  sheet 2 export did not download"),
+        }
+        c
+    };
+
+    let on_sheet1 = csv1.as_deref().map(|b| b.contains(MARKER)).unwrap_or(false);
+    let on_sheet2 = csv2.as_deref().map(|b| b.contains(MARKER)).unwrap_or(false);
+
+    // ---- verdict ------------------------------------------------------------
+    println!("\n================ VERDICT ================\n");
+    println!("  Q1  can capture read the ACTIVE sheet?");
+    println!("      sheet names present in the tree      : {q1_names_present}");
+    println!("      a selected/toggled marker MOVES      : {q1_marker_moves}");
+    println!("        with sheet2 active: {marked_when_sheet2:?}");
+    println!("        with sheet1 active: {marked_when_sheet1:?}");
+    println!("      address-bar gid moves (independent)  : {q1_gid_moves}");
+    println!();
+    println!("  Q2  does the Name Box take 'Sheet2!B2'?");
+    println!("      box read back                        : {box_reads:?}");
+    println!("      gid changed to the second sheet      : {jumped_by_gid}");
+    println!("      marker text landed on sheet 1        : {on_sheet1}  (must be false)");
+    println!("      marker text landed on sheet 2        : {on_sheet2}  (must be true)");
+
+    let q1 = q1_names_present && (q1_marker_moves || q1_gid_moves);
+    let q2 = on_sheet2 && !on_sheet1;
+    println!();
+    match (q1, q2) {
+        (true, true) => {
+            println!("  BOTH HOLD -- the fix is small: record the active sheet name beside");
+            println!("  the cell reference, and have grid_type navigate with 'Sheet!Cell'.");
+        }
+        (true, false) => {
+            println!("  Q1 holds, Q2 does NOT. The sheet is knowable but the Name Box will");
+            println!("  not cross tabs, so replay needs a real sheet-selection step first.");
+        }
+        (false, true) => {
+            println!("  Q2 holds, Q1 does NOT. Replay could target a sheet, but capture");
+            println!("  cannot tell which sheet the edit happened on -- so there is nothing");
+            println!("  to record. This is the harder half.");
+        }
+        (false, false) => {
+            println!("  NEITHER holds. The fix is not small and needs a different approach.");
+        }
+    }
+
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    println!("  clean up with: cargo run --example text_capture_probe -- sheetstrash {doc_id}");
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------- sheetsroundtrip mode ----
 // Record real Sheets cell edits, then replay them into a FRESH document and
 // check the result against that document's CSV export.
@@ -8194,6 +8609,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsmulti") {
+        return sheetsmulti_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsroundtrip") {
         return sheetsroundtrip_mode().await;
