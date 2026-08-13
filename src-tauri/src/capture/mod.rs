@@ -354,7 +354,16 @@ fn observe_grid(
             if let Some(url) = &e.page_url {
                 identifiers.push(url.clone());
             }
-            grid.note_context(identifiers, e.process_name.clone());
+            // Also the seam where a sheet switch is noticed. Deliberately here
+            // and not in `to_candidate`: `observe_grid` is already the
+            // spreadsheet-specific path, so capture's generic mapping stays
+            // app-agnostic and only `capture::grid` knows what a sheet tab is.
+            grid.note_click(
+                &e.element_role,
+                non_empty(&e.element_text).as_deref(),
+                identifiers,
+                e.process_name.clone(),
+            );
             None
         }
 

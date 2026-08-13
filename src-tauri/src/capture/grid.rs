@@ -102,6 +102,47 @@ pub fn looks_like_cell_ref(s: &str) -> bool {
     (1..=3).contains(&letters) && (1..=7).contains(&digits)
 }
 
+/// Split a possibly-qualified reference into its sheet and cell parts.
+///
+/// `"Sheet2!B2"` -> `(Some("Sheet2"), "B2")`, `"B2"` -> `(None, "B2")`.
+///
+/// The qualified form is what a recording carries once the sheet is known, and
+/// what replay hands to the Name Box. Keeping it as one string means the sheet
+/// travels the pipeline in `element_name`, on exactly the path the bare cell
+/// reference already took -- no new field in `ActionCandidate`, no change to
+/// compile or the stored payload shape.
+pub fn split_sheet_ref(s: &str) -> (Option<&str>, &str) {
+    match s.split_once('!') {
+        Some((sheet, cell)) if !sheet.is_empty() && !cell.is_empty() => (Some(sheet), cell),
+        _ => (None, s),
+    }
+}
+
+/// Does this name look like a sheet TAB, as opposed to anything else clickable?
+///
+/// Measured shape: a human clicking the tab is captured as
+/// `role="text" name="Sheet1"`. The `Button` that owns it is also accepted,
+/// since the recorder attributing the click one level up is a plausible
+/// variation rather than something to depend on either way.
+///
+/// **Known limit, and it is not small.** The name test is the default Sheets
+/// naming, `Sheet` followed by digits. A sheet the user renamed to `Data` is
+/// captured as `role="text" name="Data"`, which is indistinguishable from a
+/// click on any other text. There is no way to tell them apart from the event
+/// alone, and the accessibility tree carries no sheet-selection state to
+/// cross-check against -- measured, see
+/// docs/known-issues/complex-web-grid-capture-unreliable.md. So renamed sheets
+/// are not tracked, and a recording that switches to one is stamped with
+/// whatever sheet was last recognised, or nothing.
+pub fn looks_like_sheet_tab(role: &str, name: &str) -> bool {
+    let n = name.trim();
+    let role_ok = role.eq_ignore_ascii_case("text") || role.eq_ignore_ascii_case("button");
+    role_ok
+        && n.len() > 5
+        && n.starts_with("Sheet")
+        && n[5..].chars().all(|c| c.is_ascii_digit())
+}
+
 /// Is this focused element the transient cell editor?
 ///
 /// The single decision that keeps this watcher out of every non-grid
@@ -109,8 +150,11 @@ pub fn looks_like_cell_ref(s: &str) -> bool {
 /// directly: a `Document` surface (Notepad), an `Edit` (`<input>`,
 /// `<textarea>`), and a `ComboBox` that is an ordinary dropdown must all be
 /// ignored, or capture would start attaching spreadsheet actions to them.
+///
+/// Accepts a sheet-qualified reference as well as a bare one, so a step
+/// recorded as `Sheet2!B2` still takes the grid path at replay.
 pub fn is_cell_editor(role: &str, name: &str) -> bool {
-    role == "ComboBox" && looks_like_cell_ref(name)
+    role == "ComboBox" && looks_like_cell_ref(split_sheet_ref(name).1)
 }
 
 /// Sheets seeds its hidden editor with `U+FEFF`, and the value carries a
@@ -143,6 +187,9 @@ pub struct GridCellWatcher {
     current: Option<GridEdit>,
     identifiers: Vec<String>,
     process_name: Option<String>,
+    /// The sheet the user last switched to by clicking its tab, if any. Session
+    /// -scoped: it lives as long as the watcher, which is one capture session.
+    current_sheet: Option<String>,
 }
 
 impl GridCellWatcher {
@@ -161,6 +208,42 @@ impl GridCellWatcher {
         if process_name.is_some() {
             self.process_name = process_name;
         }
+    }
+
+    /// A click happened. Notes the app context, and tracks the active sheet.
+    ///
+    /// The sheet half is the only way capture can know which sheet an edit
+    /// belongs to. Google Sheets exposes **no** active-sheet state: a
+    /// whole-window diff across a real sheet switch returns zero differing
+    /// elements, so there is nothing to read at edit time. What can be observed
+    /// is the *event* -- the user clicking a tab -- and that is what this
+    /// records. See docs/known-issues/complex-web-grid-capture-unreliable.md.
+    ///
+    /// Consequence worth stating at the call site: a recording that merely
+    /// STARTS on a non-default sheet contains no tab click, so `current_sheet`
+    /// stays `None` and its edits are recorded bare, exactly as before this
+    /// existed. That case is not fixed by this and cannot be.
+    pub fn note_click(
+        &mut self,
+        role: &str,
+        name: Option<&str>,
+        identifiers: Vec<String>,
+        process_name: Option<String>,
+    ) {
+        if let Some(n) = name {
+            if looks_like_sheet_tab(role, n) {
+                // An in-flight edit belongs to the sheet it started on, so it is
+                // emitted before the switch takes effect rather than being
+                // restamped with the new one.
+                self.current_sheet = Some(n.trim().to_string());
+            }
+        }
+        self.note_context(identifiers, process_name);
+    }
+
+    /// The sheet edits are currently being attributed to, if one is known.
+    pub fn tracked_sheet(&self) -> Option<&str> {
+        self.current_sheet.as_deref()
     }
 
     /// A key went down. Samples the editor, and emits when an edit finishes.
@@ -293,7 +376,14 @@ impl GridCellWatcher {
             // named. Recording the cell reference as the element name is the
             // only cell identity that exists.
             element_role: Some("ComboBox".to_string()),
-            element_name: Some(edit.cell),
+            // Qualified with the sheet when one is known, bare otherwise. The
+            // bare form is byte-identical to what this emitted before sheet
+            // tracking existed, so a recording that never switches sheets is
+            // unchanged all the way through compile, store and replay.
+            element_name: Some(match &self.current_sheet {
+                Some(sheet) => format!("{sheet}!{}", edit.cell),
+                None => edit.cell,
+            }),
             payload: Some(edit.text),
             detail: Some(format!(
                 "grid cell editor, {} keystroke(s) over {}ms",
@@ -313,6 +403,100 @@ fn is_trigger_key(key_code: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sheet_tab_click_is_recognised_and_ordinary_clicks_are_not() {
+        // The measured shape of a real human tab click.
+        assert!(looks_like_sheet_tab("text", "Sheet1"));
+        assert!(looks_like_sheet_tab("text", "Sheet12"));
+        assert!(looks_like_sheet_tab("Button", "Sheet2"));
+
+        // Everything else a user might click. A false positive here would
+        // silently misattribute every later cell edit to a sheet that was
+        // never opened, which is worse than not tracking at all.
+        assert!(!looks_like_sheet_tab("text", "Sheet"));
+        assert!(!looks_like_sheet_tab("text", "Sheets home"));
+        assert!(!looks_like_sheet_tab("text", "Sheet tab bar"));
+        assert!(!looks_like_sheet_tab("text", "Add Sheet"));
+        assert!(!looks_like_sheet_tab("text", "All Sheets"));
+        assert!(!looks_like_sheet_tab("text", "SheetA"));
+        assert!(!looks_like_sheet_tab("ComboBox", "Sheet1"));
+        assert!(!looks_like_sheet_tab("text", "Windows PowerShell"));
+
+        // The documented limit, pinned so it is not mistaken for a bug later:
+        // a renamed sheet is indistinguishable from any other text click.
+        assert!(!looks_like_sheet_tab("text", "Data"));
+        assert!(!looks_like_sheet_tab("text", "Q3 Forecast"));
+    }
+
+    #[test]
+    fn a_qualified_reference_splits_and_still_takes_the_grid_path() {
+        assert_eq!(split_sheet_ref("Sheet2!B2"), (Some("Sheet2"), "B2"));
+        assert_eq!(split_sheet_ref("B2"), (None, "B2"));
+        // Degenerate forms fall back to "the whole thing is the cell", which
+        // then fails `looks_like_cell_ref` rather than half-parsing.
+        assert_eq!(split_sheet_ref("!B2"), (None, "!B2"));
+        assert_eq!(split_sheet_ref("Sheet2!"), (None, "Sheet2!"));
+
+        // Replay decides the grid path with this, so a qualified step must
+        // still reach `grid_type`.
+        assert!(is_cell_editor("ComboBox", "Sheet2!B2"));
+        assert!(is_cell_editor("ComboBox", "B2"));
+        assert!(!is_cell_editor("ComboBox", "Sheet2!Menus"));
+    }
+
+    #[test]
+    fn edits_are_stamped_with_the_tracked_sheet_and_bare_without_one() {
+        // No tab click seen: byte-identical to the pre-tracking behaviour.
+        let mut w = GridCellWatcher::new();
+        assert_eq!(w.tracked_sheet(), None);
+        w.current = Some(GridEdit {
+            cell: "B2".into(),
+            text: "hello".into(),
+            identifiers: vec!["msedge.exe".into()],
+            process_name: Some("msedge.exe".into()),
+            keystrokes: 1,
+            started_ms: 0,
+        });
+        let bare = w.flush(10).expect("an edit was in flight");
+        assert_eq!(bare.element_name.as_deref(), Some("B2"));
+
+        // After a tab click, the same edit carries the sheet.
+        let mut w = GridCellWatcher::new();
+        w.note_click(
+            "text",
+            Some("Sheet2"),
+            vec!["msedge.exe".into()],
+            Some("msedge.exe".into()),
+        );
+        assert_eq!(w.tracked_sheet(), Some("Sheet2"));
+        w.current = Some(GridEdit {
+            cell: "B2".into(),
+            text: "hello".into(),
+            identifiers: vec!["msedge.exe".into()],
+            process_name: Some("msedge.exe".into()),
+            keystrokes: 1,
+            started_ms: 0,
+        });
+        let stamped = w.flush(10).expect("an edit was in flight");
+        assert_eq!(stamped.element_name.as_deref(), Some("Sheet2!B2"));
+    }
+
+    #[test]
+    fn an_ordinary_click_does_not_disturb_the_tracked_sheet() {
+        // Clicks are how app identity is learned, so they arrive constantly.
+        // Only a tab click may change which sheet edits are attributed to.
+        let mut w = GridCellWatcher::new();
+        w.note_click("text", Some("Sheet2"), vec!["msedge.exe".into()], None);
+        w.note_click("text", Some("Windows PowerShell"), vec!["pwsh.exe".into()], None);
+        w.note_click("Button", Some("Add Sheet"), vec!["msedge.exe".into()], None);
+        w.note_click("ComboBox", Some("A1"), vec!["msedge.exe".into()], None);
+        assert_eq!(
+            w.tracked_sheet(),
+            Some("Sheet2"),
+            "only a sheet-tab click may retarget the sheet"
+        );
+    }
 
     #[test]
     fn cell_references_are_recognised_and_other_names_are_not() {
