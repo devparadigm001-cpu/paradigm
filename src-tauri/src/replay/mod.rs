@@ -948,6 +948,25 @@ async fn grid_type(
         );
     };
 
+    // `cell` is what capture recorded, which is `Sheet2!B2` when the recording
+    // knew its sheet and a bare `B2` when it did not. Both go into the Name Box
+    // verbatim: a qualified reference switches sheet AND navigates in one
+    // action, measured and CSV-confirmed.
+    //
+    // ## Why this does not first check whether the sheet already matches
+    //
+    // It cannot. Google Sheets publishes no active-sheet state -- a whole-window
+    // diff across a real switch returns zero differing elements, which is the
+    // same measurement that makes capture unable to read it. There is nothing to
+    // compare the recorded sheet against.
+    //
+    // Qualifying unconditionally is equivalent anyway: navigating to `Sheet2!B2`
+    // while already on Sheet2 lands on the same cell. The one behavioural
+    // difference is a target document with no sheet of that name, where a
+    // qualified reference fails loudly instead of silently writing to whichever
+    // sheet happens to be in front -- which is the defect this exists to stop.
+    let (recorded_sheet, bare_cell) = crate::capture::grid::split_sheet_ref(cell);
+
     if let Err(e) = name_box.set_value(cell) {
         return mk(
             StepResult::FailedAction,
@@ -965,12 +984,27 @@ async fn grid_type(
     // Confirm the cursor actually moved BEFORE typing. Nothing has been written
     // yet, so refusing here costs nothing; typing into whatever happens to be
     // selected is how a replay writes to the wrong cell while reporting success.
+    //
+    // Compared against the CELL, not against what was typed. A qualified
+    // reference echoes back bare -- measured: `Sheet2!B2` in, `"B2"` out -- so
+    // comparing against the full string would reject every cross-sheet
+    // navigation as a wrong target, precisely when it had just worked.
+    //
+    // The check is therefore weaker for a qualified step than a bare one: it
+    // confirms the cell but cannot confirm the sheet, because the Name Box does
+    // not report one and nothing else in the tree does either. Stated rather
+    // than papered over -- the sheet is verified end to end by CSV export in the
+    // probe, not here.
     let landed = name_box.text(0).unwrap_or_default();
-    if landed.trim() != cell {
+    if landed.trim() != bare_cell {
+        let asked = match recorded_sheet {
+            Some(s) => format!("{cell:?} (cell {bare_cell:?} on sheet {s:?})"),
+            None => format!("{cell:?}"),
+        };
         return mk(
             StepResult::FailedWrongTarget,
             format!(
-                "the Name Box reads {landed:?} after asking for {cell:?}, so the cursor is \
+                "the Name Box reads {landed:?} after asking for {asked}, so the cursor is \
                  not demonstrably on the recorded cell.\nRefusing to type: this is how a \
                  replay fills the wrong cell while reporting success."
             ),
