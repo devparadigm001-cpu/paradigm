@@ -7543,6 +7543,172 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------ sheetsstamp mode ----
+//
+// Verifies the CAPTURE half of sheet tracking, which needs a human: no probe in
+// this investigation has ever made a synthetic click land on a sheet tab, and
+// the tracking is driven entirely by that click.
+//
+// Drives nothing. Starts a capture session, waits while a person switches sheets
+// by clicking a tab and then edits a cell, and reports whether the resulting
+// grid action was stamped `Sheet<N>!<cell>` rather than a bare cell.
+//
+// Same guards as `sheetsmanual`: the gid is read either side, so a recording
+// with no actual sheet switch in it is reported as inconclusive rather than
+// being read as a tracking failure.
+async fn sheetsstamp_mode() -> ExitCode {
+    use paradigm_lib::capture::{CaptureSession, ExclusionList};
+    use std::io::Write;
+
+    fn say(line: &str) {
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+    }
+
+    let wait_secs: u64 = std::env::args()
+        .filter_map(|a| a.parse::<u64>().ok())
+        .find(|n| (10..=600).contains(n))
+        .unwrap_or(60);
+
+    say("== does capture stamp a cell edit with its sheet? ==\n");
+    say("This probe clicks nothing. You perform the gesture; it only watches.\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((window, doc_id)) = sheets_window(&desktop).await else {
+        say("  INCONCLUSIVE: no Sheets window open. Open a spreadsheet first.");
+        return ExitCode::FAILURE;
+    };
+    say(&format!("  document: {doc_id}"));
+
+    if !ensure_second_sheet(&desktop).await {
+        say("\n  INCONCLUSIVE: could not get a second sheet to switch to.");
+        say(&format!("\n  DOCUMENT ID for cleanup: {doc_id}"));
+        return ExitCode::FAILURE;
+    }
+    // Park on Sheet1 so the switch under test is a real change.
+    goto_sheet_via_namebox(&desktop, "Sheet1!A1").await;
+    let gid_before = current_gid(&desktop).await;
+    let tabs = tab_bar_buttons(&desktop, &window).await;
+    say(&format!("  showing gid {gid_before:?}, tabs {tabs:?}"));
+
+    say("\n================ WHAT TO DO ================\n");
+    say("  When recording starts below:");
+    say("    1. CLICK the 'Sheet2' tab at the bottom");
+    say("    2. Type a short value into a cell");
+    say("    3. Press Tab to commit it");
+    say("  Then stop touching the machine.\n");
+    say("  Use the MOUSE for step 1. The Name Box or a keyboard shortcut would");
+    say("  switch the sheet without producing the click the tracking needs.\n");
+
+    for n in (1..=5).rev() {
+        say(&format!("  starting in {n}..."));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    let session = match CaptureSession::start_session(
+        "sheets-stamp",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    say(&format!("\n  >>> RECORDING NOW -- go ahead. {wait_secs}s <<<\n"));
+    let mut left = wait_secs;
+    while left > 0 {
+        let step = left.min(5);
+        tokio::time::sleep(Duration::from_secs(step)).await;
+        left -= step;
+        if left > 0 {
+            say(&format!("      {left}s left..."));
+        }
+    }
+    say("\n  >>> STOPPED <<<\n");
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let gid_after = current_gid(&desktop).await;
+
+    say("================ DID THE SWITCH HAPPEN? ================\n");
+    say(&format!("  gid before: {gid_before:?}"));
+    say(&format!("  gid after : {gid_after:?}"));
+    let switched = gid_before.is_some() && gid_after.is_some() && gid_before != gid_after;
+    if !switched {
+        say("  !! the gid did NOT change, so no sheet switch happened. Nothing below");
+        say("     says anything about whether tracking works.");
+    }
+
+    say("\n================ WHAT CAPTURE PRODUCED ================\n");
+    say(&format!(
+        "  {} action(s), {} exclusion(s), {} unmapped event(s)\n",
+        report.actions.len(),
+        report.exclusions.len(),
+        report.unmapped_events
+    ));
+    for (i, a) in report.actions.iter().enumerate() {
+        say(&format!(
+            "  [{}] {:<9} role={:?} name={:?} payload={:?}",
+            i + 1,
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-"),
+            a.payload.as_deref().unwrap_or("-")
+        ));
+    }
+
+    say("\n================ VERDICT ================\n");
+    let grid_edits: Vec<_> = report
+        .actions
+        .iter()
+        .filter(|a| a.kind.as_str() == "type" && a.element_role.as_deref() == Some("ComboBox"))
+        .collect();
+    if grid_edits.is_empty() {
+        say("  no grid cell edit was captured, so there is nothing to have stamped.");
+        say("  (Was the value typed into a CELL, and committed with Tab?)");
+    }
+    let stamped: Vec<&str> = grid_edits
+        .iter()
+        .filter_map(|a| a.element_name.as_deref())
+        .filter(|n| n.contains('!'))
+        .collect();
+    for a in &grid_edits {
+        let name = a.element_name.as_deref().unwrap_or("-");
+        let (sheet, cell) = paradigm_lib::capture::grid::split_sheet_ref(name);
+        say(&format!(
+            "  cell edit {name:?}  ->  sheet={sheet:?} cell={cell:?}"
+        ));
+    }
+    say("");
+    if switched && !grid_edits.is_empty() && !stamped.is_empty() {
+        say("  STAMPED. Capture recorded which sheet the edit happened on, which is");
+        say("  the half that had no data source until the tab click supplied it.");
+    } else if switched && !grid_edits.is_empty() {
+        say("  NOT STAMPED. A switch happened and an edit was captured, but the edit");
+        say("  carries a bare cell -- the tab click was not recognised. Check the");
+        say("  captured click's role and name above against looks_like_sheet_tab.");
+    } else {
+        say("  INCONCLUSIVE -- see above. Not evidence either way.");
+    }
+
+    say(&format!("\n  DOCUMENT ID for cleanup: {doc_id}"));
+    ExitCode::SUCCESS
+}
+
 // ------------------------------------------------------ sheetsactive mode ----
 //
 // The last capture-side question, asked of the WHOLE window rather than the tab
@@ -10345,6 +10511,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsstamp") {
+        return sheetsstamp_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsactive") {
         return sheetsactive_mode().await;
