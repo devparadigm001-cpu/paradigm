@@ -7543,6 +7543,191 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ----------------------------------------------------- sourcereader mode ----
+//
+// The SpreadsheetReader against a real sheet. Its geometry and reference rules
+// are unit-tested, but "does it actually read the right cells out of a live
+// document" is not something a unit test can answer.
+//
+// Seeds a small table, then drives the reader through the loop 4.4 describes --
+// peek, read, advance -- and checks the values against what was written, plus
+// the three exhaustion outcomes 4.10 distinguishes.
+async fn sourcereader_mode() -> ExitCode {
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+    use paradigm_lib::source::{Advance, FieldRef, SourceReader};
+
+    println!("== the SpreadsheetReader against a live sheet ==\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((window, doc_id)) = sheets_window(&desktop).await else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    println!("  document: {doc_id}");
+
+    // ---- seed a table -------------------------------------------------------
+    //
+    // Header in row 1, two records in rows 2-3, a GAP at row 4, and one more
+    // record at row 5. The gap is the point: it is what makes the difference
+    // between Exhausted and SuspiciousGap observable.
+    let seed: &[(&str, &str)] = &[
+        ("B1", "Name"),
+        ("C1", "Total"),
+        ("B2", "Ada"),
+        ("C2", "100"),
+        ("B3", "Grace"),
+        ("C3", "200"),
+        // row 4 deliberately left blank
+        ("B5", "Katherine"),
+        ("C5", "300"),
+    ];
+    println!("\n-- seeding --");
+    for (cell, value) in seed {
+        if goto_sheet_via_namebox(&desktop, cell).await.is_none() {
+            println!("  could not reach {cell}");
+            println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+            return ExitCode::FAILURE;
+        }
+        if let Ok(t) = desktop.focused_element() {
+            let _ = t.type_text(value, false);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Ok(c) = desktop.focused_element() {
+            let _ = c.press_key("{Tab}");
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+    println!("  seeded {} cells", seed.len());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // ---- construct the reader ----------------------------------------------
+    let Some((window, _)) = sheets_window(&desktop).await.map(|(w, i)| (w, i)).or(Some((window, String::new()))) else {
+        println!("  lost the window.");
+        return ExitCode::FAILURE;
+    };
+    let fields = vec![
+        FieldRef { name: "Name".into(), locator: "B".into() },
+        FieldRef { name: "Total".into(), locator: "C".into() },
+    ];
+    let mut reader = match SpreadsheetReader::open(
+        desktop.clone(),
+        &window,
+        doc_id.clone(),
+        None,
+        2, // first data row
+        1, // header row
+        vec!["A".into(), "B".into(), "C".into(), "D".into()],
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            println!("\n  READER WOULD NOT OPEN: {e}");
+            println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  reader opened at {:?}", reader.position());
+
+    // ---- shape, for drift ---------------------------------------------------
+    println!("\n================ SHAPE (header row) ================\n");
+    match reader.shape() {
+        Ok(s) => {
+            for c in &s.columns {
+                println!("  {:?} -> {:?}", c.locator, c.label);
+            }
+        }
+        Err(e) => println!("  shape failed: {e}"),
+    }
+
+    // ---- the 4.4 loop -------------------------------------------------------
+    println!("\n================ READ LOOP ================\n");
+    let mut got: Vec<(String, String, String)> = Vec::new();
+    let mut ended = String::new();
+    for _ in 0..6 {
+        match reader.peek(&fields) {
+            Ok(Advance::Record) => {
+                match reader.read(&fields) {
+                    Ok(rec) => {
+                        let name = rec.fields.get("Name").cloned().unwrap_or_default();
+                        let total = rec.fields.get("Total").cloned().unwrap_or_default();
+                        println!(
+                            "  row {:<3} Name={name:?} Total={total:?}",
+                            rec.position.row_key
+                        );
+                        got.push((rec.position.row_key.clone(), name, total));
+                    }
+                    Err(e) => {
+                        println!("  read failed: {e}");
+                        break;
+                    }
+                }
+                if let Err(e) = reader.advance() {
+                    println!("  advance failed: {e}");
+                    break;
+                }
+            }
+            Ok(Advance::SuspiciousGap { rows_with_data_below }) => {
+                println!(
+                    "  row {:<3} SUSPICIOUS GAP -- {rows_with_data_below} row(s) with data below",
+                    reader.position().row_key
+                );
+                ended = format!("SuspiciousGap({rows_with_data_below})");
+                break;
+            }
+            Ok(Advance::Exhausted) => {
+                println!("  row {:<3} EXHAUSTED", reader.position().row_key);
+                ended = "Exhausted".to_string();
+                break;
+            }
+            Err(e) => {
+                println!("  peek failed: {e}");
+                ended = format!("error: {e}");
+                break;
+            }
+        }
+    }
+
+    println!("\n================ VERDICT ================\n");
+    let expected = [("2", "Ada", "100"), ("3", "Grace", "200")];
+    let read_ok = got.len() == expected.len()
+        && got.iter().zip(expected.iter()).all(|((r, n, t), (er, en, et))| {
+            r == er && n == en && t == et
+        });
+    println!("  records read : {:?}", got);
+    println!("  expected     : {expected:?}");
+    println!("  values match : {read_ok}");
+    println!("  stopped with : {ended}");
+    println!();
+    if read_ok && ended.starts_with("SuspiciousGap") {
+        println!("  PASS. The reader read the seeded rows correctly and stopped at the");
+        println!("  blank row WITHOUT calling it the end -- 4.10's distinction, live.");
+    } else if read_ok && ended == "Exhausted" {
+        println!("  PARTIAL. Values are right, but the blank row at 4 was reported as the");
+        println!("  end even though row 5 has data. The lookahead did not see it.");
+    } else {
+        println!("  FAIL -- see above.");
+    }
+
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------- sheetsformula mode ----
 //
 // `sheetsread` established that a cell's value IS readable live, from an
@@ -11068,6 +11253,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sourcereader") {
+        return sourcereader_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsformula") {
         return sheetsformula_mode().await;
