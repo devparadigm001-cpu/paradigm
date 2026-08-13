@@ -6,7 +6,13 @@ these — capture recording *where a value came from* — was produced in item 2
 consumed by nothing until item 6, and was one review away from being finished
 without anyone noticing.
 
-Status as of item 7 (run controls).
+**Both are now items in the design document's Section 5** — the destination
+writer as item 8 (built), the first-record check as item 9 (not built). This
+file is the record of how each was found and why it was missing; Section 5 is
+where the work is tracked. A gap recorded only here would repeat the exact
+failure it describes.
+
+Status as of item 8 (destination writer, built and proven end to end).
 
 ---
 
@@ -53,8 +59,9 @@ item for the thing that would populate it.
 controls, and folding it into them would bury a user-facing safety check inside
 an item about pause and stop.
 
-Suggested position: **before item 8**, since it gates whether a run starts at all
-and both remaining items assume runs happen.
+**Resolved as a tracking matter:** it is now **Section 5, item 9** of the design
+document, placed before new-batch detection because it gates whether a run
+starts at all. Still unbuilt — this is a scheduling fix, not an implementation.
 
 ---
 
@@ -80,11 +87,20 @@ against live Google Sheets. The new part is the write and its read-back check.
 It needs live evidence against a real Sheets window to be worth anything, the
 same standard `SpreadsheetReader` was held to.
 
-### Consequence while it is missing
+### Resolved — built as Section 5 item 8
 
-The four run-control commands (`pause_workflow_run`, `resume_workflow_run`,
-`stop_workflow_run`, `get_workflow_run_status`) are registered and reachable but
-have nothing to act on, because there is no command that starts a run. Adding a
-start command needs a writer to hand `run::background::spawn`.
+`run::spreadsheet::SpreadsheetWriter` exists and the loop has been proven
+against a live Google Sheet: three records read from Sheet1 and written to
+Sheet2, paused mid-record and resumed, verified by per-sheet CSV export, then
+re-run to confirm the ledger prevented a second write. See
+`examples/text_capture_probe.rs -- templatedrun`.
 
-**This is the shorter of the two gaps and blocks the more visible thing.**
+### What it did NOT resolve
+
+There is still no command that **starts** a run, so the four run-control
+commands (`pause_workflow_run`, `resume_workflow_run`, `stop_workflow_run`,
+`get_workflow_run_status`) remain registered and reachable with nothing to act
+on. A start command is now unblocked — `run::background::spawn` can be handed a
+real reader and writer — but it belongs with item 9, because §4.3 says the
+first-record preview gates the run, and adding a start command that skips that
+gate would build the thing item 9 exists to prevent.

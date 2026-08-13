@@ -388,9 +388,40 @@ is keyed by workflow identity, not source identity alone.
    background thread — non-blocking, survives minimize, does not survive a
    full app close (4.10). Genuinely new, since existing replay runs a fixed
    step list to completion with no pause point.
-8. **New-batch detection**: the source-watching + confirmation flow in 4.8.
-9. **Format-drift detection**: the before/during-run check in 4.5, for both
-   source and destination.
+8. **Destination writer**: the concrete `DestinationWriter` for a spreadsheet
+   — navigate, type, commit, read back and compare — mirroring the source
+   reader in item 2. *Added after the fact:* item 2 gave the source side both
+   an interface and a real implementation, and the destination side was
+   specified as an interface only. Items 6 and 7 were therefore both tested
+   entirely against fakes, and nothing could touch a real surface until this
+   existed.
+9. **First-record safety check (4.3), backend**: read the very next record and
+   render it *without writing it*, run the item 4 Qwen verification on the
+   mapping at that point, and gate the run on the answer — including 4.10's
+   "rejecting the preview cancels cleanly; the recording stands as an ordinary
+   one-shot playbook, unaffected".
+
+   *Added after the fact,* and the omission mattered: 4.3 appeared only in
+   Section 6's **frontend** list, so there was an item to build the preview
+   screen and no item to build what populates it. It is also the real call
+   site for item 4 — `detect::verify` needs a human-readable label per field
+   locator, which comes from the source's header row, and this is the only
+   point in the flow where a reader is open on the source *and* nothing has
+   been written yet. Without this item, item 4 stays built, tested and called
+   from nowhere.
+
+   Placed before new-batch detection because it gates whether a run starts at
+   all, and both remaining items assume runs happen.
+10. **New-batch detection**: the source-watching + confirmation flow in 4.8.
+11. **Format-drift detection**: the before/during-run check in 4.5, for both
+    source and destination.
+
+> **Note on numbering.** Items 8 and 9 were inserted during the build; what
+> this list originally called items 8 and 9 are now 10 and 11. Both insertions
+> were gaps found by building, not scope added — see
+> [Templated-Workflows-Build-Order-Gaps.md](Templated-Workflows-Build-Order-Gaps.md)
+> for how each was found. Commit messages referring to "item N" use the
+> numbering current at the time.
 
 ## 6. Frontend build order
 
