@@ -7543,6 +7543,224 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// -------------------------------------------------- sheetsqualified mode ----
+//
+// The replay half, and the regression check, in one document so they verify
+// each other.
+//
+//   Leg A -- a QUALIFIED step (`Sheet2!B2`) replayed while the document shows
+//   Sheet1. It must land on Sheet2. This is the fix.
+//
+//   Leg B -- a BARE step (`C3`) replayed while the document shows Sheet1. It
+//   must land on Sheet1, exactly as before sheet tracking existed. This is the
+//   regression check, and it is the one that matters most: the common case is a
+//   recording that never switches sheets, and it must be untouched.
+//
+// Ground truth is the per-sheet CSV export, and BOTH sheets are checked for BOTH
+// markers. Checking only that each marker is where it belongs would pass if a
+// marker landed on both sheets.
+async fn sheetsqualified_mode() -> ExitCode {
+    use paradigm_lib::capture::{ActionCandidate, ActionKind, CapturedStream, ExclusionList};
+    use paradigm_lib::compile::{compile, store, ReversibilityPolicy};
+    use paradigm_lib::labeling::RedactionPolicy;
+
+    const QUALIFIED: &str = "qualifiedmarker";
+    const BARE: &str = "baremarker";
+
+    println!("== qualified replay lands on the right sheet; bare is unchanged ==\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((_w, doc_id)) = sheets_window(&desktop).await else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    println!("  document: {doc_id}");
+    if !ensure_second_sheet(&desktop).await {
+        println!("\n  INCONCLUSIVE: could not get a second sheet.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::FAILURE;
+    }
+    let gid_sheet2 = current_gid(&desktop).await.unwrap_or_default();
+    println!("  Sheet2 gid = {gid_sheet2}");
+
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("temp db failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // One grid step, built through the real gate and compiler.
+    let build = |name: &str, text: &str, title: &str| {
+        let mut s = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
+        s.admit(ActionCandidate {
+            kind: ActionKind::Type,
+            identifiers: vec!["msedge.exe".into()],
+            process_name: Some("msedge.exe".into()),
+            element_role: Some("ComboBox".into()),
+            element_name: Some(name.to_string()),
+            payload: Some(text.to_string()),
+            detail: None,
+            timestamp_ms: 0,
+        });
+        compile(
+            s.actions(),
+            title,
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        )
+    };
+
+    let run_leg = |label: &str, pb: &paradigm_lib::compile::CompiledPlaybook| {
+        println!("\n  -- {label} --");
+        for s in &pb.steps {
+            let payload: serde_json::Value =
+                serde_json::from_str(&s.action_payload_json).unwrap_or_default();
+            println!("     target name = {:?}", payload["target"]["name"].as_str());
+        }
+    };
+
+    // ---- leg A: qualified, from Sheet1 --------------------------------------
+    println!("\n================ LEG A: qualified step ================");
+    let parked = goto_sheet_via_namebox(&desktop, "Sheet1!A1").await;
+    println!("  parked on gid {parked:?} (must be 0, so a switch is required)");
+    if parked.as_deref() != Some("0") {
+        println!("\n  INCONCLUSIVE: could not park on Sheet1.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::FAILURE;
+    }
+    let pb_a = build("Sheet2!B2", QUALIFIED, "Qualified");
+    run_leg("replaying Sheet2!B2 while showing Sheet1", &pb_a);
+    if let Err(e) = store::store(&mut conn, &pb_a) {
+        eprintln!("store failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    match paradigm_lib::replay::replay(&mut conn, &desktop, &pb_a.id).await {
+        Ok(r) => {
+            println!("     status: {}", r.status);
+            for o in &r.outcomes {
+                println!("     [{}] {}", o.step_order, o.result.label());
+                for l in o.detail.lines() {
+                    println!("        {l}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("replay failed to run: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // ---- leg B: bare, from Sheet1 -------------------------------------------
+    println!("\n================ LEG B: bare step (regression) ================");
+    let parked = goto_sheet_via_namebox(&desktop, "Sheet1!A1").await;
+    println!("  parked back on gid {parked:?}");
+    if parked.as_deref() != Some("0") {
+        println!("\n  INCONCLUSIVE: could not park back on Sheet1 for the regression leg.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::FAILURE;
+    }
+    let pb_b = build("C3", BARE, "Bare");
+    run_leg("replaying bare C3 while showing Sheet1", &pb_b);
+    if let Err(e) = store::store(&mut conn, &pb_b) {
+        eprintln!("store failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    match paradigm_lib::replay::replay(&mut conn, &desktop, &pb_b.id).await {
+        Ok(r) => {
+            println!("     status: {}", r.status);
+            for o in &r.outcomes {
+                println!("     [{}] {}", o.step_order, o.result.label());
+                for l in o.detail.lines() {
+                    println!("        {l}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("replay failed to run: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // ---- ground truth --------------------------------------------------------
+    println!("\n  waiting 10s for Sheets to sync before exporting...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    println!("\n================ GROUND TRUTH (per sheet) ================\n");
+    let csv1 = download_csv(browser, &doc_id, "0").await.unwrap_or_default();
+    println!("  Sheet1 (gid=0):");
+    for l in csv1.lines().take(6) {
+        println!("    {l:?}");
+    }
+    let csv2 = download_csv(browser, &doc_id, &gid_sheet2)
+        .await
+        .unwrap_or_default();
+    println!("  Sheet2 (gid={gid_sheet2}):");
+    for l in csv2.lines().take(6) {
+        println!("    {l:?}");
+    }
+
+    let q_on1 = csv1.contains(QUALIFIED);
+    let q_on2 = csv2.contains(QUALIFIED);
+    let b_on1 = csv1.contains(BARE);
+    let b_on2 = csv2.contains(BARE);
+
+    println!("\n================ VERDICT ================\n");
+    println!("  qualified marker on Sheet1 : {q_on1}   (must be false)");
+    println!("  qualified marker on Sheet2 : {q_on2}   (must be TRUE)");
+    println!("  bare marker on Sheet1      : {b_on1}   (must be TRUE)");
+    println!("  bare marker on Sheet2      : {b_on2}   (must be false)");
+    println!(
+        "  bare landed at C3          : {:?}",
+        csv_at(&csv1, 3, 3)
+    );
+
+    let fix_ok = q_on2 && !q_on1;
+    let regression_ok = b_on1 && !b_on2;
+    println!();
+    match (fix_ok, regression_ok) {
+        (true, true) => {
+            println!("  BOTH PASS. A qualified step crosses to the recorded sheet, and a bare");
+            println!("  step still writes to whatever sheet is showing -- unchanged.");
+        }
+        (false, true) => {
+            println!("  FIX FAILED, regression fine. The qualified step did not land on the");
+            println!("  recorded sheet.");
+        }
+        (true, false) => {
+            println!("  FIX WORKS but BARE BEHAVIOUR CHANGED. A recording that never switches");
+            println!("  sheets no longer behaves as before -- that is a regression.");
+        }
+        (false, false) => println!("  BOTH FAILED."),
+    }
+
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
 // ------------------------------------------------------ sheetsstamp mode ----
 //
 // Verifies the CAPTURE half of sheet tracking, which needs a human: no probe in
@@ -10511,6 +10729,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsqualified") {
+        return sheetsqualified_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsstamp") {
         return sheetsstamp_mode().await;

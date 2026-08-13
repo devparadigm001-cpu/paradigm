@@ -1573,6 +1573,100 @@ have not changed:
 Testing its capture half would also need a human at the keyboard again: no probe
 in this investigation has ever made a synthetic click land on a sheet tab.
 
+## Sheet tracking: BUILT and verified (2026-08-12)
+
+The wrong-sheet gap is fixed **for recordings that switch sheets by clicking a
+tab**. The limitation in that sentence is real and is stated in full below.
+
+### How it works
+
+Sheets exposes no active-sheet *state* — the whole-window diff above returns zero
+differing elements — but the *event* is observable. So capture tracks the event:
+
+* `GridCellWatcher` keeps a session-scoped `current_sheet`, updated when a
+  captured click looks like a sheet tab (`looks_like_sheet_tab`).
+* Cell edits are emitted as `Sheet2!B2` instead of `B2` when a sheet is known.
+* `grid_type` puts that straight into the Name Box, which switches sheet **and**
+  navigates in one action.
+
+The sheet rides inside `element_name`, on exactly the path the bare cell
+reference already travelled — no new field on `ActionCandidate`, no change to
+compile or the stored payload shape.
+
+**Architecture.** All of it lives in `capture::grid`. `observe_grid` was already
+the spreadsheet-specific seam and already saw every click, so the only change
+elsewhere is passing the click's role and name through it. Capture's generic
+`to_candidate` mapping still knows nothing about spreadsheets.
+
+### Verified, in three parts
+
+**Capture — a human clicking the tab**, since no probe can land that click:
+
+```
+  gid before: Some("0")   gid after: Some("1167047289")   <- a real switch
+
+  [2] click  role="text"     name="Sheet2"
+  [5] type   role="ComboBox" name="Sheet2!A1"  payload="hello"
+```
+
+**Compile and store** — driven through the real gate, compiler and an encrypted
+database, then read back: the qualified reference survives intact *and* still
+passes `is_cell_editor`, which is what decides whether replay uses the Name Box
+at all.
+
+**Replay and regression — both legs in one document, per-sheet CSV:**
+
+```
+  Sheet1 (gid=0):            Sheet2 (gid=959857236):
+    ",,"                       ","
+    ",,"                       ",qualifiedmarker"
+    ",,baremarker"
+
+  qualified marker on Sheet1 : false   (must be false)
+  qualified marker on Sheet2 : true    (must be TRUE)
+  bare marker on Sheet1      : true    (must be TRUE)
+  bare marker on Sheet2      : false   (must be false)
+```
+
+Both markers checked on both sheets: verifying only that each landed where it
+belonged would pass even if one had landed on both. The bare leg is the
+regression check and it is the one that matters most — the common case is a
+recording that never switches sheets, and it writes to the showing sheet exactly
+as before.
+
+### Two deviations from the plan, both forced by measurement
+
+**No "only qualify if the sheet differs" check.** It cannot be implemented:
+replay cannot read the active sheet either, for the same reason capture cannot.
+Qualifying unconditionally is equivalent in outcome — navigating to `Sheet2!B2`
+while already on Sheet2 lands on the same cell. The one real difference is a
+target document with no sheet of that name, where a qualified reference now fails
+loudly rather than silently writing to whichever sheet is in front. That is the
+defect this exists to prevent, so the trade goes the right way.
+
+**The read-back check is weaker for a qualified step.** It compares the *cell*
+only, because `Sheet2!B2` echoes back `"B2"` — measured. So it confirms the cell
+but cannot confirm the sheet, since the Name Box reports no sheet and nothing
+else in the tree does. The sheet is verified end to end by CSV, not by that
+check.
+
+### What this does NOT fix, stated plainly
+
+* **A recording that merely STARTS on a non-default sheet carries nothing.**
+  There is no tab click to observe, so `current_sheet` stays `None` and the edit
+  is recorded bare — it will replay into whatever sheet is showing, exactly as
+  before. This is not a bug in the tracking; it is the boundary of what an
+  event-based approach can see, and it cannot be fixed without an active-sheet
+  signal that Sheets does not publish.
+* **Renamed sheets are not tracked.** Detection matches the default `Sheet<N>`
+  naming. A sheet renamed to `Data` is captured as `role="text" name="Data"`,
+  indistinguishable from a click on any other text, with no selection state to
+  cross-check against. Pinned by a test asserting `Data` and `Q3 Forecast` are
+  *not* treated as tabs, so it reads as a known boundary rather than a defect.
+* **Detection is deliberately narrow** for the same reason: a false positive
+  would silently misattribute every later edit to a sheet that was never opened,
+  which is worse than not tracking at all.
+
 ### Two probe defects found while measuring, both self-inflicted
 
 Recorded because each produced a confident verdict from evidence that did not
@@ -1692,13 +1786,18 @@ exist, which is the failure shape this project keeps rediscovering.
       unchanged). A second, independent blocker surfaced too: the captured
       selector `role:text|name:Sheet1` carries no document scoping and is
       ambiguous whenever another spreadsheet is open. See "Route 1 replay".
-- [ ] **Decide whether to translate a recorded tab click into a Name Box
-      navigation.** Both halves are now individually proven — capture records the
-      tab click, and `Sheet1!A1` through the Name Box switches sheets — so this
-      would fix the explicit-switch case end to end using only measured-working
-      mechanisms. Held because it puts an application-specific heuristic into a
-      replay core that currently has none, which is a design decision rather than
-      a fix. See "Keyboard switching, and what the blocker actually is".
+- [x] ~~**Decide whether to translate a recorded tab click into a Name Box
+      navigation.**~~ **Built and verified 2026-08-12.** Capture tracks the sheet
+      from tab clicks and stamps edits `Sheet2!B2`; `grid_type` navigates the
+      qualified reference. CSV-verified on both legs: qualified lands on the
+      recorded sheet, bare is unchanged. The app-specific knowledge is confined
+      to `capture::grid`, which was already the spreadsheet seam. See "Sheet
+      tracking: BUILT and verified".
+- [ ] **The default-sheet-start case remains open, and is not fixable this way.**
+      A recording that begins on a non-default sheet without clicking a tab
+      carries no sheet identity, because there is no event to observe. It would
+      need an active-sheet signal Sheets does not publish — measured. Recorded so
+      it is not rediscovered as a regression in the tracking.
 - [x] ~~**Find a keyboard route for switching sheets.**~~ **Not needed.** The Name
       Box qualified reference already switches sheet *and* navigates to the cell
       in one action, and `grid_type` already uses the Name Box. Sheets has no
