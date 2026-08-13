@@ -4,6 +4,7 @@ pub mod compile;
 pub mod db;
 pub mod labeling;
 pub mod replay;
+pub mod source;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
