@@ -1256,6 +1256,77 @@ fourth false negative. They are worth keeping for whoever picks this up.
 route 1 is unproven in both halves, and the alternative routes in the section
 above are unchanged.
 
+## Route 1, answered by a human click: capture WORKS (2026-08-12)
+
+The gesture five automated runs could not produce was performed by hand, with
+`text_capture_probe -- sheetsmanual` watching and driving nothing.
+
+**A human clicking a sheet tab IS captured, and it names the sheet.** This
+reverses the tentative reading from the automated attempt above.
+
+### The evidence
+
+The switch was real, not assumed — the probe reads the gid either side:
+
+```
+  gid before: Some("1202380086")
+  gid after : Some("0")
+  the document changed sheets, so the recording contains a real switch.
+```
+
+And the click landed in the recording:
+
+```
+  [6] click     role="text" name="Sheet1"
+
+  compiled selector: "role:text|name:Sheet1"
+```
+
+That is a replayable identification of a *specific* sheet, which is exactly what
+the capture half needed and what the accessibility tree could not provide as
+state. The sheet identity is recoverable after all — not by reading which sheet
+is active, but by recording the act of switching.
+
+### It explains the earlier `role=pane` result rather than contradicting it
+
+The automated run captured `click role=pane name="-"` and that stands: it was a
+click that **missed** the tab. A click that *hits* is captured as
+`role="text" name="Sheet1"`. The two observations are consistent, and the earlier
+one was correctly labelled as inconclusive at the time.
+
+### Read the role carefully — it is `text`, not `Button`
+
+The locator finds `Button "Sheet1"`; the *recorder* attributes the click to the
+innermost node, the `Text "Sheet1"` inside that button's `Group` (the subtree is
+dumped under "Q1b" above). So the compiled selector is `role:text|name:Sheet1`,
+not `role:Button|name:Sheet1`.
+
+This matters for replay, and is the first thing to check next: replay would
+resolve and click the **Text** node, not the Button. Whether clicking that inner
+node activates the tab is unmeasured. Name matching is containment, so
+`name:Sheet1` also reaches `Sheet10`/`Sheet11` — already handled by
+`resolved_is_recorded_target`, which selects the element whose name *is*
+`Sheet1`. See `selector-matching-precision.md`.
+
+### What is still NOT established
+
+* **Replay.** No captured tab click has been replayed. There is specific reason
+  for doubt: synthetic clicks on Sheets chrome failed throughout the automated
+  runs, and replay clicks the same way. Capture working does not make the route
+  work.
+* **The default-sheet-start case, unchanged.** This only covers recordings that
+  *contain* a switch. A recording that merely starts on a non-default sheet still
+  carries no sheet identity, because there is no click to record. That limitation
+  is real and was never in doubt.
+
+### One thing the recording shows in passing
+
+The session also captured clicks on a PowerShell window and on the Claude app —
+`role="text" name="Windows PowerShell"`, two unnamed `group` clicks — because
+record mode captures system-wide. Unrelated to this question, and already filed
+as `record-mode-unscoped-system-wide-capture.md`, but worth noting that a real
+recording of this gesture carries noise a user would have to trim.
+
 ### Two probe defects found while measuring, both self-inflicted
 
 Recorded because each produced a confident verdict from evidence that did not
@@ -1363,15 +1434,19 @@ exist, which is the failure shape this project keeps rediscovering.
       CSV-confirmed), the **capture** half is blocked because Sheets exposes no
       accessibility signal for which sheet is active. Not implemented, because
       the navigator would have nothing to tell it which sheet.
-- [ ] **Test whether a sheet-tab click is captured — ATTEMPTED, still open.** See
-      "Route 1 attempted". A click inside the Sheets page was captured as an
-      unnamed `role=pane` compiling to the selector `"role:pane"`, which is not
-      replayable. But the decisive test did not run: synthetic clicks would not
-      land on the tab bar at all, so what capture does with a *successful* tab
-      click remains unmeasured. Route 1's replay half is now doubtful too, since
-      replay clicks the same way. Needs a reliable way to click Sheets chrome
-      before it can be settled — or a human driving the recording by hand, which
-      is the one gesture a probe has not been able to reproduce.
+- [x] ~~**Test whether a sheet-tab click is captured.**~~ **Answered by a human
+      click, 2026-08-12: YES.** Captured as `role="text" name="Sheet1"`,
+      compiling to `role:text|name:Sheet1`, with the gid confirming a real
+      switch (1202380086 → 0). See "Route 1, answered by a human click". The
+      sheet identity is recoverable by recording the *switch*, which the
+      accessibility tree could not provide as state.
+- [ ] **Replay a captured tab click — the remaining half of route 1.** Capture
+      works; replay is unmeasured and specifically doubtful, because synthetic
+      clicks on Sheets chrome failed throughout the automated runs and replay
+      clicks the same way. Check first that clicking the inner `Text` node (what
+      the recorder attributes, not the `Button` the locator finds) actually
+      activates the tab. Then replay into a fresh multi-sheet document showing a
+      different sheet, and confirm per-sheet by CSV.
 - [x] ~~**Measure the per-keystroke cost.**~~ **Measured: 2.22 ms per keystroke,
       and a confirmed non-issue.** The suspicion did not survive an A/B — see
       "The per-keystroke cost, measured".
