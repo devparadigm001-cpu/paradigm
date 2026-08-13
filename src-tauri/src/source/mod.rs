@@ -32,6 +32,38 @@
 //! **structural** -- "row 47: done" -- while actual source *content* is handled
 //! only in memory, during detection and during each run.
 //!
+//! ## Measured: a spreadsheet cell CAN be read live, from the formula bar
+//!
+//! The one primitive the spreadsheet reader needs -- read a cell's value without
+//! entering edit mode -- was unmeasured, and `text_capture_probe.rs:4769`
+//! recorded prior evidence that it might not exist. Settled by
+//! `text_capture_probe -- sheetsread` and `-- sheetsformula`:
+//!
+//! ```text
+//! [4] name=""  text(0)="B2"                bounds=(2014,207,75,20)
+//!     ancestry=["Group(Name box (Ctrl + J))", ...]        <- the REFERENCE
+//! [5] name=""  text(0)="readprobe7391\n"   bounds=(2146,205,740,27)
+//!     ancestry=["Group","Group","Group","Group","Group","Group"]  <- the VALUE
+//! ```
+//!
+//! Cross-checked against the CSV export (`,readprobe7391`), so "the tree
+//! reports it" is not a false positive from a write that never landed.
+//!
+//! Two things that decide how the reader is built:
+//!
+//! * **The value arrives with a trailing newline** (`"readprobe7391\n"`).
+//!   [`crate::capture::grid::clean_cell_text`] already strips exactly that, plus
+//!   the `U+FEFF` Sheets seeds its editor with -- so the reader reuses it rather
+//!   than growing a second cleaning rule.
+//! * **The formula bar has no name and a wholly generic ancestry** -- six
+//!   anonymous `Group`s. There is nothing to select it by directly, and the
+//!   window holds eight `Edit`s including the Name Box, which reports `"B2"`.
+//!   A reader that guessed would read a cell REFERENCE where it meant a value
+//!   and look like it was working. Identifying it is a geometric relation to the
+//!   Name Box -- same row, immediately right (Name Box ends at x=2089, the
+//!   formula bar starts at x=2146, both at y≈206) -- and the Name Box IS
+//!   reliably locatable, the way `replay::grid_type` already finds it.
+//!
 //! [`SourceRecord`] carries content, so it is deliberately awkward to persist:
 //! it derives no `Serialize`, and its `Debug` prints field NAMES with their
 //! values elided. A record is something to write to a destination and drop, not

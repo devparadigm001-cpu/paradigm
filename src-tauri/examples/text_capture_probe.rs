@@ -7543,6 +7543,345 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ---------------------------------------------------- sheetsformula mode ----
+//
+// `sheetsread` established that a cell's value IS readable live, from an
+// element with role `Edit` and an empty name. That is a finding, not yet a
+// locator: a Sheets window holds several `Edit`s, and one of them is the Name
+// Box -- which reports the cell REFERENCE. A reader that grabbed the wrong one
+// would read "B2" where it meant to read the customer's name, and would look
+// like it was working.
+//
+// So this enumerates every `Edit` in the window with enough context to tell them
+// apart -- ancestry, bounds, and what each currently reports -- against a cell
+// whose value is known. The output is what the spreadsheet SourceReader needs to
+// target the formula bar deliberately rather than by position or luck.
+async fn sheetsformula_mode() -> ExitCode {
+    const MARKER: &str = "readprobe7391";
+    const CELL: &str = "B2";
+
+    println!("== which Edit is the formula bar? ==\n");
+
+    let doc_arg = std::env::args().find(|a| {
+        a.len() >= 40
+            && a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    });
+    let browser = browser_order()[0];
+    let url = match &doc_arg {
+        Some(id) => format!("https://docs.google.com/spreadsheets/d/{id}/edit"),
+        None => "https://sheets.new".to_string(),
+    };
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", &url])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((_w, doc_id)) = sheets_window(&desktop).await else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    println!("  document: {doc_id}");
+
+    // Make sure the cell holds the marker, whether or not this document is a
+    // reused one that already had it.
+    goto_sheet_via_namebox(&desktop, CELL).await;
+    if let Ok(t) = desktop.focused_element() {
+        let _ = t.type_text(MARKER, false);
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    if let Ok(c) = desktop.focused_element() {
+        let _ = c.press_key("{Tab}");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    goto_sheet_via_namebox(&desktop, "A1").await;
+    goto_sheet_via_namebox(&desktop, CELL).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let Some((window, _)) = sheets_window(&desktop).await else {
+        println!("  lost the window.");
+        return ExitCode::FAILURE;
+    };
+
+    /// Ancestor names, nearest first -- the cheapest stable way to tell two
+    /// same-role, same-name elements apart.
+    fn ancestry(el: &UIElement) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = el.clone();
+        for _ in 0..6 {
+            match cur.parent() {
+                Ok(Some(p)) => {
+                    out.push(format!(
+                        "{}{}",
+                        p.role(),
+                        p.name()
+                            .filter(|n| !n.trim().is_empty())
+                            .map(|n| format!("({n})"))
+                            .unwrap_or_default()
+                    ));
+                    cur = p;
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    println!("\n================ EVERY Edit IN THE WINDOW ================\n");
+    let edits = desktop
+        .locator("role:Edit")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(6)), None)
+        .await
+        .unwrap_or_default();
+    println!("  {} Edit element(s)\n", edits.len());
+
+    for (i, el) in edits.iter().enumerate().take(20) {
+        let a = el.attributes();
+        let t0 = el.text(0).unwrap_or_default();
+        let carries = t0.contains(MARKER);
+        let bounds = el
+            .bounds()
+            .ok()
+            .map(|(x, y, w, h)| format!("({x:.0},{y:.0},{w:.0},{h:.0})"))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "  [{i}] name={:?} value={:?}",
+            a.name.clone().unwrap_or_default(),
+            a.value.clone().unwrap_or_default()
+        );
+        println!("      text(0)={t0:?}");
+        println!("      bounds={bounds}  carries the cell value: {carries}");
+        println!("      ancestry={:?}", ancestry(el));
+        println!();
+    }
+
+    // The Name Box, resolved the way replay already resolves it, so the two can
+    // be compared directly rather than guessed at.
+    println!("================ THE NAME BOX, FOR CONTRAST ================\n");
+    let name_box = desktop
+        .locator("name:Name box")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+        .and_then(|g| {
+            g.children()
+                .ok()
+                .and_then(|c| c.into_iter().find(|e| e.role() == "Edit"))
+        });
+    match &name_box {
+        Some(nb) => {
+            println!("  text(0)={:?}", nb.text(0).unwrap_or_default());
+            println!("  bounds={:?}", nb.bounds().ok());
+            println!("  ancestry={:?}", ancestry(nb));
+            println!("\n  (this one reports the REFERENCE -- a reader must not use it)");
+        }
+        None => println!("  not found"),
+    }
+
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------- sheetsread mode ----
+//
+// Can a cell's value be read back NON-DESTRUCTIVELY -- navigate to it, ask the
+// tree what is there, without entering edit mode?
+//
+// This is the one unmeasured primitive the spreadsheet SourceReader needs. Every
+// read this codebase performs against Sheets today is either the Name Box (a
+// cell REFERENCE, not a value) or a CSV export (the whole sheet, rendered
+// server-side). Neither is "read cell B2 live".
+//
+// There is prior evidence it may not be possible: text_capture_probe.rs:4769
+// records that after typing, no readable element reported the typed text, and
+// says plainly that "typing did not happen" and "typing happened and is
+// invisible to UIA" were indistinguishable from that run.
+//
+// So: write a distinctive marker, move away, come back, and scan every element
+// in the window for it -- checking name, value, description and text() at
+// several depths, since which accessor carries a value is exactly what is
+// unknown. Nothing is typed after the marker is written, so any hit is a real
+// non-destructive read.
+async fn sheetsread_mode() -> ExitCode {
+    const MARKER: &str = "readprobe7391";
+    const CELL: &str = "B2";
+
+    println!("== can a cell's value be read back without editing it? ==\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((_window, doc_id)) = sheets_window(&desktop).await else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    println!("  document: {doc_id}");
+
+    // ---- 1. put a known value in a known cell -------------------------------
+    println!("\n-- writing {MARKER:?} into {CELL} --");
+    if goto_sheet_via_namebox(&desktop, CELL).await.is_none() {
+        println!("  could not reach {CELL} via the Name Box.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::FAILURE;
+    }
+    if let Ok(target) = desktop.focused_element() {
+        let _ = target.type_text(MARKER, false);
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Tab, not Enter -- press_key prefixes Enter with {LEFT}{END}, and {END} in
+    // a grid relocates the cursor. See press-key-enter-injects-end-keystroke.md.
+    if let Ok(c) = desktop.focused_element() {
+        let _ = c.press_key("{Tab}");
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // ---- 2. move away, then come back ---------------------------------------
+    println!("-- moving away to A1, then back to {CELL} --");
+    goto_sheet_via_namebox(&desktop, "A1").await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    goto_sheet_via_namebox(&desktop, CELL).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Nothing below types anything. Any hit is a non-destructive read.
+
+    // ---- 3. the focused element, every accessor -----------------------------
+    println!("\n================ THE FOCUSED ELEMENT ================\n");
+    match desktop.focused_element() {
+        Ok(el) => {
+            let a = el.attributes();
+            println!("  role        : {:?}", a.role);
+            println!("  name        : {:?}", a.name);
+            println!("  value       : {:?}", a.value);
+            println!("  description : {:?}", a.description);
+            for depth in [0usize, 1, 2, 5] {
+                println!("  text({depth})     : {:?}", el.text(depth).ok());
+            }
+        }
+        Err(e) => println!("  no focused element: {e}"),
+    }
+
+    // ---- 4. the whole window, hunting for the marker ------------------------
+    println!("\n================ WHOLE-WINDOW SCAN ================\n");
+
+    /// Every element whose name, value, description or text carries `needle`.
+    fn hunt(
+        el: &UIElement,
+        needle: &str,
+        depth: usize,
+        budget: &mut usize,
+        hits: &mut Vec<String>,
+    ) {
+        if *budget == 0 || depth > 14 {
+            return;
+        }
+        *budget -= 1;
+        let a = el.attributes();
+        let mut where_found = Vec::new();
+        if a.name.as_deref().unwrap_or_default().contains(needle) {
+            where_found.push("name");
+        }
+        if a.value.as_deref().unwrap_or_default().contains(needle) {
+            where_found.push("value");
+        }
+        if a.description.as_deref().unwrap_or_default().contains(needle) {
+            where_found.push("description");
+        }
+        if el.text(0).unwrap_or_default().contains(needle) {
+            where_found.push("text(0)");
+        }
+        if el.text(2).unwrap_or_default().contains(needle) {
+            where_found.push("text(2)");
+        }
+        if !where_found.is_empty() {
+            hits.push(format!(
+                "role={:<12} name={:?} via {:?}",
+                a.role,
+                a.name.unwrap_or_default(),
+                where_found
+            ));
+        }
+        if let Ok(kids) = el.children() {
+            for k in kids {
+                hunt(&k, needle, depth + 1, budget, hits);
+            }
+        }
+    }
+
+    let Some((window, _)) = sheets_window(&desktop).await else {
+        println!("  lost the window.");
+        return ExitCode::FAILURE;
+    };
+    let mut hits = Vec::new();
+    let mut budget = 9000usize;
+    hunt(&window, MARKER, 0, &mut budget, &mut hits);
+    println!("  elements carrying {MARKER:?}: {}", hits.len());
+    for h in hits.iter().take(15) {
+        println!("    {h}");
+    }
+    if budget == 0 {
+        println!("  !! node budget exhausted -- the scan is a sample, not a total,");
+        println!("     so an empty result here would NOT be conclusive.");
+    }
+
+    // ---- 5. cross-check: is the value even in the document? -----------------
+    //
+    // Without this, "nothing reports it" cannot be told apart from "it was never
+    // written" -- the exact ambiguity that made the earlier attempt at this
+    // inconclusive.
+    println!("\n================ CROSS-CHECK (CSV) ================\n");
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let csv = download_csv(browser, &doc_id, "0").await.unwrap_or_default();
+    let in_document = csv.contains(MARKER);
+    for l in csv.lines().take(5) {
+        println!("    {l:?}");
+    }
+    println!("\n  the marker IS in the saved document: {in_document}");
+
+    println!("\n================ VERDICT ================\n");
+    if !in_document {
+        println!("  INCONCLUSIVE. The marker never reached the document, so this run");
+        println!("  cannot distinguish 'UIA does not expose cell values' from 'the");
+        println!("  write did not happen'. Not evidence either way.");
+    } else if hits.is_empty() {
+        println!("  NO LIVE READ. The value is definitely in the document, and nothing");
+        println!("  in the window's accessibility tree reports it. A live per-cell read");
+        println!("  is not available, so the SourceReader's read path has to come from");
+        println!("  somewhere else -- CSV export being the mechanism already proven.");
+    } else {
+        println!("  LIVE READ AVAILABLE. The elements above report the cell's value");
+        println!("  without entering edit mode; the reader can use that accessor.");
+    }
+
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
 // -------------------------------------------------- sheetsqualified mode ----
 //
 // The replay half, and the regression check, in one document so they verify
@@ -10729,6 +11068,12 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsformula") {
+        return sheetsformula_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsread") {
+        return sheetsread_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsqualified") {
         return sheetsqualified_mode().await;
