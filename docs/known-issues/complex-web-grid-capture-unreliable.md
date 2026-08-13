@@ -1424,6 +1424,93 @@ It inferred a click from the absence of a sheet change. Now it distinguishes
 plainly that the last is *not* evidence the click fails. Three probes in this
 file have now made the same mistake in three different ways.
 
+## Keyboard switching, and what the blocker actually is (2026-08-12)
+
+With tab-click replay confirmed dead, the natural next question was whether a
+keyboard route could switch sheets. It can — and it turns out that was never the
+missing piece.
+
+### The replay mechanism is already solved, and already built
+
+**The Name Box qualified reference is the complete answer.** `Sheet2!B2` switches
+sheet *and* navigates to the cell in one action — CSV-confirmed earlier in this
+file, and used as the reliable setup mechanism by every probe since, precisely
+because clicks were not.
+
+No "go to sheet N" shortcut is needed, and Google Sheets does not offer one
+(`Ctrl+Alt+PageUp`/`PageDown` cycle; `Alt+Shift+K` opens a list). More to the
+point, a shortcut would solve a problem that does not exist: **`grid_type`
+already navigates through the Name Box.** Making it emit `Sheet!Cell` instead of
+`Cell` is a one-line change.
+
+So the fix is not "replay a tab click", and not "find a keyboard shortcut". It is
+entirely: **can capture record which sheet the edit happened on?**
+
+### That blocker is now measured properly, and it stands
+
+The earlier answer rested on `attributes().is_selected` being `None` on every tab
+in both states. **That field is hardcoded `None` on Windows** —
+`platforms/windows/element.rs:553` — so it is `None` for every element ever, and
+the measurement established nothing. Absence of evidence read as evidence of
+absence, in this file's own investigation.
+
+`UIElement::is_selected()` (`element.rs:1261`) is a different thing: it queries
+`UISelectionItemPattern` live. Asked properly, with the gid confirming a real
+switch between snapshots:
+
+```
+  -- showing Sheet1 (gid=Some("0")) --
+    Button "Sheet1"   is_selected() = Err(Element supports neither
+                      SelectionItemPattern nor TogglePattern, and is not focused.)
+    Text   "Sheet1"   is_selected() = Err(… same …)
+    Button "Sheet2"   is_selected() = Err(… same …)
+    Text   "Sheet2"   is_selected() = Err(… same …)
+
+  -- showing Sheet2 (gid=Some("2013498543")) --
+    … identical, all four …
+```
+
+**Sheets' tabs implement neither pattern.** The conclusion is unchanged but the
+evidence is now real: there is no selection state to read, rather than a field
+that could never have carried one.
+
+Combined with the earlier full tab-bar subtree dump and the address-bar `gid`
+being a number in the browser's chrome rather than a name in the document, every
+route tried for reading the *current* sheet has now failed on measurement.
+
+### The one buildable path, and why it is not built
+
+Capture cannot read the active sheet. But it **can** record a sheet *switch* — a
+human tab click is captured as `role:text|name:Sheet1`, proven earlier in this
+file. So the combination that would work end to end is:
+
+* capture keeps the tab-click action it already produces, and
+* replay **translates** it into a Name Box navigation (`Sheet1!A1`) instead of
+  replaying the click that is measured not to work.
+
+Both halves are individually proven. It would fix the explicit-switch case
+completely, using only mechanisms measured working.
+
+**Not built, deliberately.** It puts an application-specific heuristic into the
+replay core — "a click on an element named like a sheet tab, inside a Sheets
+window, means navigate the Name Box instead" — and replay currently contains no
+per-application behaviour at all. That is a design decision worth agreeing before
+taking, not a fix to slip in. It also still leaves the default case uncovered: a
+recording that merely *starts* on a non-default sheet contains no switch to
+translate.
+
+Building only the replay half in the meantime — `grid_type` emitting
+`Sheet!Cell` when the payload carries a sheet — was rejected on this project's own
+precedent: capture would never populate that field, so it would be unused code
+that looks purposeful, which is exactly what `count_candidates` was deleted for.
+
+**One measured detail any implementation must handle.** After navigating with a
+qualified reference the Name Box reads back the *bare* cell — measured:
+`Sheet2!B2` in, `"B2"` read back. `grid_type`'s existing verification compares
+the read-back against what it typed (`landed.trim() != cell`), so it would reject
+every qualified navigation as a wrong target unless it compares against the cell
+part only.
+
 ### Two probe defects found while measuring, both self-inflicted
 
 Recorded because each produced a confident verdict from evidence that did not
@@ -1543,15 +1630,22 @@ exist, which is the failure shape this project keeps rediscovering.
       unchanged). A second, independent blocker surfaced too: the captured
       selector `role:text|name:Sheet1` carries no document scoping and is
       ambiguous whenever another spreadsheet is open. See "Route 1 replay".
-- [ ] **Decide whether route 1 is worth reviving.** Capture works and is the only
-      mechanism found that recovers sheet identity at all, so the finding is
-      worth keeping — but replay needs a way to activate a sheet tab that a
-      synthetic click does not currently provide, *and* the recorded selector
-      needs scoping. The Name Box qualified reference (`Sheet2!B2`, confirmed
-      working) remains the only measured way to reach another sheet
-      programmatically; a replay that translated a recorded tab click into a Name
-      Box navigation would use the proven mechanism instead of the failing one.
-      Untested, and a design change rather than a fix.
+- [ ] **Decide whether to translate a recorded tab click into a Name Box
+      navigation.** Both halves are now individually proven — capture records the
+      tab click, and `Sheet1!A1` through the Name Box switches sheets — so this
+      would fix the explicit-switch case end to end using only measured-working
+      mechanisms. Held because it puts an application-specific heuristic into a
+      replay core that currently has none, which is a design decision rather than
+      a fix. See "Keyboard switching, and what the blocker actually is".
+- [x] ~~**Find a keyboard route for switching sheets.**~~ **Not needed.** The Name
+      Box qualified reference already switches sheet *and* navigates to the cell
+      in one action, and `grid_type` already uses the Name Box. Sheets has no
+      "go to sheet N" shortcut, and would not need one.
+- [x] ~~**Re-check whether the accessibility tree exposes the active sheet.**~~
+      **Re-measured properly and it does not.** The earlier answer relied on
+      `attributes().is_selected`, which is hardcoded `None` on Windows and proved
+      nothing. `UIElement::is_selected()` asked live returns "supports neither
+      SelectionItemPattern nor TogglePattern" for every tab in both states.
 - [x] ~~**Measure the per-keystroke cost.**~~ **Measured: 2.22 ms per keystroke,
       and a confirmed non-issue.** The suspicion did not survive an A/B — see
       "The per-keystroke cost, measured".

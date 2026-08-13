@@ -7543,6 +7543,130 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ---------------------------------------------------- sheetsselected mode ----
+//
+// Re-opens a question this investigation answered WRONG.
+//
+// "Q1: can capture read the active sheet?" was answered no, on the strength of
+// `attributes().is_selected` being `None` on every tab in both states. That
+// field is hardcoded `None` on Windows -- `platforms/windows/element.rs:553` --
+// so it is `None` for every element ever, and the measurement established
+// nothing. Absence of evidence, read as evidence of absence.
+//
+// `UIElement::is_selected()` (`element.rs:1261`) is a different thing entirely:
+// it queries `UISelectionItemPattern` live. This asks that method instead, and
+// checks the answer MOVES when the sheet changes -- a marker that does not move
+// is not an active-sheet signal, whatever it reports.
+async fn sheetsselected_mode() -> ExitCode {
+    println!("== does is_selected() identify the active sheet? ==\n");
+    println!("The earlier 'no' came from attributes().is_selected, which is hardcoded");
+    println!("None on Windows. This asks the real accessor.\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((_window, doc_id)) = sheets_window(&desktop).await else {
+        println!("  INCONCLUSIVE: no Sheets window open.");
+        return ExitCode::FAILURE;
+    };
+    println!("  document: {doc_id}");
+
+    if !ensure_second_sheet(&desktop).await {
+        println!("\n  INCONCLUSIVE: could not get a second sheet.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::FAILURE;
+    }
+
+    /// Every candidate element in the tab bar, with what it is.
+    async fn tab_elements(desktop: &Desktop, window: &UIElement) -> Vec<(String, UIElement)> {
+        let mut out = Vec::new();
+        if let Some(bar) = find_named(desktop, window, &["role:Group"], |n| {
+            n.trim() == "Sheet tab bar"
+        })
+        .await
+        {
+            fn walk(el: &UIElement, depth: usize, out: &mut Vec<(String, UIElement)>) {
+                if depth > 6 {
+                    return;
+                }
+                let name = el.name().unwrap_or_default();
+                let t = name.trim();
+                if t.len() > 5 && t.starts_with("Sheet") && t[5..].chars().all(|c| c.is_ascii_digit())
+                {
+                    out.push((format!("{} {:?}", el.role(), t), el.clone()));
+                }
+                if let Ok(kids) = el.children() {
+                    for k in kids {
+                        walk(&k, depth + 1, out);
+                    }
+                }
+            }
+            walk(&bar, 0, &mut out);
+        }
+        out
+    }
+
+    async fn snapshot(desktop: &Desktop, label: &str) -> Vec<(String, String)> {
+        let Some((window, _)) = sheets_window(desktop).await else {
+            return Vec::new();
+        };
+        let els = tab_elements(desktop, &window).await;
+        println!("\n  -- {label} --");
+        let mut out = Vec::new();
+        for (what, el) in els {
+            let sel = match el.is_selected() {
+                Ok(true) => "Ok(true)".to_string(),
+                Ok(false) => "Ok(false)".to_string(),
+                Err(e) => format!("Err({e})"),
+            };
+            println!("    {what:<24} is_selected() = {sel}");
+            out.push((what, sel));
+        }
+        out
+    }
+
+    // Park on Sheet1, snapshot; move to Sheet2, snapshot. The Name Box is used
+    // to switch because it is the mechanism measured working -- clicks are not.
+    goto_sheet_via_namebox(&desktop, "Sheet1!A1").await;
+    let gid1 = current_gid(&desktop).await;
+    let on_sheet1 = snapshot(&desktop, &format!("showing Sheet1 (gid={gid1:?})")).await;
+
+    goto_sheet_via_namebox(&desktop, "Sheet2!A1").await;
+    let gid2 = current_gid(&desktop).await;
+    let on_sheet2 = snapshot(&desktop, &format!("showing Sheet2 (gid={gid2:?})")).await;
+
+    println!("\n================ VERDICT ================\n");
+    if gid1 == gid2 || gid1.is_none() || gid2.is_none() {
+        println!("  INCONCLUSIVE: the document did not actually change sheets between the");
+        println!("  two snapshots, so nothing below distinguishes anything.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::FAILURE;
+    }
+    let any_true = on_sheet1.iter().chain(on_sheet2.iter()).any(|(_, s)| s == "Ok(true)");
+    let moved = on_sheet1 != on_sheet2;
+    println!("  any element reported Ok(true) : {any_true}");
+    println!("  the answers MOVED with the sheet: {moved}");
+    if any_true && moved {
+        println!("\n  USABLE. is_selected() identifies the active sheet, so capture CAN");
+        println!("  record which sheet a cell edit happened on -- the blocker the whole");
+        println!("  wrong-sheet investigation has been stuck behind.");
+    } else if !any_true {
+        println!("\n  NOT USABLE. Nothing reports Ok(true) in either state -- Sheets' tabs");
+        println!("  do not implement SelectionItemPattern. The earlier conclusion stands,");
+        println!("  now for a reason that was actually measured.");
+    } else {
+        println!("\n  NOT USABLE. Something reports Ok(true) but the answer does not change");
+        println!("  with the sheet, so it is not an active-sheet signal.");
+    }
+
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------- sheetsscopefix mode ----
 //
 // End-to-end check of window-scoped resolution: with TWO spreadsheets open,
@@ -9987,6 +10111,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsselected") {
+        return sheetsselected_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsscopefix") {
         return sheetsscopefix_mode().await;
