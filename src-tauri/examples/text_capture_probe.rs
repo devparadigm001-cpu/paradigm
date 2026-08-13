@@ -7543,6 +7543,124 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------ sheetsrename mode ----
+//
+// Rename an open spreadsheet, by `set_value` on the title field -- the same
+// mechanism the Name Box uses, and the one measured reliable where clicks are
+// not.
+//
+// Exists to undo a rename this investigation made. `sheetstrash` deliberately
+// refuses any document whose title is not "Untitled spreadsheet", so that it can
+// never delete real work; renaming a throwaway put it out of reach of its own
+// cleanup. Renaming it back is the right repair -- loosening that guard to cover
+// a name the probe itself invented would trade a real safety property for
+// convenience.
+//
+// Usage: sheetsrename <doc-id> <new name...>
+async fn sheetsrename_mode() -> ExitCode {
+    let Some(id) = std::env::args().find(|a| {
+        a.len() >= 40
+            && a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }) else {
+        eprintln!("usage: sheetsrename <doc-id> <new name...>");
+        return ExitCode::FAILURE;
+    };
+    let new_name: String = std::env::args()
+        .skip_while(|a| a != "sheetsrename")
+        .skip(1)
+        .filter(|a| *a != id)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if new_name.trim().is_empty() {
+        eprintln!("usage: sheetsrename <doc-id> <new name...>");
+        return ExitCode::FAILURE;
+    }
+    println!("== rename {id} to {new_name:?} ==\n");
+
+    let browser = browser_order()[0];
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "start",
+            "",
+            browser,
+            "--new-window",
+            &format!("https://docs.google.com/spreadsheets/d/{id}/edit"),
+        ])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = desktop
+        .locator("role:Window|name:Google Sheets")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        println!("  no Sheets window found.");
+        return ExitCode::FAILURE;
+    };
+    println!("  window: {:?}", window.name().unwrap_or_default());
+
+    // The title field is the Edit whose text is the current document name.
+    let current = window
+        .name()
+        .unwrap_or_default()
+        .split(" - Google Sheets")
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let Some(edit) = desktop
+        .locator("role:Edit")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .ok()
+        .and_then(|all| {
+            all.into_iter()
+                .find(|e| e.text(0).unwrap_or_default().trim() == current.trim())
+        })
+    else {
+        println!("  could not find the title field (looking for {current:?}).");
+        return ExitCode::FAILURE;
+    };
+
+    let _ = edit.set_value(&new_name);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let _ = edit.press_key("{Enter}");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let after = desktop
+        .locator("role:Window|name:Google Sheets")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+        .and_then(|w| w.name())
+        .unwrap_or_default();
+    println!("  window title now: {after:?}");
+    if after.contains(new_name.trim()) {
+        println!("\n  RENAMED.");
+        ExitCode::SUCCESS
+    } else {
+        println!("\n  the rename did not take.");
+        ExitCode::FAILURE
+    }
+}
+
 // ---------------------------------------------------- sheetsselected mode ----
 //
 // Re-opens a question this investigation answered WRONG.
@@ -10111,6 +10229,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsrename") {
+        return sheetsrename_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsselected") {
         return sheetsselected_mode().await;
