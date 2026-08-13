@@ -1375,6 +1375,14 @@ That would block route 1 even if the click worked. The ambiguity check itself
 behaved exactly as designed — it refused rather than silently clicking a tab in
 the wrong document.
 
+> **Fixed 2026-08-12.** Replay now resolves element steps inside the window a
+> `navigate` step activated, so a second spreadsheet's `Sheet1` no longer makes
+> this ambiguous. Re-measured with two documents open and two `Sheet1` tabs on
+> the desktop: the click now resolves and executes instead of refusing. See
+> "Window-scoped resolution: BUILT" in `replay-window-selector-ambiguity.md`.
+> This removes the *second* blocker for route 1. The first — that the click does
+> not activate the tab — is unchanged.
+
 > **Correction (2026-08-12).** This section first said the gap "has a known
 > remedy: `StepPayload::scoped_selector`". **That is wrong and was measured
 > wrong.** A `process:` prefix cannot separate two spreadsheets, because they are

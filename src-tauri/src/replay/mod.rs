@@ -364,6 +364,53 @@ fn parse_payload(raw: &str) -> StepPayload {
 // `StepPayload::scoped_selector` is kept and tested for whatever counting path
 // a future attempt uses.
 
+/// Locate a selector inside the run's window, falling back to the whole desktop.
+///
+/// Returns the element, whether the scoped attempt is the one that found it, and
+/// a note for the step detail when the fallback ran.
+///
+/// ## Why a fallback, rather than scoping strictly
+///
+/// Strict scoping would be a regression, not a tightening. The scope is the
+/// window `navigate` activated, and an application is free to put the next
+/// element somewhere else: a dialog, a popup, or a second window it opened
+/// itself. Those are real playbooks that work today, and refusing them to gain
+/// precision trades a silent-wrong-target risk for a loud-wrong-failure
+/// certainty on recordings that were fine.
+///
+/// So the scoped attempt is tried first and the desktop-wide search is kept as
+/// the floor: this can only ever resolve *more* than before, never less. The
+/// fallback is reported in the step detail rather than being silent, because
+/// "we widened the search" is exactly the kind of thing that must not be
+/// indistinguishable from "we found it where we expected".
+async fn locate_scoped(
+    desktop: &Desktop,
+    scope: Option<&UIElement>,
+    selector: &str,
+    timeout: Duration,
+) -> (Result<UIElement, AutomationError>, bool, String) {
+    if let Some(window) = scope {
+        // Half the budget to the scoped attempt so a miss still leaves time for
+        // the desktop-wide one; the total stays what it was before scoping.
+        let scoped = desktop
+            .locator(selector)
+            .within(window.clone())
+            .first(Some(timeout / 2))
+            .await;
+        if let Ok(el) = scoped {
+            return (Ok(el), true, String::new());
+        }
+    }
+    let wide = desktop.locator(selector).first(Some(timeout)).await;
+    let note = if scope.is_some() && wide.is_ok() {
+        "\n  note: not found in the navigated window; resolved desktop-wide instead"
+            .to_string()
+    } else {
+        String::new()
+    };
+    (wide, false, note)
+}
+
 /// Is the element we resolved the one the recording targeted?
 ///
 /// Selectors match names by CONTAINMENT (`contains_name` in terminator), so
@@ -449,6 +496,39 @@ const AMBIGUITY_TIMEOUT: Duration = Duration::from_secs(2);
 /// The asymmetry settles it. Under-counting is silent and writes to the wrong
 /// window; over-counting is loud and refuses a step the user can see. Only one
 /// of those is recoverable.
+///
+/// ## Re-derived for a WINDOW root (2026-08-12), not carried over
+///
+/// Element steps now enumerate within the navigated window rather than the
+/// desktop, which changes the traversal root the argument above was built on.
+/// The reasoning was redone against `terminator-rs` 0.23.35 rather than assumed
+/// to transfer, and the conclusion is unchanged but now rests on something
+/// stronger:
+///
+/// * `should_use_shallow_search` (`platforms/windows/engine.rs:61-65`) returns
+///   **false whenever a root is supplied** -- it is the first branch, before any
+///   role check. So with a window root the depth-5 container optimisation cannot
+///   apply *at all*, for any role.
+/// * `find_element`, behind `first()`, calls
+///   `calculate_search_depth(role, name, root, None)` (`:1939`) -> `None
+///   .unwrap_or(50)` = **50**.
+/// * `find_elements`, behind `all()`, calls
+///   `calculate_search_depth(role, name, root, depth)` (`:1180`) ->
+///   `depth.unwrap_or(50)` = **50** for `AMBIGUITY_DEPTH = None`.
+/// * `Locator::within` sets one `root` that both paths receive unchanged
+///   (`locator.rs:59-62`, `:73-78`, `:103-106`).
+///
+/// So under a window root the counter and the resolver traverse **exactly the
+/// same depth from exactly the same node** -- equality, not merely the superset
+/// the desktop-root case had to settle for. The role-dependent asymmetry that
+/// made the original derivation delicate is gone, because the optimisation that
+/// caused it is disabled by the presence of a root.
+///
+/// One consequence worth stating: this is why `resolve_recorded` takes the scope
+/// as an argument instead of deciding for itself. If it enumerated desktop-wide
+/// while the resolver searched one window, the count would describe a different
+/// element set than the one `first()` chose from, which is the precise defect
+/// that killed the two earlier counting attempts.
 const AMBIGUITY_DEPTH: Option<usize> = None;
 
 /// What the candidate enumeration was able to establish.
@@ -491,10 +571,21 @@ enum Resolution {
 /// Runs only after a successful `first()`. Ordering matters: a miss costs the
 /// full locate timeout, so enumerating *before* resolution would add that to
 /// every genuinely-absent element.
-async fn resolve_recorded(desktop: &Desktop, selector: &str, recorded: &str) -> Resolution {
+/// `scope` must be the SAME root the resolver used, or the count answers a
+/// different question than the one asked -- see `AMBIGUITY_DEPTH`.
+async fn resolve_recorded(
+    desktop: &Desktop,
+    scope: Option<&UIElement>,
+    selector: &str,
+    recorded: &str,
+) -> Resolution {
+    let root = match scope {
+        Some(w) => w.clone(),
+        None => desktop.root(),
+    };
     let candidates = match desktop
         .locator(selector)
-        .within(desktop.root())
+        .within(root)
         .all(Some(AMBIGUITY_TIMEOUT), AMBIGUITY_DEPTH)
         .await
     {
@@ -552,9 +643,20 @@ pub async fn replay(
     // (declined), anything else that stops it ends as `failed` (went wrong).
     let mut terminal_status: Option<&str> = None;
 
+    // The window the run is acting in, set by the most recent successful
+    // `navigate`. Element steps resolve inside it instead of across the whole
+    // desktop -- see `resolve_in`. `None` until a navigate succeeds, and for
+    // playbooks that never navigate, which then behave exactly as before.
+    let mut scope: Option<UIElement> = None;
+
     for step in &playbook.steps {
         let payload = parse_payload(&step.action_payload_json);
-        let outcome = execute_step(desktop, step, &payload).await;
+        let mut activated: Option<UIElement> = None;
+        let outcome =
+            execute_step(desktop, step, &payload, scope.as_ref(), &mut activated).await;
+        if let Some(w) = activated {
+            scope = Some(w);
+        }
 
         let halted = outcome.result == StepResult::HaltedRedacted;
         let is_failure = outcome.result.is_failure();
@@ -616,10 +718,19 @@ pub async fn replay(
     })
 }
 
+/// Run one step.
+///
+/// `scope` is the window the run is acting in, if one has been established;
+/// element resolution happens inside it. `activated` is an out-parameter: a
+/// successful `navigate` writes the window it activated there, so the caller can
+/// scope the steps that follow. Written only on success, so a failed navigate
+/// leaves the previous scope in place rather than clearing it.
 async fn execute_step(
     desktop: &Desktop,
     step: &StoredStep,
     payload: &StepPayload,
+    scope: Option<&UIElement>,
+    activated: &mut Option<UIElement>,
 ) -> StepOutcome {
     let mk = |result: StepResult, detail: String| StepOutcome {
         step_order: step.step_order,
@@ -652,8 +763,11 @@ async fn execute_step(
     }
 
     // 3. navigate: activate the target window, falling back to the app name.
+    //
+    // Deliberately NOT scoped: this step is searching *for* a window, so there
+    // is no window to search inside yet. It is what establishes the scope.
     if step.action_type == "navigate" {
-        return navigate(desktop, payload, &mk).await;
+        return navigate(desktop, payload, &mk, activated).await;
     }
 
     // 3b. Grid cells have nothing to resolve, so they take their own path.
@@ -681,11 +795,13 @@ async fn execute_step(
         );
     };
 
-    let element = match desktop
-        .locator(selector)
-        .first(Some(ELEMENT_LOCATE_TIMEOUT))
-        .await
-    {
+    // Resolve inside the navigated window when there is one, so a second
+    // document holding an identically-named element cannot make this ambiguous.
+    // Falls back to desktop-wide when the scoped attempt finds nothing -- see
+    // `locate_scoped` for why that fallback is required rather than tidy.
+    let (element, used_scope, scope_note) =
+        locate_scoped(desktop, scope, selector, ELEMENT_LOCATE_TIMEOUT).await;
+    let element = match element {
         Ok(el) => el,
         Err(e) => {
             return mk(
@@ -704,7 +820,11 @@ async fn execute_step(
     let mut element = element;
     let mut unverified_note = String::new();
     if let Some(recorded) = payload.target_name.as_deref() {
-        match resolve_recorded(desktop, selector, recorded).await {
+        // The SAME root the resolution above used. Enumerating desktop-wide
+        // after a scoped `first()` would count a different element set than the
+        // one it chose from -- the defect that killed the earlier attempts.
+        let count_scope = if used_scope { scope } else { None };
+        match resolve_recorded(desktop, count_scope, selector, recorded).await {
             // Act on the element that IS the recorded one, which may not be the
             // one `first()` returned.
             Resolution::Unique(exact) => element = exact,
@@ -749,8 +869,10 @@ async fn execute_step(
         ),
     };
     // Carried into the step detail rather than dropped: "could not check" must
-    // not be indistinguishable from "checked, and it was fine".
+    // not be indistinguishable from "checked, and it was fine". Same for a
+    // widened search -- see `locate_scoped`.
     outcome.detail.push_str(&unverified_note);
+    outcome.detail.push_str(&scope_note);
     outcome
 }
 
@@ -904,6 +1026,7 @@ async fn navigate(
     desktop: &Desktop,
     payload: &StepPayload,
     mk: &impl Fn(StepResult, String) -> StepOutcome,
+    activated: &mut Option<UIElement>,
 ) -> StepOutcome {
     if let Some(selector) = payload.selector.as_deref() {
         // The ambiguity check runs below, after resolution -- see `ambiguity_of`.
@@ -932,7 +1055,9 @@ async fn navigate(
                     // "Untitled - Notepad" replayed against two blank Notepad
                     // windows, and the run reported 12/12 succeeded while
                     // typing into the wrong one.
-                    match resolve_recorded(desktop, selector, recorded).await {
+                    // Desktop-wide, matching the `first()` above: a navigate is
+                    // searching FOR a window, so there is nothing to scope to.
+                    match resolve_recorded(desktop, None, selector, recorded).await {
                         Resolution::Unique(exact) => window = exact,
                         Resolution::Ambiguous(n) => {
                             return mk(
@@ -965,10 +1090,16 @@ async fn navigate(
                     }
                 }
                 return match window.activate_window() {
-                    Ok(()) => mk(
-                        StepResult::Executed,
-                        format!("activated window via {selector:?}{unverified_note}"),
-                    ),
+                    Ok(()) => {
+                        // Later element steps resolve inside this window. Set
+                        // only on success, so a failed activation cannot scope
+                        // the rest of the run to a window it never reached.
+                        *activated = Some(window.clone());
+                        mk(
+                            StepResult::Executed,
+                            format!("activated window via {selector:?}{unverified_note}"),
+                        )
+                    }
                     Err(e) => mk(
                         StepResult::FailedAction,
                         format!("found window via {selector:?} but activate_window failed: {e}"),

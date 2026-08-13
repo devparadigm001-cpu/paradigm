@@ -947,25 +947,90 @@ windows of the *same* `msedge.exe`, so no process prefix can separate them — a
 the fourth match is not even a Sheets window. What distinguishes two open
 spreadsheets is the **document window**, not the process.
 
-### What would actually work, and why it was not just done
+## Window-scoped resolution: BUILT (2026-08-12)
 
-Scope element resolution to **the window the run is acting in**. Replay's
-`navigate` step already activates the right window; it simply does not keep it.
-Threading that window through the run and resolving later steps `.within(it)` is
-the shape of the fix, and it is what the "Measure the cost on a real workload"
-item below already anticipated as the remedy.
+The remedy above — scope element resolution to the window the run is acting in,
+rather than to a process — is now implemented and measured.
 
-Not implemented, because it is not a small change and this file records two
-previous attempts that looked small and were wrong:
+### How it works
 
-* all three resolution sites are desktop-wide today —
-  `replay/mod.rs:479-480`, `:668`, `:903`;
-* `AMBIGUITY_DEPTH`'s derivation reasons specifically about `find_element` with
-  `root: None` versus `Desktop::root()`. Changing the traversal root invalidates
-  that argument; it would have to be redone rather than assumed to carry over;
-* a wrong or stale window makes elements that *are* present unfindable, turning
-  working playbooks into `FailedNotFound` — a regression traded for precision, on
-  the exact code path this document already broke twice.
+`replay()` keeps a `scope: Option<UIElement>`. A **successful** `navigate` writes
+the window it activated into it, and every later element step resolves inside
+that window. `navigate` itself stays desktop-wide, because it is searching *for*
+a window: it is what establishes the scope, not a consumer of it.
+
+Set only on success, so a navigate that fails to activate cannot silently scope
+the rest of the run to a window it never reached.
+
+### The fallback is deliberate, not laziness
+
+`locate_scoped` tries the scoped lookup first and falls back to the desktop-wide
+search. Strict scoping would be a regression rather than a tightening: the scope
+is one window, and applications legitimately put the next element elsewhere — a
+dialog, a popup, a second window they opened themselves. Those are playbooks that
+work today.
+
+So the desktop-wide search is kept as the floor. **This change can only ever
+resolve more than before, never less.** When the fallback runs it is reported in
+the step detail, because "we widened the search" must not be indistinguishable
+from "we found it where we expected".
+
+The counting scope follows the resolution scope: if `first()` fell back to
+desktop-wide, `resolve_recorded` counts desktop-wide too. Counting a different
+element set than the resolver chose from is the precise defect that killed both
+earlier counting attempts.
+
+### The depth derivation, redone from scratch for a window root
+
+Not carried over — the original argument is specific to a desktop root, and
+re-deriving it was a precondition for this change. Against `terminator-rs`
+0.23.35:
+
+* `should_use_shallow_search` (`platforms/windows/engine.rs:61-65`) returns
+  **false whenever a root is supplied**, as its first branch, before any role
+  check. With a window root the depth-5 container optimisation cannot apply at
+  all, for any role.
+* `find_element`, behind `first()`, calls
+  `calculate_search_depth(role, name, root, None)` (`:1939`) → `None.unwrap_or(50)`
+  = **50**.
+* `find_elements`, behind `all()`, calls
+  `calculate_search_depth(role, name, root, depth)` (`:1180`) →
+  `depth.unwrap_or(50)` = **50** for `AMBIGUITY_DEPTH = None`.
+* `Locator::within` stores one root that both paths receive unchanged
+  (`locator.rs:59-62`, `:73-78`, `:103-106`).
+
+**Counter and resolver therefore traverse exactly the same depth from exactly
+the same node — equality, not the superset the desktop-root case had to settle
+for.** The role-dependent asymmetry that made the original derivation delicate is
+gone, because the optimisation causing it is disabled by the presence of a root.
+`AMBIGUITY_DEPTH = None` stays correct, now for a stronger reason.
+
+### Measured
+
+**The new case.** Two spreadsheets open, each with a `Sheet1` tab, one renamed so
+the navigate step can pick it:
+
+```
+  desktop-wide exact matches for Sheet1: 2      <- genuinely ambiguous
+
+  [1] navigate  executed      -- scope established
+  [2] click     executed      -- resolved inside that window
+```
+
+The identical scenario refused with `FailedAmbiguous` before this change, in the
+`sheetsreplaytab` run recorded in `complex-web-grid-capture-unreliable.md`.
+
+**The regression check, which was the real risk.** Full suite green after the
+change: **105 lib, 8 db_encryption, 15 ipc_commands, 1 ipc_pipeline, 2
+replay_aborted, 0 failed.** `ipc_pipeline::full_pipeline_over_ipc` is the one
+that matters most here — it drives a real record → compile → replay cycle
+against a single document, which is exactly the "does scoping break the ordinary
+case" question, and it passes.
+
+Two probe runs also exercised the guards rather than the fix, and both refused
+correctly rather than reporting a result: a duplicate document-A window made the
+*navigate* ambiguous, and the run reported `INCONCLUSIVE: navigate did not
+succeed, so no scope was set` instead of claiming the click had been scoped.
 
 ## Next steps
 

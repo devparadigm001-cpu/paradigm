@@ -7543,6 +7543,276 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ---------------------------------------------------- sheetsscopefix mode ----
+//
+// End-to-end check of window-scoped resolution: with TWO spreadsheets open,
+// each owning a `Sheet1` tab, does a replay that navigates to one of them
+// resolve the tab inside that window instead of refusing as ambiguous?
+//
+// The two documents need DISTINCT window titles, or the navigate step itself is
+// ambiguous and the run never establishes a scope -- a different bug, and one
+// this file already documents. So one document is renamed first, via `set_value`
+// on the title field: the same mechanism the Name Box uses, chosen because
+// clicks on Sheets chrome are measured unreliable.
+async fn sheetsscopefix_mode() -> ExitCode {
+    use paradigm_lib::capture::{ActionCandidate, ActionKind, CapturedStream, ExclusionList};
+    use paradigm_lib::compile::{compile, store, ReversibilityPolicy};
+    use paradigm_lib::labeling::RedactionPolicy;
+
+    const RENAMED: &str = "ScopeProbeAlpha";
+    println!("== window-scoped resolution, two spreadsheets, one Sheet1 each ==\n");
+
+    let browser = browser_order()[0];
+    let ids: Vec<String> = std::env::args()
+        .filter(|a| {
+            a.len() >= 40
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .collect();
+    if ids.len() < 2 {
+        eprintln!("pass TWO document ids: the one to rename, then the decoy");
+        return ExitCode::FAILURE;
+    }
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // ---- document A, renamed so navigate can target it -----------------------
+    println!("-- opening document A ({}) --", ids[0]);
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "start",
+            "",
+            browser,
+            "--new-window",
+            &format!("https://docs.google.com/spreadsheets/d/{}/edit", ids[0]),
+        ])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    // Idempotent: a previous run may already have renamed this document, in
+    // which case the title field no longer reads "Untitled spreadsheet" and
+    // there is nothing to do.
+    let already = desktop
+        .locator(format!("role:Window|name:{RENAMED}").as_str())
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), Some(3))
+        .await
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+
+    if already {
+        println!("  document A is already named {RENAMED:?}; skipping the rename");
+    } else {
+        let Some((win_a, _)) = sheets_window(&desktop).await else {
+            println!("  INCONCLUSIVE: no Sheets window.");
+            return ExitCode::FAILURE;
+        };
+        // The title field is an Edit whose text is the current document name.
+        let title_edit = desktop
+            .locator("role:Edit")
+            .within(win_a.clone())
+            .all(Some(Duration::from_secs(5)), None)
+            .await
+            .ok()
+            .and_then(|all| {
+                all.into_iter().find(|e| {
+                    let t = e.text(0).unwrap_or_default();
+                    t.trim() == "Untitled spreadsheet"
+                })
+            });
+        match &title_edit {
+            Some(e) => {
+                println!("  renaming document A to {RENAMED:?}");
+                let _ = e.set_value(RENAMED);
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let _ = e.press_key("{Enter}");
+                tokio::time::sleep(Duration::from_secs(4)).await;
+            }
+            None => {
+                println!("  INCONCLUSIVE: could not find the title field to rename.");
+                println!("  Without distinct titles the navigate step is itself ambiguous and");
+                println!("  no scope is ever established, so this would test nothing.");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // Look it up by its NEW title. `sheets_window` matches "Untitled
+    // spreadsheet", so a successful rename makes it invisible to that helper --
+    // which is what happened on the first attempt and read as "lost the window".
+    let Some(win_a) = desktop
+        .locator(format!("role:Window|name:{RENAMED}").as_str())
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        println!("  could not find a window titled {RENAMED:?} after renaming, so the");
+        println!("  rename did not take. Without distinct titles this tests nothing.");
+        return ExitCode::FAILURE;
+    };
+    let title_a = win_a.name().unwrap_or_default();
+    println!("  document A window title now: {title_a:?}");
+    if !title_a.contains(RENAMED) {
+        println!("\n  INCONCLUSIVE: the rename did not take, so both windows still share a");
+        println!("  title and the navigate step could not pick one.");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- document B, the decoy, left as "Untitled spreadsheet" --------------
+    println!("\n-- opening document B, the decoy ({}) --", ids[1]);
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "start",
+            "",
+            browser,
+            "--new-window",
+            &format!("https://docs.google.com/spreadsheets/d/{}/edit", ids[1]),
+        ])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    // ---- prove the ambiguity exists before claiming to have fixed it --------
+    let wide = desktop
+        .locator("role:text|name:Sheet1")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .unwrap_or_default();
+    let wide_exact = wide
+        .iter()
+        .filter(|e| {
+            paradigm_lib::replay::resolved_is_recorded_target(
+                "Sheet1",
+                &e.name().unwrap_or_default(),
+            )
+        })
+        .count();
+    println!("\n  desktop-wide exact matches for Sheet1: {wide_exact}");
+    if wide_exact < 2 {
+        println!("\n  INCONCLUSIVE: fewer than two Sheet1 tabs on the desktop, so there is");
+        println!("  no ambiguity to resolve and a pass would prove nothing.");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- the playbook: navigate to A, then click ITS Sheet1 tab -------------
+    let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
+    stream.admit(ActionCandidate {
+        kind: ActionKind::Navigate,
+        identifiers: vec![title_a.clone()],
+        process_name: Some("msedge.exe".into()),
+        element_role: Some("Window".into()),
+        element_name: Some(title_a.clone()),
+        payload: None,
+        detail: None,
+        timestamp_ms: 0,
+    });
+    stream.admit(ActionCandidate {
+        kind: ActionKind::Click,
+        identifiers: vec![title_a.clone()],
+        process_name: Some("msedge.exe".into()),
+        element_role: Some("text".into()),
+        element_name: Some("Sheet1".into()),
+        payload: None,
+        detail: None,
+        timestamp_ms: 1,
+    });
+    let playbook = compile(
+        &stream.actions().to_vec(),
+        "Scope Fix",
+        &ReversibilityPolicy::placeholder(),
+        &RedactionPolicy::placeholder(),
+    );
+    println!("\n  playbook steps:");
+    for s in &playbook.steps {
+        let sel = serde_json::from_str::<serde_json::Value>(&s.action_payload_json)
+            .ok()
+            .and_then(|v| v["target"]["selector"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "<none>".into());
+        println!("    [{}] {:<9} selector={sel:?}", s.step_order, s.action_type);
+    }
+
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("temp db failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = store::store(&mut conn, &playbook) {
+        eprintln!("store failed: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    println!("\n================ REPLAY ================\n");
+    let run = match paradigm_lib::replay::replay(&mut conn, &desktop, &playbook.id).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("replay failed to run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  status: {}", run.status);
+    for o in &run.outcomes {
+        println!("  [{}] {:<9} {}", o.step_order, o.action_type, o.result.label());
+        for line in o.detail.lines() {
+            println!("       {line}");
+        }
+    }
+
+    println!("\n================ VERDICT ================\n");
+    let nav_ok = run
+        .outcomes
+        .iter()
+        .find(|o| o.action_type == "navigate")
+        .map(|o| !o.result.is_failure())
+        .unwrap_or(false);
+    let click = run.outcomes.iter().find(|o| o.action_type == "click");
+    let click_label = click.map(|o| o.result.label()).unwrap_or("<none>");
+    let click_ambiguous = click_label == "failed_ambiguous";
+
+    println!("  {wide_exact} Sheet1 tabs on the desktop -- desktop-wide this IS ambiguous");
+    println!("  navigate established a scope : {nav_ok}");
+    println!("  click outcome                : {click_label}");
+    if nav_ok && !click_ambiguous {
+        println!("\n  FIXED. The click resolved inside the navigated window instead of");
+        println!("  refusing across the desktop. (Whether the click then activates the");
+        println!("  tab is a separate, already-measured question.)");
+    } else if !nav_ok {
+        println!("\n  INCONCLUSIVE: navigate did not succeed, so no scope was set and the");
+        println!("  click was never scoped. This does not test the fix.");
+    } else {
+        println!("\n  NOT FIXED: the click is still ambiguous with a scope in place.");
+    }
+
+    println!("\n  DOCUMENT IDs for cleanup: {} {}", ids[0], ids[1]);
+    ExitCode::SUCCESS
+}
+
 // ------------------------------------------------------- sheetsscope mode ----
 //
 // Would `StepPayload::scoped_selector` fix the ambiguity that made a tab-click
@@ -9717,6 +9987,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsscopefix") {
+        return sheetsscopefix_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsscope") {
         return sheetsscope_mode().await;
