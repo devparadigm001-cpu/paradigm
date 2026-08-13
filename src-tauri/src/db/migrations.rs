@@ -367,6 +367,45 @@ mod tests {
         );
     }
 
+    /// The Section 3 privacy lock, made structural.
+    ///
+    /// Duplicate-row tracking stores a position marker and nothing else. The
+    /// design resolves a real, previously-rejected privacy question by keeping
+    /// the durable data structural -- "row 47: done" -- while source content is
+    /// handled only transiently. A column here holding source content would
+    /// recreate the durable position-plus-content pair that reasoning refused.
+    ///
+    /// Asserting the exact column set is the point: this fails on ADDITION, not
+    /// just removal, so the decision cannot be reversed by someone adding a
+    /// `value` column for convenience without confronting why it is not there.
+    #[test]
+    fn a_processed_row_is_a_position_marker_not_a_value() {
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('workflow_processed_rows') ORDER BY name")
+            .expect("prepare");
+        let columns: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+
+        assert_eq!(
+            columns,
+            vec![
+                "id".to_string(),
+                "playbook_id".to_string(),
+                "processed_at".to_string(),
+                "row_key".to_string(),
+                "source_id".to_string(),
+            ],
+            "the processed-rows table must carry position only -- adding a column \
+             that can hold source content reverses the Section 3 privacy resolution"
+        );
+    }
+
     #[test]
     fn processed_rows_require_a_real_workflow() {
         let dir = TempDir::new().expect("temp dir");

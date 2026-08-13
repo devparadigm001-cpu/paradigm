@@ -29,6 +29,17 @@
 --   proposed  offered as a repeating pattern, not yet answered by the user.
 --   confirmed the user said yes. Never ask again -- this is the state 4.2/4.8
 --             depend on surviving a restart.
+--
+-- On `proposed`, honestly: the design's post-stop flow (4.1 detect -> 4.12
+-- review screen -> 4.2 confirm) may never persist it, because a session is
+-- reviewed BEFORE it is stored -- `stop_record_session` explicitly does not
+-- compile, and 4.10 says rejecting leaves "an ordinary one-shot playbook".
+-- Both outcomes therefore write a row that is already answered. It is kept
+-- anyway because SQLite cannot alter a CHECK constraint without rebuilding the
+-- table, so an unused enum value costs nothing while adding one later costs a
+-- migration. If item 3 confirms detection never persists an unanswered
+-- candidate, this value is dead and should be recorded as such rather than
+-- left looking meaningful.
 ALTER TABLE playbooks ADD COLUMN template_state TEXT NOT NULL DEFAULT 'none'
     CHECK (template_state IN ('none', 'proposed', 'confirmed'));
 
@@ -55,6 +66,16 @@ ALTER TABLE playbooks ADD COLUMN template_confirmed_at TEXT
 -- would buy nothing today, while foreclosing Phase 2's retry and drift-repair
 -- work marking an ordinary playbook as running. The default keeps every
 -- existing row at 'idle' regardless.
+--
+-- Known consequence for backend item 7, recorded here because the schema is
+-- what makes it possible: this column is durable, but a run is not. 4.10 says a
+-- run executes on the app's own background thread and does NOT survive a full
+-- app close. So a crash or a close mid-run leaves 'running' or 'paused' behind
+-- with nothing executing. Item 7 needs a startup reconciliation -- deciding
+-- whether a persisted non-idle state means "resume", "reset to idle", or "ask"
+-- -- and 4.6's rule that a paused record is redone cleanly from its start makes
+-- resetting safe. Not resolved here: item 1 is schema only, and inventing the
+-- policy now would fix it before the code that lives with it exists.
 ALTER TABLE playbooks ADD COLUMN run_state TEXT NOT NULL DEFAULT 'idle'
     CHECK (run_state IN ('idle', 'running', 'paused'));
 
@@ -73,6 +94,24 @@ CREATE INDEX IF NOT EXISTS idx_playbooks_template_state
 -- ------------------------------------------------- processed source rows ----
 --
 -- Which specific source rows a given workflow has already handled.
+--
+-- ## A POSITION MARKER ONLY. Never a value.
+--
+-- This is a locked privacy decision, not a stylistic one. The foundational
+-- design (Section 3) resolves a real tension: storing where a pasted value came
+-- FROM was previously considered and rejected on privacy grounds, in
+-- multiline-document-capture-duplicates.md. The resolution that makes this
+-- feature buildable is that the durable data is *structural* -- "row 47: done"
+-- -- while actual source content is handled only transiently, during detection
+-- and during each run.
+--
+-- So this table records that a row was processed and nothing about what it
+-- contained. Adding a column here that holds source content -- even "just for
+-- debugging" -- would recreate exactly the durable position-plus-content pair
+-- the original privacy reasoning refused, and would silently reverse a decision
+-- taken deliberately. `a_processed_row_is_a_position_marker_not_a_value` in
+-- db::migrations::tests fails if the column set changes, so that reversal
+-- cannot happen quietly.
 --
 -- ## The key is (workflow, source, row) -- and the workflow part is the point
 --
