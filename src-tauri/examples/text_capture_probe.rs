@@ -7543,6 +7543,518 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ---------------------------------------------------- sheetstabclick mode ----
+//
+// Route 1 from "The sheet-name gap, measured": Sheets publishes no signal for
+// WHICH sheet is active, but a sheet tab is an ordinary `Button "Sheet2"`. So a
+// user who switches sheets during a recording may already produce a replayable
+// click -- sidestepping the unreadable active-sheet state entirely.
+//
+// Three things to establish, in order, and the third is a limitation rather
+// than a feature:
+//
+//   1. Does capture actually ADMIT the tab click, and with what selector?
+//   2. Does REPLAYING it land the edit on the right sheet in a fresh document?
+//      Ground truth is the per-sheet CSV export, never the UI.
+//   3. Does it cover a recording that merely STARTS on a non-default sheet?
+//      Measured directly rather than reasoned about, because this is the half
+//      that decides whether "fixed" would be an overclaim.
+
+/// The open Sheets window and its document id.
+async fn sheets_window(desktop: &Desktop) -> Option<(UIElement, String)> {
+    let w = desktop
+        .locator("role:Window|name:Untitled spreadsheet")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .ok()?
+        .into_iter()
+        .next()?;
+    let addr = address_of(desktop, &w).await;
+    let id = addr
+        .split("/d/")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    Some((w, id))
+}
+
+/// Click a sheet tab by name. Returns the gid afterwards.
+///
+/// Re-resolves the window rather than taking one from the caller. The first
+/// version held a handle across an "Add Sheet" click and every later read came
+/// back empty -- `gid now None` -- which looked like a failed click but was a
+/// stale element. Anything read after a navigation must be re-resolved.
+async fn click_sheet_tab(desktop: &Desktop, name: &str) -> Option<String> {
+    let (window, _) = sheets_window(desktop).await?;
+    let tab = find_named(desktop, &window, &["role:Button"], |n| n.trim() == name).await?;
+    robust_click(desktop, &tab);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (fresh, _) = sheets_window(desktop).await?;
+    gid_in(&address_of(desktop, &fresh).await)
+}
+
+/// Switch sheets via the Name Box, using a qualified reference.
+///
+/// Setup only -- never for the step under test. Clicking a sheet tab was
+/// measured failing repeatedly in this desktop state (the "Add Sheet" button
+/// and the "Sheet1" tab both accepted a click that the page never saw), while
+/// keyboard and Name Box entry kept working. Since a qualified reference was
+/// already proven to cross sheets in "The sheet-name gap, measured", setup uses
+/// the mechanism known to work and leaves the click to the hypothesis.
+async fn goto_sheet_via_namebox(desktop: &Desktop, reference: &str) -> Option<String> {
+    let (window, _) = sheets_window(desktop).await?;
+    let _ = window.activate_window();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let name_box = desktop
+        .locator("name:Name box")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .ok()?
+        .into_iter()
+        .next()?
+        .children()
+        .ok()?
+        .into_iter()
+        .find(|e| e.role() == "Edit")?;
+    let _ = name_box.set_value(reference);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let _ = name_box.press_key("{Enter}");
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    current_gid(desktop).await
+}
+
+/// The gid the open document is currently showing, freshly resolved.
+async fn current_gid(desktop: &Desktop) -> Option<String> {
+    let (w, _) = sheets_window(desktop).await?;
+    gid_in(&address_of(desktop, &w).await)
+}
+
+/// The names of every sheet tab currently present, freshly resolved.
+async fn sheet_tab_names(desktop: &Desktop) -> Vec<String> {
+    let Some((window, _)) = sheets_window(desktop).await else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = sheet_tabs(desktop, &window)
+        .await
+        .iter()
+        .filter_map(|e| e.name())
+        .map(|n| n.trim().to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Add a second sheet, and confirm it exists before returning.
+///
+/// Retries because a single click 30s after load is not reliable: the first
+/// attempt at this reported "second sheet created, gid=0" against a document
+/// that still had only `["Sheet1"]`. The `sheetsmulti` probe got away with one
+/// click only because ~20s of unrelated tab scanning sat between load and
+/// click. Waiting on the observable outcome beats guessing a delay.
+/// Two strategies, alternated, because a click alone was measured failing four
+/// times in a row against a document where `sheetsmulti` had succeeded: the
+/// button click only reaches the web app when its window is foreground, and
+/// `{shift}{f11}` is Sheets' own "insert sheet" shortcut and does not depend on
+/// hit-testing a button at all.
+async fn ensure_second_sheet(desktop: &Desktop) -> bool {
+    for attempt in 1..=6 {
+        if sheet_tab_names(desktop).await.iter().any(|n| n == "Sheet2") {
+            return true;
+        }
+        if let Some((window, _)) = sheets_window(desktop).await {
+            // Foreground first. A background window accepts the UIA call and
+            // the page never sees it.
+            let _ = window.activate_window();
+            tokio::time::sleep(Duration::from_millis(700)).await;
+
+            if attempt % 2 == 1 {
+                if let Some(add) = find_named(desktop, &window, &["role:Button"], |n| {
+                    n.trim().eq_ignore_ascii_case("Add Sheet")
+                })
+                .await
+                {
+                    robust_click(desktop, &add);
+                }
+            } else if let Ok(el) = desktop.focused_element() {
+                let _ = el.press_key("{shift}{f11}");
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let tabs = sheet_tab_names(desktop).await;
+        let how = if attempt % 2 == 1 { "click" } else { "shift+f11" };
+        println!("    add-sheet attempt {attempt} ({how}): tabs now {tabs:?}");
+        if tabs.iter().any(|n| n == "Sheet2") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Put the caret in the grid, so typing reaches a cell rather than whatever
+/// the last click left focused.
+async fn focus_grid(desktop: &Desktop) {
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{ctrl}{home}");
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+}
+
+async fn sheetstabclick_mode() -> ExitCode {
+    use paradigm_lib::capture::{CaptureSession, ExclusionList};
+    use paradigm_lib::compile::{compile, store, ReversibilityPolicy};
+    use paradigm_lib::labeling::RedactionPolicy;
+
+    println!("== does a captured sheet-tab click replay onto the right sheet? ==\n");
+    println!("Creates TWO throwaway spreadsheets. Both IDs are printed at the end.\n");
+
+    let browser = browser_order()[0];
+    let open_new_sheet = || async {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+            .spawn()
+        {
+            let _ = c.wait();
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    };
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    const MARKER: &str = "tabclickmarker";
+    const MARKER2: &str = "nostartswitch";
+
+    // ---- set up the RECORDING document --------------------------------------
+    println!("-- opening the RECORDING document --");
+    open_new_sheet().await;
+    let Some((_rec_win, rec_id)) = sheets_window(&desktop).await else {
+        println!("  INCONCLUSIVE: no Sheets window. Not signed in, or it did not load.");
+        return ExitCode::FAILURE;
+    };
+    println!("  recording document: {rec_id}");
+
+    // A second sheet, created BEFORE capture starts so that creating it is not
+    // itself part of the recording -- the question is about switching, not
+    // about adding. Verified, not assumed.
+    if !ensure_second_sheet(&desktop).await {
+        println!("\n  INCONCLUSIVE: could not add a Sheet2, so nothing below would be");
+        println!("  testing a sheet switch. Not reporting a result from it.");
+        println!("\n  DOCUMENT ID for cleanup: {rec_id}");
+        return ExitCode::FAILURE;
+    }
+    let rec_gid2 = current_gid(&desktop).await.unwrap_or_default();
+    println!("  second sheet present, gid={rec_gid2}");
+
+    // Back to the first sheet, still outside capture, so the recording has to
+    // perform the switch itself.
+    let back = goto_sheet_via_namebox(&desktop, "Sheet1!A1").await;
+    println!("  switched back to Sheet1 before recording, gid={back:?}");
+    if back.as_deref() != Some("0") {
+        println!("\n  INCONCLUSIVE: could not return to the first sheet, so the recording");
+        println!("  would not have to switch at all.");
+        println!("\n  DOCUMENT ID for cleanup: {rec_id}");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- 1. record: click the Sheet2 tab, then edit a cell ------------------
+    println!("\n================ 1. RECORD (tab click + cell edit) ================\n");
+    let session = match CaptureSession::start_session(
+        "sheets-tab-click",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let switched = click_sheet_tab(&desktop, "Sheet2").await;
+    println!("  clicked the Sheet2 tab, gid now {switched:?}");
+    // Focus lands on the tab button after clicking it, so typing would go
+    // there rather than into a cell. The previous run typed into the button and
+    // captured nothing, which was then misread as "the tab click is not
+    // captured".
+    focus_grid(&desktop).await;
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.type_text(MARKER, false);
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{Tab}");
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // `unmapped` is the load-bearing diagnostic. Zero actions AND zero unmapped
+    // events means the recorder never saw anything, which is a broken run, not
+    // a finding about what capture admits. Without this the two are
+    // indistinguishable -- the exact mistake the first run made.
+    println!(
+        "\n  captured {} action(s), {} exclusion(s), {} unmapped event(s):",
+        report.actions.len(),
+        report.exclusions.len(),
+        report.unmapped_events
+    );
+    if report.actions.is_empty() && report.unmapped_events == 0 {
+        println!("  !! the recorder observed NO events at all -- this run is broken,");
+        println!("     not evidence about whether tab clicks are captured.");
+    }
+    for a in &report.actions {
+        println!(
+            "    {:<9} role={:<12} name={:?} payload={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-"),
+            a.payload.as_deref().unwrap_or("-")
+        );
+    }
+    for e in report.exclusions.iter().take(10) {
+        println!("    excluded {:?} {:?}", e.kind.as_str(), e.reason);
+    }
+
+    let tab_click = report.actions.iter().find(|a| {
+        a.kind.as_str() == "click" && a.element_name.as_deref().map(|n| n.trim()) == Some("Sheet2")
+    });
+    println!(
+        "\n  a click action naming the Sheet2 tab: {}",
+        if tab_click.is_some() { "YES" } else { "NO" }
+    );
+
+    // What selector would compile actually build for it? That is what replay
+    // resolves, so printing the action alone is not enough.
+    let replayable: Vec<_> = report
+        .actions
+        .iter()
+        .filter(|a| a.kind.as_str() == "click" || a.kind.as_str() == "type")
+        .cloned()
+        .collect();
+    let recorded_pb = compile(
+        &replayable,
+        "Sheets Tab Click",
+        &ReversibilityPolicy::placeholder(),
+        &RedactionPolicy::placeholder(),
+    );
+    println!("\n  compiled steps and the selectors replay would resolve:");
+    for s in &recorded_pb.steps {
+        let sel = serde_json::from_str::<serde_json::Value>(&s.action_payload_json)
+            .ok()
+            .and_then(|v| v["target"]["selector"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "<none>".into());
+        println!("    [{}] {:<9} selector={sel:?}", s.step_order, s.action_type);
+    }
+
+    if tab_click.is_none() {
+        println!("\n  STOPPING: the tab click was not captured, so there is nothing to");
+        println!("  replay. Route 1 does not work, and no fix follows from it.");
+        println!("\n  DOCUMENT ID for cleanup: {rec_id}");
+        return ExitCode::SUCCESS;
+    }
+
+    // ---- 3. the limitation, measured on the same document -------------------
+    //
+    // Deliberately BEFORE the replay leg: it is cheap, it uses the document
+    // already open on Sheet2, and it is the result most likely to be assumed
+    // rather than checked.
+    println!("\n================ 3. LIMITATION: recording that STARTS on Sheet2 ================\n");
+    println!("  already on Sheet2; starting capture without touching a tab.");
+    let session2 = match CaptureSession::start_session(
+        "sheets-tab-click-nostart",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start second capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    focus_grid(&desktop).await;
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.type_text(MARKER2, false);
+    }
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{Tab}");
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let report2 = match session2.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop second capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "  captured {} action(s), {} unmapped event(s):",
+        report2.actions.len(),
+        report2.unmapped_events
+    );
+    for a in &report2.actions {
+        println!(
+            "    {:<9} role={:<12} name={:?} payload={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-"),
+            a.payload.as_deref().unwrap_or("-")
+        );
+    }
+    let any_sheet_ref = report2.actions.iter().any(|a| {
+        a.element_name
+            .as_deref()
+            .map(|n| n.trim().starts_with("Sheet") && n.trim().len() > 5)
+            .unwrap_or(false)
+    });
+    println!(
+        "\n  anything naming a sheet in this recording: {}",
+        if any_sheet_ref { "YES" } else { "NO" }
+    );
+
+    // ---- 2. replay into a FRESH multi-sheet document ------------------------
+    println!("\n================ 2. REPLAY into a fresh document ================\n");
+
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("temp db failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = store::store(&mut conn, &recorded_pb) {
+        eprintln!("store failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("  stored {} step(s)", recorded_pb.steps.len());
+
+    println!("\n-- opening a FRESH document to replay into --");
+    open_new_sheet().await;
+    let Some((_play_win, play_id)) = sheets_window(&desktop).await else {
+        println!("  could not open a fresh document.");
+        return ExitCode::FAILURE;
+    };
+    if play_id == rec_id {
+        println!("  the fresh document IS the recorded one; aborting -- replaying into it");
+        println!("  would pass without doing anything.");
+        return ExitCode::FAILURE;
+    }
+    println!("  replay document: {play_id}");
+
+    // It needs a Sheet2 to switch to, and must be sitting on Sheet1 so the
+    // switch is actually required.
+    if !ensure_second_sheet(&desktop).await {
+        println!("  could not add a Sheet2 to the replay document.");
+        println!("\n  DOCUMENT IDs for cleanup: {rec_id} {play_id}");
+        return ExitCode::FAILURE;
+    }
+    let play_gid2 = current_gid(&desktop).await.unwrap_or_default();
+    let play_back = goto_sheet_via_namebox(&desktop, "Sheet1!A1").await;
+    println!("  replay doc has a second sheet gid={play_gid2}, now showing gid={play_back:?}");
+    if play_back.as_deref() != Some("0") {
+        println!("  could not put the replay document on Sheet1, so replay would not have");
+        println!("  to switch. Not reporting a result from it.");
+        println!("\n  DOCUMENT IDs for cleanup: {rec_id} {play_id}");
+        return ExitCode::FAILURE;
+    }
+    println!("  (so replay MUST switch sheets for the edit to land correctly)");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let run = match paradigm_lib::replay::replay(&mut conn, &desktop, &recorded_pb.id).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("replay failed to run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("\n  replay status: {}", run.status);
+    for o in &run.outcomes {
+        println!("    [{}] {:<9} {}", o.step_order, o.action_type, o.result.label());
+        for line in o.detail.lines() {
+            println!("         {line}");
+        }
+    }
+
+    // ---- ground truth --------------------------------------------------------
+    println!("\n  waiting 10s for Sheets to sync before exporting...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    println!("\n================ GROUND TRUTH (replay doc, per sheet) ================\n");
+    let csv1 = download_csv(browser, &play_id, "0").await;
+    match &csv1 {
+        Some(b) => {
+            println!("  Sheet1 (gid=0), {} bytes:", b.len());
+            for line in b.lines().take(6) {
+                println!("    {line:?}");
+            }
+        }
+        None => println!("  Sheet1 export did not download"),
+    }
+    let csv2 = if play_gid2.is_empty() {
+        None
+    } else {
+        let c = download_csv(browser, &play_id, &play_gid2).await;
+        match &c {
+            Some(b) => {
+                println!("  Sheet2 (gid={play_gid2}), {} bytes:", b.len());
+                for line in b.lines().take(6) {
+                    println!("    {line:?}");
+                }
+            }
+            None => println!("  Sheet2 export did not download"),
+        }
+        c
+    };
+
+    let on1 = csv1.as_deref().map(|b| b.contains(MARKER)).unwrap_or(false);
+    let on2 = csv2.as_deref().map(|b| b.contains(MARKER)).unwrap_or(false);
+
+    println!("\n================ VERDICT ================\n");
+    println!("  1. tab click captured                : {}", tab_click.is_some());
+    println!("  2. replay put the edit on Sheet2     : {on2}  (must be true)");
+    println!("     replay put the edit on Sheet1     : {on1}  (must be false)");
+    println!("  3. a recording that STARTS on Sheet2");
+    println!("     carries any sheet identity        : {any_sheet_ref}  (expected false)");
+    println!();
+    if tab_click.is_some() && on2 && !on1 {
+        println!("  ROUTE 1 WORKS for the explicit-switch case, with NO new code --");
+        println!("  the tab click is an ordinary click action and replays as one.");
+        println!("  It does NOT cover a recording that starts on a non-default sheet.");
+    } else if tab_click.is_some() {
+        println!("  The click is captured but the replay did not land on the right sheet.");
+        println!("  Route 1 does not work as it stands; see the step outcomes above.");
+    }
+
+    println!("\n  DOCUMENT IDs for cleanup: {rec_id} {play_id}");
+    println!("  clean up with: cargo run --example text_capture_probe -- sheetstrash {rec_id} {play_id}");
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------- sheetsroundtrip mode ----
 // Record real Sheets cell edits, then replay them into a FRESH document and
 // check the result against that document's CSV export.
@@ -8609,6 +9121,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetstabclick") {
+        return sheetstabclick_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsmulti") {
         return sheetsmulti_mode().await;

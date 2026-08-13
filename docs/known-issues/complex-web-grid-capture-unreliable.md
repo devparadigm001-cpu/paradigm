@@ -1175,6 +1175,87 @@ Three routes remain, none free, none measured:
 `Sheet!Cell` navigator with nothing able to tell it which sheet — working code
 that cannot be reached, which this project has removed twice before.
 
+## Route 1 attempted: the sheet-tab click. Still open (2026-08-12)
+
+The cheapest route from the section above — "a tab is an ordinary `Button`, so a
+user switching sheets mid-recording may already produce a replayable click" — was
+attempted with `text_capture_probe -- sheetstabclick`. **It is not demonstrated,
+and it now looks less promising than when it was written down.**
+
+Stated plainly so the next attempt does not re-derive it: this is a *negative and
+partly inconclusive* result, not a fix.
+
+### What was established
+
+**A click inside the Sheets page is captured as an unnamed `pane`.** From a valid
+run — setup verified, and the recorder demonstrably alive with 38 unmapped
+events, so this is not an empty-run artifact:
+
+```
+  captured 2 action(s), 0 exclusion(s), 38 unmapped event(s):
+    navigate  role=Window  name="Untitled spreadsheet - Google Sheets …"
+    click     role=pane    name="-"
+
+  compiled selector for the click: "role:pane"
+```
+
+`role:pane`, with **no name**. That is not a replayable identification of
+anything, let alone of a specific sheet tab — it would match any pane on screen.
+Note the asymmetry with the previous section: terminator's own locator finds
+`Button "Sheet2"` in this very document, but the *recorder* did not attribute the
+click to that element.
+
+### What was NOT established, and why
+
+**Whether a click that actually lands on a tab is captured as
+`role:Button|name:Sheet2`.** It could not be tested, because the probe could not
+make one land:
+
+```
+  clicked the Sheet2 tab, gid now Some("0")     <- still Sheet1; the click missed
+```
+
+So the `role=pane` capture above is of a click that did *not* hit the tab, and it
+would be wrong to read it as "a tab click is captured as a pane". It establishes
+what the click path produced for the click that happened, nothing more.
+
+**Synthetic clicks on Sheets' chrome were unreliable throughout**, while keyboard
+input was not. Measured repeatedly across five runs:
+
+| Action | Click | Keyboard |
+|---|---|---|
+| Add a sheet | failed 4/4 and 1/1 attempts | `{shift}{f11}` worked first try, twice |
+| Switch sheet | failed | Name Box `Sheet1!A1` worked, gid 316398254 → 0 |
+
+This matters beyond the probe: **replay drives clicks the same way**. A fix that
+depends on replaying a captured tab click would inherit exactly this
+unreliability, so route 1's replay half is now doubtful as well as its capture
+half.
+
+### Why this is being reported rather than pushed further
+
+Four of five runs failed in *setup* rather than at the hypothesis, and each
+failure mode had to be found and fixed before the run said anything:
+
+* a window handle held across a navigation went stale, and every later read came
+  back empty — which printed as "the tab click was not captured" and was **not**
+  that;
+* `Add Sheet` silently did nothing while the probe reported "second sheet
+  created, gid=0" and carried on into a recording that could not have switched
+  sheets;
+* focus stayed on the tab button after clicking, so the typed marker never
+  reached a cell and capture recorded nothing at all.
+
+The guards added in response — verify the second sheet exists by name before
+recording, refuse to continue if the document is not on Sheet1, and print
+`unmapped_events` so "the recorder saw nothing" is distinguishable from "the
+recorder admitted nothing" — are what turned run five into evidence instead of a
+fourth false negative. They are worth keeping for whoever picks this up.
+
+**No fix was attempted on the strength of this.** The honest position is that
+route 1 is unproven in both halves, and the alternative routes in the section
+above are unchanged.
+
 ### Two probe defects found while measuring, both self-inflicted
 
 Recorded because each produced a confident verdict from evidence that did not
@@ -1282,11 +1363,15 @@ exist, which is the failure shape this project keeps rediscovering.
       CSV-confirmed), the **capture** half is blocked because Sheets exposes no
       accessibility signal for which sheet is active. Not implemented, because
       the navigator would have nothing to tell it which sheet.
-- [ ] **Test whether a sheet-tab click is captured.** The cheapest remaining
-      route to the capture half, and untested. A tab is a `Button` named
-      `"Sheet2"`, so a user switching sheets mid-recording may already produce a
-      replayable action. Would not cover a recording that merely *starts* on a
-      non-default sheet. See "The sheet-name gap, measured", route 1.
+- [ ] **Test whether a sheet-tab click is captured — ATTEMPTED, still open.** See
+      "Route 1 attempted". A click inside the Sheets page was captured as an
+      unnamed `role=pane` compiling to the selector `"role:pane"`, which is not
+      replayable. But the decisive test did not run: synthetic clicks would not
+      land on the tab bar at all, so what capture does with a *successful* tab
+      click remains unmeasured. Route 1's replay half is now doubtful too, since
+      replay clicks the same way. Needs a reliable way to click Sheets chrome
+      before it can be settled — or a human driving the recording by hand, which
+      is the one gesture a probe has not been able to reproduce.
 - [x] ~~**Measure the per-keystroke cost.**~~ **Measured: 2.22 ms per keystroke,
       and a confirmed non-issue.** The suspicion did not survive an A/B — see
       "The per-keystroke cost, measured".
