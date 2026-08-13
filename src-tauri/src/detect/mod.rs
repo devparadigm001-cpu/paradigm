@@ -49,6 +49,7 @@
 //! left to be settled on evidence rather than answered implicitly by whatever
 //! this file assumed.
 
+pub mod link;
 pub mod verify;
 
 use std::collections::{BTreeMap, BTreeSet};

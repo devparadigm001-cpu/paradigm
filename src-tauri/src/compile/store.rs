@@ -31,9 +31,35 @@ pub fn store(conn: &mut Connection, playbook: &CompiledPlaybook) -> Result<(), S
 
     let tx = conn.transaction()?;
 
+    // `template_state` follows from whether a template is attached, and is set
+    // here rather than left to a caller: the two describe the same fact, and a
+    // playbook carrying a template while claiming `template_state = 'none'`
+    // would be a lie the schema cannot catch.
+    //
+    // 'confirmed', never 'proposed'. See migration 20260813000004's note: the
+    // whole detect -> review -> confirm sequence runs before anything is
+    // persisted, so a template only reaches storage once the user has already
+    // said yes. The paired CHECK requires the timestamp alongside it.
+    // The timestamp comes from SQLite rather than Rust so it matches every
+    // other timestamp in the schema exactly -- same function, same format, same
+    // clock -- instead of introducing a second way of writing the same thing.
+    let template_state = if playbook.template.is_some() {
+        "confirmed"
+    } else {
+        "none"
+    };
     tx.execute(
-        "INSERT INTO playbooks (id, name, source) VALUES (?1, ?2, ?3)",
-        (&playbook.id, &playbook.name, &playbook.source),
+        "INSERT INTO playbooks (id, name, source, template_state, template_confirmed_at)
+         VALUES (?1, ?2, ?3, ?4,
+                 CASE WHEN ?4 = 'confirmed'
+                      THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      ELSE NULL END)",
+        (
+            &playbook.id,
+            &playbook.name,
+            &playbook.source,
+            template_state,
+        ),
     )?;
 
     // Additive: written only when a template was attached, so an ordinary
@@ -528,6 +554,19 @@ mod tests {
         );
         assert_eq!(load_template(&conn, &playbook.id).expect("load"), None);
 
+        // And the lifecycle columns still say what they said before templated
+        // workflows existed. This INSERT is shared by every playbook in the
+        // product, so a wrong default here would mislabel all of them.
+        let (state, at): (String, Option<String>) = conn
+            .query_row(
+                "SELECT template_state, template_confirmed_at FROM playbooks WHERE id = ?1",
+                [&playbook.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("read lifecycle state");
+        assert_eq!(state, "none");
+        assert_eq!(at, None);
+
         // And the playbook itself is exactly what it was: three steps, in
         // order, with their payloads intact.
         let loaded = load(&conn, &playbook.id).expect("load");
@@ -567,6 +606,22 @@ mod tests {
         // The literal example steps are still there -- §5 item 5's "alongside",
         // not "instead of".
         assert_eq!(load(&conn, &playbook.id).expect("load").steps.len(), 3);
+
+        // A stored template means the user already confirmed it: the whole
+        // detect -> review -> confirm sequence runs before anything is
+        // persisted, so 'proposed' is never written. The paired CHECK would
+        // have rejected the row outright if the timestamp were missing, so
+        // this asserts the pairing was satisfied deliberately rather than by
+        // luck.
+        let (state, at): (String, Option<String>) = conn
+            .query_row(
+                "SELECT template_state, template_confirmed_at FROM playbooks WHERE id = ?1",
+                [&playbook.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("read lifecycle state");
+        assert_eq!(state, "confirmed");
+        assert!(at.is_some(), "a confirmation must carry when it happened");
     }
 
     #[test]

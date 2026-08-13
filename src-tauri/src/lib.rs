@@ -5,6 +5,7 @@ pub mod db;
 pub mod detect;
 pub mod labeling;
 pub mod replay;
+pub mod run;
 pub mod source;
 
 use std::path::PathBuf;
@@ -50,6 +51,14 @@ pub struct AppState {
     /// The last stopped session, awaiting a compile decision. Kept here rather
     /// than round-tripped through the frontend -- see `commands.rs`.
     pub pending_actions: Mutex<Option<Vec<CapturedAction>>>,
+    /// The source->destination links from that same session, kept beside it.
+    ///
+    /// Separate from `pending_actions` rather than folded into it because they
+    /// are different kinds of fact: an action is a step to replay, a link is
+    /// evidence about where a value came from. Only detection reads these, and
+    /// only until the compile decision is made -- §3's transient rule, which is
+    /// why they live in memory and never in the database.
+    pub pending_links: Mutex<Option<Vec<capture::grid::SourceLink>>>,
 }
 
 pub const MODEL_FILE: &str = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
@@ -170,6 +179,7 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
                 model_path,
                 session: Mutex::new(None),
                 pending_actions: Mutex::new(None),
+                pending_links: Mutex::new(None),
             });
             Ok(())
         })

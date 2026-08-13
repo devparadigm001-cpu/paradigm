@@ -34,7 +34,8 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::capture::{ActionKind, CaptureSession, CapturedAction, ExclusionList};
-use crate::compile::{compile, store, validate, ReversibilityPolicy};
+use crate::compile::{compile, store, validate, CompiledTemplate, ReversibilityPolicy};
+use crate::detect::{self, Detection};
 use crate::labeling::{self, calibration, clean, CalibrationSample, RedactionPolicy};
 use crate::replay::{self, journal};
 use crate::AppState;
@@ -67,6 +68,33 @@ pub struct CaptureSummary {
     /// that no action records -- see `CaptureReport::pastes_observed`.
     pub pastes_observed: usize,
     pub actions: Vec<CapturedActionView>,
+    /// The repeating pattern detection found, if it found one. §4.12's review:
+    /// the user sees the mapping in full before answering.
+    pub template: Option<TemplateProposal>,
+    /// Why no pattern was offered, when none was. `None` when one was.
+    ///
+    /// Every negative case of `Detection` is distinct for a reason -- §4.1 and
+    /// §4.12 prescribe different responses -- so the reason is surfaced rather
+    /// than collapsed into the absence of a proposal.
+    pub no_template_reason: Option<String>,
+}
+
+/// One field of a proposed mapping, in the user's terms.
+#[derive(Debug, Serialize)]
+pub struct MappedField {
+    pub from: String,
+    pub to: String,
+}
+
+/// A detected pattern, offered for confirmation. Structure only -- no values.
+#[derive(Debug, Serialize)]
+pub struct TemplateProposal {
+    pub source: String,
+    pub destination: String,
+    pub fields: Vec<MappedField>,
+    pub source_step: i64,
+    pub destination_step: i64,
+    pub examples: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -268,6 +296,11 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
         .await
         .map_err(|e| format!("could not stop recording: {e}"))?;
 
+    // §4.1 runs detection when the recording stops. It is pure and takes no
+    // model, so it costs nothing on a session that turns out to have no
+    // pattern -- which is most of them.
+    let (template, no_template_reason) = propose_template(&report.source_links);
+
     let policy = RedactionPolicy::placeholder();
     let summary = CaptureSummary {
         session_name: report.session_name.clone(),
@@ -276,12 +309,92 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
         unmapped_events: report.unmapped_events,
         pastes_observed: report.pastes_observed,
         actions: view_of(&report.actions, &policy),
+        template,
+        no_template_reason,
     };
 
-    let mut pending = state.pending_actions.lock().map_err(|e| e.to_string())?;
-    *pending = Some(report.actions);
+    {
+        let mut pending = state.pending_actions.lock().map_err(|e| e.to_string())?;
+        *pending = Some(report.actions);
+    }
+    let mut links = state.pending_links.lock().map_err(|e| e.to_string())?;
+    *links = Some(report.source_links);
 
     Ok(summary)
+}
+
+/// Run detection over a session's source links and describe the outcome.
+///
+/// Returns the proposal, or the reason there is none. Every negative is worded
+/// as the next thing to do rather than as a diagnosis, because that is what the
+/// user needs: §4.1 asks for "keep recording" on too few examples, §4.12 asks
+/// for "split the recording" on multiple patterns, and §2 is explicit that a
+/// still source is inconclusive rather than a confirmed constant.
+fn propose_template(
+    links: &[crate::capture::grid::SourceLink],
+) -> (Option<TemplateProposal>, Option<String>) {
+    let Some((source, destination)) = detect::link::dominant_surfaces(links) else {
+        // Not an anomaly. Nothing was copied between grids, so this is an
+        // ordinary recording and there was never a pattern to look for.
+        return (None, None);
+    };
+    let observations = detect::link::observations(links);
+
+    match detect::detect(&observations, &source, &destination) {
+        Detection::Pattern(p) => (
+            Some(TemplateProposal {
+                source,
+                destination,
+                fields: p
+                    .fields
+                    .iter()
+                    .map(|f| MappedField {
+                        from: f.source_field.clone(),
+                        to: f.destination_field.clone(),
+                    })
+                    .collect(),
+                source_step: p.source_step,
+                destination_step: p.destination_step,
+                examples: p.examples,
+            }),
+            None,
+        ),
+        Detection::TooFewExamples { records } => (
+            None,
+            Some(format!(
+                "only {records} record{} were copied across; three are needed \
+                 before a repeating pattern can be confirmed",
+                if records == 1 { "" } else { "s" }
+            )),
+        ),
+        Detection::SourceDidNotAdvance => (
+            None,
+            Some(
+                "the destination moved on but the source stayed on one record, \
+                 so what should change each time is undetermined"
+                    .to_string(),
+            ),
+        ),
+        Detection::InconsistentAdvance { .. } => (
+            None,
+            Some("the records were not a consistent distance apart".to_string()),
+        ),
+        Detection::InconsistentMapping { .. } => (
+            None,
+            Some(
+                "the records disagree about which source field feeds which \
+                 destination field"
+                    .to_string(),
+            ),
+        ),
+        Detection::MultiplePatterns { signatures } => (
+            None,
+            Some(format!(
+                "{signatures} separate patterns were recorded together; \
+                 record them as separate workflows"
+            )),
+        ),
+    }
 }
 
 /// Clean, label, compile, validate and store the last captured session.
@@ -295,6 +408,7 @@ pub async fn compile_and_store_playbook(
     state: State<'_, AppState>,
     name_hint: Option<String>,
     step_indices: Option<Vec<usize>>,
+    confirm_template: Option<bool>,
 ) -> Result<StoredPlaybookInfo, String> {
     let captured = {
         let pending = state.pending_actions.lock().map_err(|e| e.to_string())?;
@@ -339,6 +453,16 @@ pub async fn compile_and_store_playbook(
     };
 
     let playbook = compile(&actions, &label, &ReversibilityPolicy::placeholder(), &redaction);
+
+    // §4.2's answer. Only when the user said yes -- `compile` itself is
+    // untouched and always produces an ordinary playbook, so declining, or
+    // never being asked, leaves exactly the Phase 1 behaviour.
+    let playbook = if confirm_template.unwrap_or(false) {
+        let template = confirmed_template(&state)?;
+        playbook.with_template(template)
+    } else {
+        playbook
+    };
 
     // Report validation errors rather than swallowing them.
     let errors = validate(&playbook);
@@ -388,11 +512,60 @@ pub async fn compile_and_store_playbook(
         store::store(&mut conn, &playbook).map_err(|e| e.to_string())?;
     }
 
-    // Consume the pending capture so it cannot be stored twice.
-    let mut pending = state.pending_actions.lock().map_err(|e| e.to_string())?;
-    *pending = None;
+    // Consume the pending capture so it cannot be stored twice. The links go
+    // with it: they describe that same session, and leaving them behind would
+    // let a later compile build a template out of a recording that is gone.
+    {
+        let mut pending = state.pending_actions.lock().map_err(|e| e.to_string())?;
+        *pending = None;
+    }
+    let mut links = state.pending_links.lock().map_err(|e| e.to_string())?;
+    *links = None;
 
     Ok(info)
+}
+
+/// Rebuild the template the user just confirmed, from the links of the session
+/// being compiled.
+///
+/// Detection is re-run here rather than the proposal being carried over from
+/// `stop_record_session`. That is deliberate: the proposal that crossed the IPC
+/// boundary is a display view, and trusting a value that has been outside the
+/// backend to decide what gets written to the database would undo the same
+/// invariant the module docs describe for `CapturedAction`. The links never
+/// left app state, so re-deriving from them is both cheap and trustworthy.
+///
+/// ## What is NOT done here, and why
+///
+/// `detect::verify` -- item 4's Qwen check -- is not called. It needs a
+/// human-readable label per field locator, which comes from the source's header
+/// row, and by this point the recording has ended and nothing holds a live
+/// reader on the source. Calling it with the locators as their own labels would
+/// be worse than not calling it: `verify` explicitly returns `Unsure` for
+/// "C -> B" because that carries no meaning to judge, so it would produce a
+/// guaranteed non-answer wearing the appearance of a check. The verification
+/// belongs where a reader is open on the source -- §4.3's first-record preview.
+fn confirmed_template(state: &State<'_, AppState>) -> Result<CompiledTemplate, String> {
+    let links = state.pending_links.lock().map_err(|e| e.to_string())?;
+    let links = links
+        .as_deref()
+        .ok_or_else(|| "no captured session to build a template from".to_string())?;
+
+    let (source, destination) = detect::link::dominant_surfaces(links)
+        .ok_or_else(|| "this recording copied nothing between documents".to_string())?;
+    let observations = detect::link::observations(links);
+
+    match detect::detect(&observations, &source, &destination) {
+        Detection::Pattern(p) => Ok(CompiledTemplate::from_pattern(&p, source, destination)),
+        // The confirmation and the recording disagree. Refusing is the only
+        // safe answer: storing a template detection does not stand behind would
+        // put a workflow into the product that nothing has justified.
+        _ => Err(
+            "this recording no longer shows a repeating pattern, so it was stored as an \
+             ordinary playbook instead"
+                .to_string(),
+        ),
+    }
 }
 
 /// Every stored playbook, for display.
@@ -587,4 +760,108 @@ mod tests {
         // Documented behaviour, not an oversight -- see `resolve_selection`.
         assert_eq!(resolve_selection(2, Some(&[1, 1, 0])).unwrap(), vec![1, 1, 0]);
     }
+
+    // ---------------- the stop -> proposal wiring (§4.1, §4.12) ----------------
+
+    fn link(seq: u64, src: &str, dst: &str) -> crate::capture::grid::SourceLink {
+        crate::capture::grid::SourceLink {
+            seq,
+            source_document: "Orders".into(),
+            source_cell: src.into(),
+            destination_document: "Invoices".into(),
+            destination_cell: dst.into(),
+        }
+    }
+
+    #[test]
+    fn three_aligned_copies_are_offered_as_a_template() {
+        let (proposal, reason) = propose_template(&[
+            link(1, "C2", "B2"),
+            link(2, "C3", "B3"),
+            link(3, "C4", "B4"),
+        ]);
+        assert_eq!(reason, None);
+        let p = proposal.expect("a pattern should have been detected");
+        assert_eq!(p.source, "Orders");
+        assert_eq!(p.destination, "Invoices");
+        assert_eq!(p.source_step, 1);
+        assert_eq!(p.destination_step, 1);
+        assert_eq!(p.examples, 3);
+        assert_eq!(p.fields.len(), 1);
+        assert_eq!(p.fields[0].from, "C");
+        assert_eq!(p.fields[0].to, "B");
+    }
+
+    #[test]
+    fn two_copies_are_not_a_pattern_and_the_reason_says_what_to_do() {
+        // §2's Rule of 3. The message has to be actionable, not a diagnosis.
+        let (proposal, reason) = propose_template(&[link(1, "C2", "B2"), link(2, "C3", "B3")]);
+        assert!(proposal.is_none());
+        let reason = reason.expect("a refusal must explain itself");
+        assert!(reason.contains("three are needed"), "unhelpful: {reason}");
+    }
+
+    #[test]
+    fn an_ordinary_recording_proposes_nothing_and_reports_no_problem() {
+        // Nothing was copied between grids, so there was never a pattern to
+        // look for. That is not a failed detection and must not read as one.
+        let (proposal, reason) = propose_template(&[]);
+        assert!(proposal.is_none());
+        assert_eq!(reason, None, "an ordinary recording is not a refusal");
+    }
+
+    #[test]
+    fn a_still_source_is_reported_as_inconclusive_not_as_a_constant() {
+        // §2 is explicit: a source that did not move is inconclusive, "not as
+        // confirmation of a fixed, unchanging value".
+        let (proposal, reason) = propose_template(&[
+            link(1, "C2", "B2"),
+            link(2, "C2", "B3"),
+            link(3, "C2", "B4"),
+        ]);
+        assert!(proposal.is_none());
+        let reason = reason.expect("a refusal must explain itself");
+        assert!(
+            reason.contains("stayed on one record"),
+            "should name the still source: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_multi_field_pattern_reports_every_mapped_field() {
+        // §4.12: a pattern may span several fields as long as they advance
+        // together.
+        let mut links = Vec::new();
+        for (i, row) in [2, 3, 4].iter().enumerate() {
+            links.push(crate::capture::grid::SourceLink {
+                seq: (i * 2) as u64,
+                source_document: "Orders".into(),
+                source_cell: format!("C{row}"),
+                destination_document: "Invoices".into(),
+                destination_cell: format!("B{row}"),
+            });
+            links.push(crate::capture::grid::SourceLink {
+                seq: (i * 2 + 1) as u64,
+                source_document: "Orders".into(),
+                source_cell: format!("D{row}"),
+                destination_document: "Invoices".into(),
+                destination_cell: format!("E{row}"),
+            });
+        }
+        let (proposal, _) = propose_template(&links);
+        let p = proposal.expect("a two-field pattern should be detected");
+        let pairs: Vec<(String, String)> = p
+            .fields
+            .iter()
+            .map(|f| (f.from.clone(), f.to.clone()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("C".to_string(), "B".to_string()),
+                ("D".to_string(), "E".to_string())
+            ]
+        );
+    }
+
 }
