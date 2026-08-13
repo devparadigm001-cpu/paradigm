@@ -7543,6 +7543,295 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ---------------------------------------------------- sheetsmanual mode ----
+//
+// The one gesture five automated runs could not produce: a HUMAN clicking a
+// sheet tab. `sheetstabclick` could never make a synthetic click land on the
+// tab bar, so what capture does with a real tab click is still unmeasured --
+// see "Route 1 attempted" in
+// docs/known-issues/complex-web-grid-capture-unreliable.md.
+//
+// This probe drives NOTHING. It finds the open Sheets window, starts a real
+// capture session, waits while a person switches sheets and types, then prints
+// exactly what capture produced. The probe not touching the mouse is the entire
+// point: any click it made would be the thing already known not to work.
+//
+// It also reads the gid before and after. If the sheet did not actually change,
+// the recording is of some other gesture and the run says so rather than
+// letting a conclusion be drawn from it.
+
+/// Names of the buttons in the sheet tab bar, excluding its controls.
+///
+/// Not `sheet_tabs`, which only matches `Sheet<digits>`: a real user's document
+/// has tabs called things like "Data" or "Q3", and this probe is meant to be
+/// pointed at whatever is already open.
+async fn tab_bar_buttons(desktop: &Desktop, window: &UIElement) -> Vec<String> {
+    let Some(bar) = find_named(desktop, window, &["role:Group"], |n| {
+        n.trim() == "Sheet tab bar"
+    })
+    .await
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Ok(toolbars) = bar.children() {
+        for tb in toolbars {
+            if let Ok(kids) = tb.children() {
+                for k in kids {
+                    if k.role() == "Button" {
+                        if let Some(n) = k.name() {
+                            let t = n.trim().to_string();
+                            if !t.is_empty()
+                                && t != "Add Sheet"
+                                && t != "All Sheets"
+                                && !out.contains(&t)
+                            {
+                                out.push(t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+async fn sheetsmanual_mode() -> ExitCode {
+    use paradigm_lib::capture::{CaptureSession, ExclusionList};
+    use paradigm_lib::compile::{compile, ReversibilityPolicy};
+    use paradigm_lib::labeling::RedactionPolicy;
+    use std::io::Write;
+
+    fn say(line: &str) {
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+    }
+
+    // Seconds to leave the recorder running. Override by passing a number.
+    let wait_secs: u64 = std::env::args()
+        .filter_map(|a| a.parse::<u64>().ok())
+        .find(|n| (10..=600).contains(n))
+        .unwrap_or(45);
+
+    say("== capture a HUMAN sheet-tab click ==\n");
+    say("This probe clicks nothing. You perform the gesture; it only watches.");
+    say("Point it at a Sheets document that ALREADY has two sheets.\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Any Sheets window, not just "Untitled spreadsheet" -- this is meant to be
+    // pointed at a real document.
+    let Some(window) = desktop
+        .locator("role:Window|name:Google Sheets")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .ok()
+        .and_then(|all| all.into_iter().next())
+    else {
+        say("  INCONCLUSIVE: no window titled '… Google Sheets' is open.");
+        say("  Open a Sheets document with two sheets, then run this again.");
+        return ExitCode::FAILURE;
+    };
+    say(&format!("  window : {:?}", window.name().unwrap_or_default()));
+
+    let addr_before = address_of(&desktop, &window).await;
+    let doc_id = addr_before
+        .split("/d/")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    let gid_before = gid_in(&addr_before);
+    say(&format!("  document: {doc_id}"));
+    say(&format!("  showing gid: {gid_before:?}"));
+
+    let tabs = tab_bar_buttons(&desktop, &window).await;
+    say(&format!("  sheet tabs visible: {tabs:?}"));
+    if tabs.len() < 2 {
+        say("\n  WARNING: fewer than two sheet tabs were found. If the document only");
+        say("  has one sheet there is nothing to switch to, and the recording will");
+        say("  not answer the question. Add a second sheet first (Shift+F11).");
+    }
+
+    // ---- what to do ---------------------------------------------------------
+    say("\n================ WHAT TO DO ================\n");
+    say("  When recording starts below:");
+    say("    1. CLICK the other sheet's tab at the bottom (the gesture under test)");
+    say("    2. Type a short value into a cell");
+    say("    3. Press Tab to commit it");
+    say("  Then stop touching the machine and wait for the report.\n");
+    say("  Do NOT use the Name Box or a keyboard shortcut to switch sheets --");
+    say("  a click on the tab is the specific thing being measured.\n");
+
+    for n in (1..=5).rev() {
+        say(&format!("  starting in {n}..."));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    let session = match CaptureSession::start_session(
+        "sheets-manual-tab-click",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    say(&format!(
+        "\n  >>> RECORDING NOW -- go ahead. {wait_secs}s <<<\n"
+    ));
+    let mut left = wait_secs;
+    while left > 0 {
+        let step = left.min(5);
+        tokio::time::sleep(Duration::from_secs(step)).await;
+        left -= step;
+        if left > 0 {
+            say(&format!("      {left}s left..."));
+        }
+    }
+    say("\n  >>> STOPPED <<<\n");
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // ---- did the sheet actually change? -------------------------------------
+    let addr_after = address_of(&desktop, &window).await;
+    let gid_after = gid_in(&addr_after);
+    say("================ DID THE SWITCH HAPPEN? ================\n");
+    say(&format!("  gid before: {gid_before:?}"));
+    say(&format!("  gid after : {gid_after:?}"));
+    let switched = gid_before.is_some() && gid_after.is_some() && gid_before != gid_after;
+    if switched {
+        say("  the document changed sheets, so the recording contains a real switch.");
+    } else {
+        say("  !! the gid did NOT change, so no sheet switch happened during the");
+        say("     recording. Whatever is below is a capture of some other gesture,");
+        say("     and nothing about tab clicks should be concluded from it.");
+    }
+
+    // ---- what capture produced ---------------------------------------------
+    say("\n================ WHAT CAPTURE PRODUCED ================\n");
+    say(&format!(
+        "  {} action(s), {} exclusion(s), {} unmapped event(s)",
+        report.actions.len(),
+        report.exclusions.len(),
+        report.unmapped_events
+    ));
+    if report.actions.is_empty() && report.unmapped_events == 0 {
+        say("  !! the recorder observed NO events at all -- this run is broken, not");
+        say("     evidence about what capture does with a tab click.");
+    }
+    say("");
+    for (i, a) in report.actions.iter().enumerate() {
+        say(&format!(
+            "  [{}] {:<9} role={:?} name={:?} payload={:?}",
+            i + 1,
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-"),
+            a.payload.as_deref().unwrap_or("-")
+        ));
+    }
+    for e in report.exclusions.iter().take(12) {
+        say(&format!("      excluded {:?} {:?}", e.kind.as_str(), e.reason));
+    }
+
+    // ---- the selectors replay would actually resolve ------------------------
+    let replayable: Vec<_> = report
+        .actions
+        .iter()
+        .filter(|a| a.kind.as_str() == "click" || a.kind.as_str() == "type")
+        .cloned()
+        .collect();
+    say("\n================ COMPILED SELECTORS ================\n");
+    if replayable.is_empty() {
+        say("  no click or type actions to compile.");
+    } else {
+        let pb = compile(
+            &replayable,
+            "Manual Tab Click",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        for s in &pb.steps {
+            let sel = serde_json::from_str::<serde_json::Value>(&s.action_payload_json)
+                .ok()
+                .and_then(|v| v["target"]["selector"].as_str().map(str::to_string))
+                .unwrap_or_else(|| "<none>".into());
+            say(&format!(
+                "  [{}] {:<9} selector={sel:?}",
+                s.step_order, s.action_type
+            ));
+        }
+    }
+
+    // ---- the actual question ------------------------------------------------
+    say("\n================ THE TAB CLICK ================\n");
+    let named_tab: Vec<_> = report
+        .actions
+        .iter()
+        .filter(|a| a.kind.as_str() == "click")
+        .filter(|a| {
+            a.element_name
+                .as_deref()
+                .map(|n| tabs.iter().any(|t| t == n.trim()))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if let Some(a) = named_tab.first() {
+        say("  CAPTURED, and it names the tab:");
+        say(&format!(
+            "    role={:?} name={:?}",
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-")
+        ));
+        say("\n  That is a replayable identification of a specific sheet, which is");
+        say("  what route 1 needs. Next step is replaying it into a fresh document.");
+    } else {
+        let clicks: Vec<_> = report
+            .actions
+            .iter()
+            .filter(|a| a.kind.as_str() == "click")
+            .collect();
+        if clicks.is_empty() {
+            say("  no click action was captured at all.");
+        } else {
+            say("  NO captured click names a sheet tab. The clicks that were captured:");
+            for a in clicks {
+                say(&format!(
+                    "    role={:?} name={:?}",
+                    a.element_role.as_deref().unwrap_or("-"),
+                    a.element_name.as_deref().unwrap_or("-")
+                ));
+            }
+            say("\n  If the gid DID change above, then a real tab click happened and");
+            say("  capture did not attribute it to the tab -- which settles route 1");
+            say("  negatively, and this time on a genuine human gesture.");
+        }
+    }
+
+    say(&format!("\n  document: {doc_id}"));
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------- sheetstabclick mode ----
 //
 // Route 1 from "The sheet-name gap, measured": Sheets publishes no signal for
@@ -9121,6 +9410,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsmanual") {
+        return sheetsmanual_mode().await;
     }
     if std::env::args().any(|a| a == "sheetstabclick") {
         return sheetstabclick_mode().await;
