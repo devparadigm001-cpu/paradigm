@@ -7543,6 +7543,122 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------ sheetsactive mode ----
+//
+// The last capture-side question, asked of the WHOLE window rather than the tab
+// bar: is the active sheet's identity anywhere in the accessibility tree?
+//
+// Everything so far looked at the sheet tabs and asked "which one is marked
+// selected" -- answered no, twice, the second time properly via
+// `is_selected()`/SelectionItemPattern. But a sheet name could be exposed
+// somewhere else entirely: a status line, a heading, an accessible description,
+// a hidden label.
+//
+// So this takes the opposite approach. Snapshot every element in the window on
+// one sheet, snapshot again on another, and diff. Anything that appears,
+// disappears, or changes value across the switch is a candidate signal. If the
+// diff is empty of anything naming a sheet, the tree genuinely does not carry it
+// and capture has no source -- concluded from the whole window, not one corner.
+async fn sheetsactive_mode() -> ExitCode {
+    println!("== is the ACTIVE sheet's name anywhere in the tree? ==\n");
+    println!("Diffs the whole window across a sheet switch, rather than assuming");
+    println!("the signal would live on the tabs.\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((_w, doc_id)) = sheets_window(&desktop).await else {
+        println!("  INCONCLUSIVE: no Sheets window open.");
+        return ExitCode::FAILURE;
+    };
+    println!("  document: {doc_id}");
+    if !ensure_second_sheet(&desktop).await {
+        println!("\n  INCONCLUSIVE: could not get a second sheet.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::FAILURE;
+    }
+
+    /// Every (role, name, value) triple in the window, budgeted.
+    fn census(el: &UIElement, depth: usize, out: &mut Vec<String>, budget: &mut usize) {
+        if *budget == 0 || depth > 14 {
+            return;
+        }
+        *budget -= 1;
+        let a = el.attributes();
+        let name = a.name.unwrap_or_default();
+        let value = a.value.unwrap_or_default();
+        let desc = a.description.unwrap_or_default();
+        if !name.is_empty() || !value.is_empty() || !desc.is_empty() {
+            out.push(format!("{}|{}|{}|{}", a.role, name, value, desc));
+        }
+        if let Ok(kids) = el.children() {
+            for k in kids {
+                census(&k, depth + 1, out, budget);
+            }
+        }
+    }
+
+    async fn snap(desktop: &Desktop, label: &str) -> Vec<String> {
+        let Some((w, _)) = sheets_window(desktop).await else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut budget = 8000usize;
+        census(&w, 0, &mut out, &mut budget);
+        println!("  {label}: {} elements with text ({} budget left)", out.len(), budget);
+        out
+    }
+
+    goto_sheet_via_namebox(&desktop, "Sheet1!A1").await;
+    let gid1 = current_gid(&desktop).await;
+    let a = snap(&desktop, &format!("on Sheet1 (gid={gid1:?})")).await;
+
+    goto_sheet_via_namebox(&desktop, "Sheet2!A1").await;
+    let gid2 = current_gid(&desktop).await;
+    let b = snap(&desktop, &format!("on Sheet2 (gid={gid2:?})")).await;
+
+    if gid1 == gid2 || gid1.is_none() || gid2.is_none() {
+        println!("\n  INCONCLUSIVE: the sheet did not actually change between snapshots.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::FAILURE;
+    }
+
+    let only_a: Vec<&String> = a.iter().filter(|x| !b.contains(x)).collect();
+    let only_b: Vec<&String> = b.iter().filter(|x| !a.contains(x)).collect();
+
+    println!("\n================ WHAT CHANGED ================\n");
+    println!("  present only while Sheet1 was active: {}", only_a.len());
+    for x in only_a.iter().take(20) {
+        println!("    {x}");
+    }
+    println!("\n  present only while Sheet2 was active: {}", only_b.len());
+    for x in only_b.iter().take(20) {
+        println!("    {x}");
+    }
+
+    let names_a_sheet = only_a.iter().any(|x| x.contains("Sheet1"));
+    let names_b_sheet = only_b.iter().any(|x| x.contains("Sheet2"));
+
+    println!("\n================ VERDICT ================\n");
+    println!("  a Sheet1-naming element appears only when Sheet1 is active : {names_a_sheet}");
+    println!("  a Sheet2-naming element appears only when Sheet2 is active : {names_b_sheet}");
+    if names_a_sheet && names_b_sheet {
+        println!("\n  A SIGNAL EXISTS. Capture can read the active sheet from it, and the");
+        println!("  wrong-sheet fix becomes buildable end to end.");
+    } else {
+        println!("\n  NO SIGNAL. Nothing that names the active sheet appears or disappears");
+        println!("  with the switch, across the WHOLE window -- not just the tab bar.");
+        println!("  Capture has no source for which sheet an edit happened on.");
+    }
+
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
 // ------------------------------------------------------ sheetsrename mode ----
 //
 // Rename an open spreadsheet, by `set_value` on the title field -- the same
@@ -10229,6 +10345,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsactive") {
+        return sheetsactive_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsrename") {
         return sheetsrename_mode().await;

@@ -1511,6 +1511,68 @@ the read-back against what it typed (`landed.trim() != cell`), so it would rejec
 every qualified navigation as a wrong target unless it compares against the cell
 part only.
 
+## The capture side is impossible, not merely hard (2026-08-12)
+
+Asked to build "record which sheet a cell edit happened on", the precondition was
+checked first: is that datum available anywhere? It is not, and this is the
+measurement that settles it.
+
+Every previous attempt looked at the **sheet tabs** and asked which one is marked
+current. This asks the opposite question of the **whole window**: snapshot every
+element's role, name, value and description on one sheet, snapshot again on
+another, and diff. A status line, a heading, a hidden label, an accessible
+description — anything at all that differs would be a usable signal.
+
+```
+  on Sheet1 (gid=Some("0"))        : 48 elements with text
+  on Sheet2 (gid=Some("390264723")): 48 elements with text
+
+  present only while Sheet1 was active: 0
+  present only while Sheet2 was active: 0
+```
+
+**Zero difference, in either direction, with the gid confirming a real switch.**
+The accessibility tree Google Sheets exposes is byte-identical whichever sheet is
+displayed. There is nothing to read, so `grid.rs` cannot stamp an edit with a
+sheet name, and no amount of care on the replay side changes that.
+
+This supersedes the tab-focused answers as the general result. Those were correct
+but narrow — one of them was even reached via a field hardcoded to `None`. This
+one covers the whole window and needs no assumption about where a signal would
+live.
+
+### What is therefore NOT buildable
+
+The requested shape — capture stamps each grid edit with its sheet, `grid_type`
+emits `Sheet!Cell` — has no data source for its first half. Building only the
+second half was rejected on this project's own precedent: capture would never
+populate the field, making it unused code that looks purposeful, which is what
+`count_candidates` was deleted for.
+
+### The one design that remains, unchanged and still unbuilt
+
+Capture cannot read the *state*, but it can record the *event*: a human tab click
+is captured as `role:text|name:Sheet1`, proven earlier in this file. So capture
+could track a "current sheet" across a recording session — updated whenever a
+sheet-tab click is admitted — and stamp later grid edits with it. Replay would
+then navigate `Sheet!Cell` through the Name Box, the mechanism already measured
+working.
+
+Every component of that is proven. It is still not built, for two reasons that
+have not changed:
+
+* It needs an application-specific heuristic in **capture** this time — "a click
+  on a text element named `Sheet<n>` inside a Sheets window means the active
+  sheet changed". Capture has no per-application behaviour today, and the same
+  objection was raised against putting one in replay. It is a design decision to
+  agree, not a fix to slip in.
+* It covers only recordings that **contain** a switch. One that merely starts on
+  a non-default sheet still carries nothing, because there is no event to record.
+  The common case stays unfixed.
+
+Testing its capture half would also need a human at the keyboard again: no probe
+in this investigation has ever made a synthetic click land on a sheet tab.
+
 ### Two probe defects found while measuring, both self-inflicted
 
 Recorded because each produced a confident verdict from evidence that did not
@@ -1646,6 +1708,12 @@ exist, which is the failure shape this project keeps rediscovering.
       `attributes().is_selected`, which is hardcoded `None` on Windows and proved
       nothing. `UIElement::is_selected()` asked live returns "supports neither
       SelectionItemPattern nor TogglePattern" for every tab in both states.
+- [x] ~~**Record which sheet a cell edit happened on.**~~ **Cannot be built —
+      there is no such datum.** A whole-window diff across a real sheet switch
+      returns **zero** differing elements in either direction: the tree Sheets
+      exposes is identical whichever sheet is displayed. See "The capture side is
+      impossible, not merely hard". This closes the question for the general
+      case; only the event-based design below remains.
 - [x] ~~**Measure the per-keystroke cost.**~~ **Measured: 2.22 ms per keystroke,
       and a confirmed non-issue.** The suspicion did not survive an A/B — see
       "The per-keystroke cost, measured".
