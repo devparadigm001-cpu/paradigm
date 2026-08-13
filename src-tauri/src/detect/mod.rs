@@ -49,6 +49,8 @@
 //! left to be settled on evidence rather than answered implicitly by whatever
 //! this file assumed.
 
+pub mod verify;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A position in a source or destination, in the general terms §4 asks for: a

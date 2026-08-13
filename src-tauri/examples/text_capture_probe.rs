@@ -7543,6 +7543,158 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// --------------------------------------------------- verifymapping mode ----
+//
+// §4.1's sensibility check against the real local model.
+//
+// Both directions, because only one of them is interesting. That a sensible
+// mapping passes proves little on its own -- a check that answers "yes" to
+// everything would pass it too, and would be worse than no check at all, since
+// it would look like verification. What has to be shown is that a genuinely
+// nonsensical mapping is REFUSED, and that the confidence floor is somewhere a
+// real model's numbers actually straddle.
+//
+// Prints the raw output and mean token probability for every case, so the
+// threshold in `detect::verify::CONFIDENCE_FLOOR` can be set from measurements
+// rather than guessed at -- which is what §4.1 asks for explicitly.
+async fn verifymapping_mode() -> ExitCode {
+    use paradigm_lib::detect::verify::{build_prompt, describe, interpret, CONFIDENCE_FLOOR};
+
+    println!("== does the local model judge a mapping sensibly? ==\n");
+
+    let model = std::path::Path::new("models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+    let model = if model.exists() {
+        model.to_path_buf()
+    } else {
+        std::path::Path::new("src-tauri/models/qwen2.5-0.5b-instruct-q4_k_m.gguf").to_path_buf()
+    };
+    if !model.exists() {
+        println!("  INCONCLUSIVE: no model at {}", model.display());
+        return ExitCode::FAILURE;
+    }
+    println!("  model: {}", model.display());
+
+    let engine = match paradigm_lib::labeling::shared(&model) {
+        Ok(e) => e,
+        Err(e) => {
+            println!("  INCONCLUSIVE: model would not load: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  loaded in {:?}\n", engine.load_time());
+
+    // `expected_sensible` is what a person would say, and is the yardstick the
+    // model is measured against -- not something it is told.
+    let cases: &[(&str, bool, &[(&str, &str)])] = &[
+        (
+            "the design's own example",
+            true,
+            &[("Customer Name", "Client"), ("Order Total", "Amount")],
+        ),
+        (
+            "plausible renaming",
+            true,
+            &[("Product SKU", "Item Code"), ("Quantity", "Units")],
+        ),
+        (
+            "exact same names",
+            true,
+            &[("Invoice Number", "Invoice Number"), ("Due Date", "Due Date")],
+        ),
+        (
+            "types crossed over",
+            false,
+            &[("Phone Number", "Order Total"), ("Email Address", "Ship Date")],
+        ),
+        (
+            "nonsense pairing",
+            false,
+            &[("Delivery Address", "Tax Rate"), ("Customer Name", "Quantity")],
+        ),
+        (
+            "money into a date",
+            false,
+            &[("Order Total", "Delivery Date")],
+        ),
+    ];
+
+    println!(
+        "  {:<26} {:<8} {:<10} {:<28} {}",
+        "case", "expected", "conf", "raw", "verdict"
+    );
+    println!("  {}", "-".repeat(100));
+
+    let mut agreed = 0usize;
+    let mut rerecord_when_wrong = 0usize;
+    let mut wrong_total = 0usize;
+    let mut confidences: Vec<(bool, f64)> = Vec::new();
+
+    for (name, expected_sensible, fields) in cases {
+        let described: Vec<(String, String)> = fields
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let prompt = build_prompt(&describe(&described));
+        let completion = match engine.complete(&prompt) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("  {name:<26} inference failed: {e}");
+                continue;
+            }
+        };
+        let verdict = interpret(&completion.output, completion.mean_token_probability);
+        let raw = completion.output.replace('\n', " ");
+        println!(
+            "  {name:<26} {:<8} {:<10.3} {:<28} {verdict:?}",
+            expected_sensible,
+            completion.mean_token_probability,
+            format!("{:.26}", raw)
+        );
+
+        let said_sensible = matches!(verdict, paradigm_lib::detect::verify::Verdict::Sensible { .. });
+        if said_sensible == *expected_sensible {
+            agreed += 1;
+        }
+        if !*expected_sensible {
+            wrong_total += 1;
+            if verdict.should_rerecord() {
+                rerecord_when_wrong += 1;
+            }
+        }
+        confidences.push((*expected_sensible, completion.mean_token_probability));
+    }
+
+    println!("\n================ VERDICT ================\n");
+    println!("  confidence floor in use : {CONFIDENCE_FLOOR:.2}");
+    println!("  agreed with a human     : {agreed}/{}", cases.len());
+    println!(
+        "  NONSENSE refused        : {rerecord_when_wrong}/{wrong_total}   <- the half that matters"
+    );
+    let min = confidences
+        .iter()
+        .map(|(_, c)| *c)
+        .fold(f64::INFINITY, f64::min);
+    let max = confidences
+        .iter()
+        .map(|(_, c)| *c)
+        .fold(f64::NEG_INFINITY, f64::max);
+    println!("  confidence range        : {min:.3} .. {max:.3}");
+    println!();
+    if rerecord_when_wrong == wrong_total && agreed == cases.len() {
+        println!("  PASS. Sensible mappings proceed and nonsensical ones are refused, so the");
+        println!("  check discriminates rather than rubber-stamping.");
+    } else if rerecord_when_wrong == wrong_total {
+        println!("  USABLE. Every nonsensical mapping was refused, which is the property that");
+        println!("  protects the user. Some sensible ones were also refused -- that costs a");
+        println!("  re-record, not a wrong result. See the table for where the floor sits.");
+    } else {
+        println!("  NOT USABLE AS SET. A nonsensical mapping was allowed to proceed. The");
+        println!("  floor or the prompt needs changing -- see the confidences above.");
+    }
+
+    ExitCode::SUCCESS
+}
+
 // --------------------------------------------------- sheetscopylive mode ----
 //
 // Source-position capture end to end: a real capture session watching a real
@@ -11679,6 +11831,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "verifymapping") {
+        return verifymapping_mode().await;
     }
     if std::env::args().any(|a| a == "sheetscopylive") {
         return sheetscopylive_mode().await;

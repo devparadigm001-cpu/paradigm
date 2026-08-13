@@ -199,6 +199,52 @@ impl LabelingEngine {
     }
 }
 
+/// One raw completion, for callers that ask their own question.
+///
+/// `mean_token_probability` is the useful part: a confidence derived from the
+/// token probabilities the model actually produced, rather than a number the
+/// model was asked to state about itself. A 0.5B model is not reliable at
+/// self-reporting confidence; this is measured from decoding.
+#[derive(Debug, Clone)]
+pub struct Completion {
+    pub output: String,
+    pub tokens_generated: usize,
+    pub stopped_by: Option<String>,
+    pub inference_time: Duration,
+    pub mean_token_probability: f64,
+}
+
+impl LabelingEngine {
+    /// Run an arbitrary prompt through the loaded model.
+    ///
+    /// Exists so a second job can reuse the model without `labeling` learning
+    /// what that job is about -- §4.1 gives the local model a mapping-
+    /// sensibility check, and the mapping semantics belong with detection, not
+    /// here. This module owns the model; the caller owns the question.
+    ///
+    /// Same locked execution parameters as [`LabelingEngine::label`]: a fresh
+    /// context per call, temperature 0, and the shared token and stop limits.
+    pub fn complete(&self, prompt: &str) -> Result<Completion, LabelingError> {
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(std::num::NonZeroU32::new(N_CTX))
+            .with_n_threads(self.n_threads)
+            .with_n_threads_batch(self.n_threads);
+        let mut ctx = self
+            .model
+            .new_context(&self.backend, ctx_params)
+            .map_err(|e| LabelingError::Context(e.to_string()))?;
+
+        let raw = infer(&self.model, &mut ctx, prompt)?;
+        Ok(Completion {
+            output: raw.output,
+            tokens_generated: raw.tokens_generated,
+            stopped_by: raw.stopped_by,
+            inference_time: raw.duration,
+            mean_token_probability: raw.mean_token_probability,
+        })
+    }
+}
+
 /// The locked prompt shape: three worked examples, then the pattern to label.
 pub fn build_prompt(input_pattern: &str) -> String {
     format!(
