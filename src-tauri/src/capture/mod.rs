@@ -75,6 +75,22 @@ pub struct CaptureReport {
     /// not "data was definitely lost".
     /// See docs/known-issues/complex-web-grid-capture-unreliable.md.
     pub pastes_observed: usize,
+    /// Copy → paste pairs seen this session: where a value came from, and where
+    /// it went. Positions only, never content.
+    ///
+    /// A **side channel**, deliberately not part of `actions`. §3 of the
+    /// templated-workflows design permits source positions only transiently --
+    /// during detection and during a live run -- and never as a durable
+    /// position-plus-content pair. Keeping them here means they are available
+    /// to pattern detection at stop and then dropped: they are not compiled,
+    /// not stored, and `CapturedAction` gains no source field, so every other
+    /// consumer of capture is unaffected.
+    ///
+    /// Empty for recordings that never copy, which includes every workflow
+    /// typed from the user reading the source with their eyes -- there is no
+    /// observable source interaction in that case, and a stated limitation is
+    /// better than an inferred source.
+    pub source_links: Vec<grid::SourceLink>,
 }
 
 /// One Record Mode capture session.
@@ -245,6 +261,14 @@ impl CaptureSession {
             exclusions,
             unmapped_events,
             pastes_observed: *self.pastes.lock().unwrap_or_else(|e| e.into_inner()),
+            // Drained rather than copied: the watcher must not hand the same
+            // positions to a second reader, and nothing should hold them after
+            // the report they belong to.
+            source_links: self
+                .grid
+                .lock()
+                .map(|mut g| g.take_links())
+                .unwrap_or_default(),
         })
     }
 
@@ -339,9 +363,17 @@ fn observe_grid(
     match event {
         // Keyboard events carry no `ui_element` -- measured, 0 of 15 key-downs
         // in a driven Sheets session -- so the watcher resolves focus itself.
-        WorkflowEvent::Keyboard(e) if e.is_key_down => {
-            grid.observe_key(e.key_code, e.metadata.timestamp.unwrap_or_else(now_ms))
-        }
+        // The modifier state is passed for one reason: Ctrl+C and Ctrl+V are
+        // where a value's SOURCE position can be observed, and only
+        // `capture::grid` knows what a spreadsheet cell is. One extra
+        // parameter through the seam that already exists, exactly as
+        // `note_click` took one -- the generic `to_candidate` path still knows
+        // nothing about spreadsheets or clipboards.
+        WorkflowEvent::Keyboard(e) if e.is_key_down => grid.observe_key(
+            e.key_code,
+            e.ctrl_pressed,
+            e.metadata.timestamp.unwrap_or_else(now_ms),
+        ),
 
         // Clicks never name the editor, but they do say which app is in play,
         // and the exclusion gate needs that.

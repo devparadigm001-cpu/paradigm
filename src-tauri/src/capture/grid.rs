@@ -47,7 +47,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use terminator::Desktop;
+use terminator::{Desktop, UIElement};
 
 use super::stream::{ActionCandidate, ActionKind};
 
@@ -180,6 +180,32 @@ struct GridEdit {
     started_ms: u64,
 }
 
+/// Where a value came from, paired with where it went.
+///
+/// **Transient by design.** §3 of the templated-workflows design permits source
+/// positions only during detection and during a live run, never as a durable
+/// position-plus-content pair. So this is a side channel on `CaptureReport`,
+/// consumed at stop and dropped -- it never enters the action stream, is never
+/// compiled, and is never written to the database. It also carries no VALUE:
+/// what was copied is not read, only where it was copied from and to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceLink {
+    /// Order within the session, so detection can collapse corrections by
+    /// keeping the last write to a destination.
+    pub seq: u64,
+    pub source_document: String,
+    pub source_cell: String,
+    pub destination_document: String,
+    pub destination_cell: String,
+}
+
+/// `C` and `V`. Copy and paste are the only clipboard keys this tracks; cut
+/// (`X`) is deliberately excluded, because a cut REMOVES the source row and a
+/// pattern inferred from vanishing sources would replay against data that is no
+/// longer there.
+const KEY_C: u32 = 0x43;
+const KEY_V: u32 = 0x56;
+
 /// Follows the transient cell editor and produces `Type` candidates.
 #[derive(Default)]
 pub struct GridCellWatcher {
@@ -190,6 +216,11 @@ pub struct GridCellWatcher {
     /// The sheet the user last switched to by clicking its tab, if any. Session
     /// -scoped: it lives as long as the watcher, which is one capture session.
     current_sheet: Option<String>,
+    /// Where the last Ctrl+C happened: (document, cell). Held until the next
+    /// copy replaces it, so one copy can legitimately feed several pastes.
+    pending_source: Option<(String, String)>,
+    /// Completed source -> destination pairs. Drained at stop.
+    links: Vec<SourceLink>,
 }
 
 impl GridCellWatcher {
@@ -246,13 +277,100 @@ impl GridCellWatcher {
         self.current_sheet.as_deref()
     }
 
+    /// Everything the session paired, drained.
+    pub fn take_links(&mut self) -> Vec<SourceLink> {
+        std::mem::take(&mut self.links)
+    }
+
+    /// Record a copy, or pair a paste with the copy that preceded it.
+    ///
+    /// Separated from the reading of the position so the PAIRING -- which is
+    /// where the correctness is -- can be tested without a live spreadsheet.
+    /// `position` is `(document, cell)`, already read.
+    ///
+    /// A paste with no preceding copy produces nothing. That is the honest
+    /// outcome rather than a guess: the value came from somewhere this session
+    /// did not see, and inventing a source would be worse than recording none.
+    fn pair_clipboard(&mut self, key_code: u32, position: (String, String), seq: u64) {
+        match key_code {
+            KEY_C => self.pending_source = Some(position),
+            KEY_V => {
+                if let Some((source_document, source_cell)) = self.pending_source.clone() {
+                    self.links.push(SourceLink {
+                        seq,
+                        source_document,
+                        source_cell,
+                        destination_document: position.0,
+                        destination_cell: position.1,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The focused window's document id and selected cell, read synchronously.
+    ///
+    /// Measured, and the reason this is a small change rather than a
+    /// restructuring: a sync walk from the focused element finds the Name Box in
+    /// ~50ms over 67 nodes, while the async locator takes ~450ms. `observe_grid`
+    /// holds a `std::sync::Mutex` inside an async pump, so an await here would
+    /// have meant taking the pump apart; it is not needed.
+    ///
+    /// Both facts come from one walk. The document id is required because two
+    /// blank spreadsheets share the window title "Untitled spreadsheet" -- the
+    /// same ambiguity that bit replay earlier -- so the title cannot tell a
+    /// source from a destination and the address bar's `/d/<id>/` can.
+    fn read_position(&mut self) -> Option<(String, String)> {
+        if self.desktop.is_none() {
+            self.desktop = Desktop::new_default().ok();
+        }
+        let focused = self.desktop.as_ref()?.focused_element().ok()?;
+
+        // Up to the window: the Name Box and the address bar are siblings of
+        // the focused element's subtree, not ancestors of it.
+        let mut root = focused.clone();
+        for _ in 0..12 {
+            match root.parent() {
+                Ok(Some(parent)) => {
+                    let reached_window = parent.role() == "Window";
+                    root = parent;
+                    if reached_window {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        let mut budget = 3000usize;
+        let mut cell = None;
+        let mut document = None;
+        collect_position(&root, 0, &mut budget, &mut cell, &mut document);
+        Some((document?, cell?))
+    }
+
     /// A key went down. Samples the editor, and emits when an edit finishes.
     ///
     /// Two things end an edit: a trigger key (Enter or Tab), and the editor
     /// reporting a *different* cell than the one being tracked, which is how a
     /// click into another cell mid-edit shows up.
-    pub fn observe_key(&mut self, key_code: u32, timestamp_ms: u64) -> Option<ActionCandidate> {
+    pub fn observe_key(
+        &mut self,
+        key_code: u32,
+        ctrl_pressed: bool,
+        timestamp_ms: u64,
+    ) -> Option<ActionCandidate> {
         let started = std::time::Instant::now();
+        // Clipboard first: a copy has no editor to sample, and a paste's
+        // destination must be read BEFORE the sampling below can disturb
+        // anything. Only ever runs on Ctrl+C / Ctrl+V, so the ~50ms walk it
+        // costs is not on the typing path.
+        if ctrl_pressed && (key_code == KEY_C || key_code == KEY_V) {
+            if let Some(position) = self.read_position() {
+                self.pair_clipboard(key_code, position, timestamp_ms);
+            }
+        }
         let out = self.observe_key_inner(key_code, timestamp_ms);
         GRID_CALLS.fetch_add(1, Ordering::Relaxed);
         GRID_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -395,6 +513,63 @@ impl GridCellWatcher {
     }
 }
 
+/// One descent collecting both facts a position needs: the selected cell from
+/// the Name Box, and the document id from the browser's address bar.
+///
+/// Bounded and depth-limited. It stops descending a branch once both are found,
+/// which is what keeps the measured cost at tens of milliseconds rather than a
+/// full-window walk.
+fn collect_position(
+    el: &UIElement,
+    depth: usize,
+    budget: &mut usize,
+    cell: &mut Option<String>,
+    document: &mut Option<String>,
+) {
+    if *budget == 0 || depth > 14 || (cell.is_some() && document.is_some()) {
+        return;
+    }
+    *budget -= 1;
+
+    let name = el.name().unwrap_or_default();
+    let trimmed = name.trim();
+
+    // The Name Box group holds an Edit reporting the selected cell reference.
+    if cell.is_none() && trimmed.starts_with("Name box") {
+        if let Ok(children) = el.children() {
+            if let Some(edit) = children.into_iter().find(|c| c.role() == "Edit") {
+                let text = edit.text(0).unwrap_or_default();
+                let reference = text.trim();
+                if looks_like_cell_ref(split_sheet_ref(reference).1) {
+                    *cell = Some(reference.to_string());
+                }
+            }
+        }
+    }
+
+    // The address bar carries /d/<id>/, which is the only thing that separates
+    // two documents both titled "Untitled spreadsheet".
+    if document.is_none() && trimmed == "Address and search bar" {
+        let url = el.text(0).unwrap_or_default();
+        if let Some(rest) = url.split("/d/").nth(1) {
+            if let Some(id) = rest.split('/').next() {
+                if !id.is_empty() {
+                    *document = Some(id.to_string());
+                }
+            }
+        }
+    }
+
+    if let Ok(children) = el.children() {
+        for child in children {
+            collect_position(&child, depth + 1, budget, cell, document);
+            if cell.is_some() && document.is_some() {
+                return;
+            }
+        }
+    }
+}
+
 /// Enter and Tab, the two keys that commit a cell edit.
 fn is_trigger_key(key_code: u32) -> bool {
     key_code == 0x0D || key_code == 0x09
@@ -403,6 +578,105 @@ fn is_trigger_key(key_code: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pos(document: &str, cell: &str) -> (String, String) {
+        (document.to_string(), cell.to_string())
+    }
+
+    #[test]
+    fn a_copy_then_paste_is_paired() {
+        let mut w = GridCellWatcher::new();
+        w.pair_clipboard(KEY_C, pos("orders", "C2"), 10);
+        w.pair_clipboard(KEY_V, pos("shipping", "B5"), 20);
+
+        let links = w.take_links();
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0],
+            SourceLink {
+                seq: 20,
+                source_document: "orders".into(),
+                source_cell: "C2".into(),
+                destination_document: "shipping".into(),
+                destination_cell: "B5".into(),
+            }
+        );
+        // Drained, not copied -- a second read must not re-deliver them.
+        assert!(w.take_links().is_empty());
+    }
+
+    #[test]
+    fn a_paste_with_no_preceding_copy_records_nothing() {
+        // The value came from somewhere this session never saw. Inventing a
+        // source would be worse than recording none.
+        let mut w = GridCellWatcher::new();
+        w.pair_clipboard(KEY_V, pos("shipping", "B5"), 10);
+        assert!(w.take_links().is_empty());
+    }
+
+    #[test]
+    fn each_copy_replaces_the_last_and_pairs_with_its_own_paste() {
+        // The shape the design's example produces: copy a row, paste it, copy
+        // the next, paste that. Each pair must be its own, or the mapping
+        // detection infers would be nonsense.
+        let mut w = GridCellWatcher::new();
+        w.pair_clipboard(KEY_C, pos("orders", "C2"), 1);
+        w.pair_clipboard(KEY_V, pos("shipping", "B5"), 2);
+        w.pair_clipboard(KEY_C, pos("orders", "C3"), 3);
+        w.pair_clipboard(KEY_V, pos("shipping", "B6"), 4);
+        w.pair_clipboard(KEY_C, pos("orders", "C4"), 5);
+        w.pair_clipboard(KEY_V, pos("shipping", "B7"), 6);
+
+        let links = w.take_links();
+        assert_eq!(links.len(), 3);
+        assert_eq!(
+            links
+                .iter()
+                .map(|l| (l.source_cell.as_str(), l.destination_cell.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("C2", "B5"), ("C3", "B6"), ("C4", "B7")]
+        );
+    }
+
+    #[test]
+    fn one_copy_may_feed_several_pastes() {
+        // Not an error: a user filling three cells from one source value is
+        // doing something real, and the pairing should describe it rather than
+        // silently drop the later pastes.
+        let mut w = GridCellWatcher::new();
+        w.pair_clipboard(KEY_C, pos("orders", "C2"), 1);
+        w.pair_clipboard(KEY_V, pos("shipping", "B5"), 2);
+        w.pair_clipboard(KEY_V, pos("shipping", "B6"), 3);
+        assert_eq!(w.take_links().len(), 2);
+    }
+
+    #[test]
+    fn keys_that_are_not_copy_or_paste_are_ignored() {
+        let mut w = GridCellWatcher::new();
+        w.pair_clipboard(0x58, pos("orders", "C2"), 1); // Ctrl+X, deliberately not tracked
+        w.pair_clipboard(0x41, pos("orders", "C2"), 2); // Ctrl+A
+        w.pair_clipboard(KEY_V, pos("shipping", "B5"), 3);
+        assert!(
+            w.take_links().is_empty(),
+            "only a real copy may arm a paste"
+        );
+    }
+
+    #[test]
+    fn a_link_carries_positions_and_never_a_value() {
+        // §3's rule: the durable-shaped data is structural. A SourceLink has no
+        // field that could hold what was copied, and this fails if one is
+        // added -- the same guard as workflow_processed_rows.
+        let mut w = GridCellWatcher::new();
+        w.pair_clipboard(KEY_C, pos("orders", "C2"), 1);
+        w.pair_clipboard(KEY_V, pos("shipping", "B5"), 2);
+        let printed = format!("{:?}", w.take_links()[0]);
+        assert!(printed.contains("C2") && printed.contains("B5"));
+        assert!(
+            !printed.to_lowercase().contains("value") && !printed.contains("text"),
+            "a link must not carry content: {printed}"
+        );
+    }
 
     #[test]
     fn a_sheet_tab_click_is_recognised_and_ordinary_clicks_are_not() {

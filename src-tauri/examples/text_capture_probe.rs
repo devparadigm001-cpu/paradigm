@@ -7543,6 +7543,168 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// --------------------------------------------------- sheetscopylive mode ----
+//
+// Source-position capture end to end: a real capture session watching a real
+// copy-paste across two documents, checking that the PAIRS are right -- not
+// merely that positions can be read one at a time, which `sheetscopy` already
+// established.
+//
+// Three copy-paste rounds, source rows advancing, destination rows advancing.
+// That is exactly the shape §4.1's Rule of 3 looks for, so a correct result
+// here is the input detection has been waiting for.
+async fn sheetscopylive_mode() -> ExitCode {
+    use paradigm_lib::capture::{CaptureSession, ExclusionList};
+
+    println!("== live copy-paste, paired source and destination ==\n");
+
+    let browser = browser_order()[0];
+    let open = |url: String| async move {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "--new-window", &url])
+            .spawn()
+        {
+            let _ = c.wait();
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    };
+
+    open("https://sheets.new".to_string()).await;
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((_w, source_id)) = sheets_window(&desktop).await else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    println!("  source: {source_id}");
+    for (cell, value) in [("C2", "alpha"), ("C3", "beta"), ("C4", "gamma")] {
+        goto_sheet_via_namebox(&desktop, cell).await;
+        if let Ok(t) = desktop.focused_element() {
+            let _ = t.type_text(value, false);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Ok(c) = desktop.focused_element() {
+            let _ = c.press_key("{Tab}");
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+    println!("  seeded C2..C4");
+
+    open("https://sheets.new".to_string()).await;
+    let dest_id = sheets_window(&desktop)
+        .await
+        .map(|(_, id)| id)
+        .unwrap_or_default();
+    println!("  destination: {dest_id}");
+    if dest_id.is_empty() || dest_id == source_id {
+        println!("\n  INCONCLUSIVE: need two distinct documents.");
+        println!("\n  DOCUMENT IDs for cleanup: {source_id} {dest_id}");
+        return ExitCode::FAILURE;
+    }
+
+    let source_url = format!("https://docs.google.com/spreadsheets/d/{source_id}/edit");
+    let dest_url = format!("https://docs.google.com/spreadsheets/d/{dest_id}/edit");
+
+    // ---- record ------------------------------------------------------------
+    let session = match CaptureSession::start_session(
+        "copy-paste-pairs",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    println!("\n-- three copy-paste rounds --");
+    for (src_cell, dst_cell) in [("C2", "B5"), ("C3", "B6"), ("C4", "B7")] {
+        // Copy in the source.
+        open(source_url.clone()).await;
+        goto_sheet_via_namebox(&desktop, src_cell).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{ctrl}c");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Paste in the destination.
+        open(dest_url.clone()).await;
+        goto_sheet_via_namebox(&desktop, dst_cell).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{ctrl}v");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        println!("  {src_cell} -> {dst_cell}");
+    }
+
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // ---- what was paired ----------------------------------------------------
+    println!("\n================ PAIRED OBSERVATIONS ================\n");
+    println!("  pastes counted : {}", report.pastes_observed);
+    println!("  source links   : {}\n", report.source_links.len());
+    for l in &report.source_links {
+        println!(
+            "  {}!{}  ->  {}!{}",
+            &l.source_document[..8.min(l.source_document.len())],
+            l.source_cell,
+            &l.destination_document[..8.min(l.destination_document.len())],
+            l.destination_cell
+        );
+    }
+
+    println!("\n================ VERDICT ================\n");
+    let expected = [("C2", "B5"), ("C3", "B6"), ("C4", "B7")];
+    let got: Vec<(String, String)> = report
+        .source_links
+        .iter()
+        .map(|l| (l.source_cell.clone(), l.destination_cell.clone()))
+        .collect();
+    let pairs_right = got.len() == expected.len()
+        && got
+            .iter()
+            .zip(expected.iter())
+            .all(|((s, d), (es, ed))| s == es && d == ed);
+    let docs_right = report
+        .source_links
+        .iter()
+        .all(|l| l.source_document == source_id && l.destination_document == dest_id);
+
+    println!("  pairs in order      : {pairs_right}  {got:?}");
+    println!("  documents correct   : {docs_right}");
+    println!(
+        "  no content captured : {}",
+        !format!("{:?}", report.source_links).contains("alpha")
+    );
+    println!();
+    if pairs_right && docs_right {
+        println!("  PASS. Every paste is paired with the copy that fed it, in the right");
+        println!("  document, with source and destination advancing together -- the exact");
+        println!("  input the Rule-of-3 check needs and had no producer for.");
+    } else {
+        println!("  FAIL -- see above.");
+    }
+
+    println!("\n  DOCUMENT IDs for cleanup: {source_id} {dest_id}");
+    ExitCode::SUCCESS
+}
+
 // ------------------------------------------------------- sheetscopy mode ----
 //
 // Can capture learn WHERE a value was copied from, at the moment Ctrl+C happens?
@@ -11517,6 +11679,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetscopylive") {
+        return sheetscopylive_mode().await;
     }
     if std::env::args().any(|a| a == "sheetscopy") {
         return sheetscopy_mode().await;
