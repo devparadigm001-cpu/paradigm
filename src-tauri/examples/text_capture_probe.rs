@@ -7543,6 +7543,270 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------- sheetscopy mode ----
+//
+// Can capture learn WHERE a value was copied from, at the moment Ctrl+C happens?
+//
+// Three questions, and the answers decide whether source-position capture is a
+// small change to capture::grid or a restructuring of it:
+//
+//   1. At rest -- a cell SELECTED but not being edited -- does the focused
+//      element carry the cell reference? `GridCellWatcher::sample` relies on it
+//      during editing (the editor's NAME is the cell), and if that held at rest
+//      too, nothing else would be needed. Measured as `name: None` once
+//      already; this confirms it deliberately.
+//   2. If not, does the Name Box report the selected cell, and can it be found
+//      SYNCHRONOUSLY? `observe_grid` holds a std Mutex inside an async pump, so
+//      an await there would be wrong. A sync walk from the focused element is
+//      the alternative, and its cost is the thing to measure.
+//   3. With two documents open, does a Name Box read find the FOREGROUND
+//      window's? Pairing a copy with a later paste depends on telling the two
+//      apart.
+async fn sheetscopy_mode() -> ExitCode {
+    println!("== can the source cell be read at Ctrl+C time? ==\n");
+
+    let browser = browser_order()[0];
+    let open = |url: &'static str| async move {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, "--new-window", url])
+            .spawn()
+        {
+            let _ = c.wait();
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    };
+
+    // ---- two documents ------------------------------------------------------
+    println!("-- opening the SOURCE document --");
+    open("https://sheets.new").await;
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((_w, source_id)) = sheets_window(&desktop).await else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    println!("  source document: {source_id}");
+
+    // Seed two cells so a selection has something real under it.
+    for (cell, value) in [("C2", "alpha"), ("C3", "beta")] {
+        goto_sheet_via_namebox(&desktop, cell).await;
+        if let Ok(t) = desktop.focused_element() {
+            let _ = t.type_text(value, false);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Ok(c) = desktop.focused_element() {
+            let _ = c.press_key("{Tab}");
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+    println!("  seeded C2, C3");
+
+    println!("\n-- opening the DESTINATION document --");
+    open("https://sheets.new").await;
+    let dest_id = sheets_window(&desktop)
+        .await
+        .map(|(_, id)| id)
+        .unwrap_or_default();
+    println!("  destination document: {dest_id}");
+    if dest_id == source_id || dest_id.is_empty() {
+        println!("\n  INCONCLUSIVE: could not get two distinct documents.");
+        println!("\n  DOCUMENT IDs for cleanup: {source_id} {dest_id}");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- helpers ------------------------------------------------------------
+
+    /// Walk up to a window-like ancestor, then hunt down for the Name Box.
+    /// Entirely synchronous -- this is the mechanism under test.
+    fn name_box_sync(from: &UIElement, budget: &mut usize) -> Option<UIElement> {
+        // Up first: the Name Box is a sibling subtree, not an ancestor.
+        let mut root = from.clone();
+        for _ in 0..12 {
+            match root.parent() {
+                Ok(Some(p)) => {
+                    let is_window = p.role() == "Window" || p.role() == "Pane";
+                    root = p;
+                    if is_window {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        fn descend(el: &UIElement, depth: usize, budget: &mut usize) -> Option<UIElement> {
+            if *budget == 0 || depth > 12 {
+                return None;
+            }
+            *budget -= 1;
+            if el.name().unwrap_or_default().trim().starts_with("Name box") {
+                if let Ok(kids) = el.children() {
+                    if let Some(edit) = kids.into_iter().find(|k| k.role() == "Edit") {
+                        return Some(edit);
+                    }
+                }
+            }
+            if let Ok(kids) = el.children() {
+                for k in kids {
+                    if let Some(found) = descend(&k, depth + 1, budget) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        descend(&root, 0, budget)
+    }
+
+    // ---- 1 + 2: select a cell in the SOURCE, then Ctrl+C --------------------
+    println!("\n================ SOURCE: select C2, then Ctrl+C ================\n");
+    // Re-open the source by URL so it is unambiguously foreground.
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "start",
+            "",
+            browser,
+            &format!("https://docs.google.com/spreadsheets/d/{source_id}/edit"),
+        ])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    goto_sheet_via_namebox(&desktop, "C2").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // The copy itself. "{ctrl}c" contains no ENTER, so the {LEFT}{END}
+    // injection documented in press-key-enter-injects-end-keystroke.md does not
+    // apply here.
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{ctrl}c");
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // 1. What does the focused element say, at rest?
+    match desktop.focused_element() {
+        Ok(el) => {
+            let a = el.attributes();
+            println!("  focused role  : {:?}", a.role);
+            println!("  focused name  : {:?}", a.name);
+            println!("  focused value : {:?}", a.value);
+            println!(
+                "  is_cell_editor(role, name): {}",
+                paradigm_lib::capture::grid::is_cell_editor(
+                    &a.role,
+                    &a.name.clone().unwrap_or_default()
+                )
+            );
+        }
+        Err(e) => println!("  no focused element: {e}"),
+    }
+
+    // 2. The sync walk, timed.
+    println!();
+    match desktop.focused_element() {
+        Ok(el) => {
+            let started = std::time::Instant::now();
+            let mut budget = 4000usize;
+            let found = name_box_sync(&el, &mut budget);
+            let elapsed = started.elapsed();
+            match found {
+                Some(nb) => {
+                    println!("  SYNC Name Box found in {:?}", elapsed);
+                    println!("    nodes visited : {}", 4000 - budget);
+                    println!("    reads         : {:?}", nb.text(0).ok());
+                }
+                None => println!(
+                    "  SYNC Name Box NOT found ({:?}, {} nodes)",
+                    elapsed,
+                    4000 - budget
+                ),
+            }
+        }
+        Err(e) => println!("  no focused element for the sync walk: {e}"),
+    }
+
+    // Async baseline, for comparison. Plainly awaited -- an earlier draft
+    // reached for block_on inside this async fn, which on a tokio runtime is a
+    // deadlock waiting to happen rather than a shortcut.
+    let started = std::time::Instant::now();
+    let mut async_read: Option<String> = None;
+    if let Some((w, _)) = sheets_window(&desktop).await {
+        if let Ok(groups) = desktop
+            .locator("name:Name box")
+            .within(w)
+            .all(Some(Duration::from_secs(4)), None)
+            .await
+        {
+            async_read = groups
+                .into_iter()
+                .next()
+                .and_then(|g| {
+                    g.children()
+                        .ok()
+                        .and_then(|c| c.into_iter().find(|e| e.role() == "Edit"))
+                })
+                .and_then(|e| e.text(0).ok());
+        }
+    }
+    println!(
+        "\n  ASYNC Name Box reads {async_read:?} in {:?}",
+        started.elapsed()
+    );
+
+    // ---- 3: switch to the DESTINATION, read again ---------------------------
+    println!("\n================ DESTINATION: foreground, read again ================\n");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "start",
+            "",
+            browser,
+            &format!("https://docs.google.com/spreadsheets/d/{dest_id}/edit"),
+        ])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    goto_sheet_via_namebox(&desktop, "B5").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let dest_read = match desktop.focused_element() {
+        Ok(el) => {
+            let mut budget = 4000usize;
+            name_box_sync(&el, &mut budget).and_then(|nb| nb.text(0).ok())
+        }
+        Err(_) => None,
+    };
+    let addr_now = sheets_window(&desktop)
+        .await
+        .map(|(_, id)| id)
+        .unwrap_or_default();
+    println!("  sync Name Box reads : {dest_read:?}   (expected B5)");
+    println!("  window's document   : {addr_now}");
+    println!("  source document     : {source_id}");
+    println!(
+        "  the two are distinguishable: {}",
+        addr_now != source_id && !addr_now.is_empty()
+    );
+
+    println!("\n================ VERDICT ================\n");
+    println!("  1. focused element carries the cell at rest : see above (expect NO)");
+    println!("  2. sync Name Box read works                 : see timings above");
+    println!("  3. async read agreed                        : {async_read:?}");
+    println!("  4. foreground window is identifiable        : see above");
+
+    println!("\n  DOCUMENT IDs for cleanup: {source_id} {dest_id}");
+    ExitCode::SUCCESS
+}
+
 // ----------------------------------------------------- sourcereader mode ----
 //
 // The SpreadsheetReader against a real sheet. Its geometry and reference rules
@@ -11253,6 +11517,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetscopy") {
+        return sheetscopy_mode().await;
     }
     if std::env::args().any(|a| a == "sourcereader") {
         return sourcereader_mode().await;
