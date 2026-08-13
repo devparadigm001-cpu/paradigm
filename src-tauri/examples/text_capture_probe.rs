@@ -11874,6 +11874,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "sheetsreplaytab") {
         return sheetsreplaytab_mode().await;
     }
+    if std::env::args().any(|a| a == "templatedrun") {
+        return templatedrun_mode().await;
+    }
     if std::env::args().any(|a| a == "sheetsmanual") {
         return sheetsmanual_mode().await;
     }
@@ -12354,4 +12357,452 @@ async fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// templatedrun -- the first end-to-end run of the templated-workflow loop
+// against a real spreadsheet, with CSV export as ground truth.
+//
+// Everything before this proved the loop against fakes. Fakes cannot show that
+// the Name Box navigation, the type-and-commit sequence, the read-back check
+// and the run loop's ordering all hold together on a live surface -- so this
+// exercises read -> map -> write -> mark done -> pause -> resume, and then
+// re-runs to prove the ledger really prevents a second write.
+//
+// Ground truth is `export?format=csv&gid=<n>`, downloaded per sheet, never the
+// UI that produced the edit. The destination is checked for the values it
+// should hold AND the source is checked to confirm it was not written to --
+// checking only the destination would pass a run that wrote to both.
+// ---------------------------------------------------------------------------
+
+/// A destination writer that fires a control action partway through, so a pause
+/// can be made to land mid-record on a real sheet rather than between records.
+struct PausingWriter {
+    inner: paradigm_lib::run::spreadsheet::SpreadsheetWriter,
+    control: paradigm_lib::run::RunControl,
+    calls: usize,
+    pause_on: usize,
+    fired: bool,
+}
+
+impl paradigm_lib::run::DestinationWriter for PausingWriter {
+    fn position(&self) -> String {
+        self.inner.position()
+    }
+
+    fn write(&mut self, field: &str, value: &str) -> Result<(), paradigm_lib::source::SourceError> {
+        self.calls += 1;
+        let result = self.inner.write(field, value);
+
+        // Paused AFTER the write returns, not before it.
+        //
+        // Pausing first looked equivalent and was not: a real write takes about
+        // three seconds, and the resumer thread saw the pause, waited, and
+        // resumed all while that write was still in flight -- so by the time
+        // the loop reached its pause check the run was Running again and no
+        // redo happened. The first live run reported "a record was redone:
+        // false" for exactly this reason, with nothing wrong in the loop.
+        //
+        // Firing here leaves microseconds between the pause and the loop
+        // observing it, which is the same ordering the unit tests rely on.
+        if self.calls == self.pause_on && !self.fired {
+            self.fired = true;
+            println!(
+                "    [pausing after write #{} -- mid-record, so the record must be redone]",
+                self.calls
+            );
+            self.control.pause();
+        }
+        result
+    }
+
+    fn advance(&mut self, step: i64) -> Result<(), paradigm_lib::source::SourceError> {
+        self.inner.advance(step)
+    }
+}
+
+async fn templatedrun_mode() -> ExitCode {
+    use paradigm_lib::compile::CompiledTemplate;
+    use paradigm_lib::detect::FieldMapping;
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::{DestinationWriter, RunControl, RunStop};
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+
+    println!("== templatedrun: the run loop against a real spreadsheet ==\n");
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A fresh document, so nothing here depends on what a previous run left
+    // behind and the ledger starts genuinely empty.
+    let browser = "msedge";
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let Some((_w, doc_id)) = sheets_window(&desktop).await else {
+        eprintln!("no 'Untitled spreadsheet' window: not signed in, or it did not load");
+        return ExitCode::FAILURE;
+    };
+    println!("doc id: {doc_id}");
+
+    if !ensure_second_sheet(&desktop).await {
+        eprintln!("could not create a second sheet");
+        return ExitCode::FAILURE;
+    }
+
+    // gids, needed for the per-sheet CSV export -- the default export returns
+    // whichever sheet is first, which would silently check the wrong one.
+    //
+    // Discovered via the Name Box, NOT by clicking tabs. Clicking a sheet tab
+    // was measured failing repeatedly in this desktop state (the click is
+    // accepted and the page never sees it), while a qualified Name Box
+    // reference kept working. Setup uses the mechanism known to work.
+    let gid2 = match goto_sheet_via_namebox(&desktop, "Sheet2!A1").await {
+        Some(g) => g,
+        None => {
+            eprintln!("could not reach Sheet2 via the Name Box");
+            return ExitCode::FAILURE;
+        }
+    };
+    let gid1 = match goto_sheet_via_namebox(&desktop, "Sheet1!A1").await {
+        Some(g) => g,
+        None => {
+            eprintln!("could not reach Sheet1 via the Name Box");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("Sheet1 gid={gid1}  Sheet2 gid={gid2}\n");
+
+    // ---- 1. Seed the source ------------------------------------------------
+    //
+    // Written through the same SpreadsheetWriter the run will use, pointed at
+    // Sheet1. That is deliberate: if the writer cannot put values into a sheet
+    // reliably, this fails here, before anything about the run loop is in
+    // question.
+    let rows = [("Acme", "100"), ("Globex", "200"), ("Initech", "300")];
+    println!("-- seeding Sheet1 C2:D4 --");
+    {
+        let Some((window, _)) = sheets_window(&desktop).await else {
+            eprintln!("lost the spreadsheet window before seeding");
+            return ExitCode::FAILURE;
+        };
+        let mut seeder = match SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet1"),
+            Some("Sheet1".to_string()),
+            2,
+        )
+        .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("could not open a writer on Sheet1: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        for (name, amount) in rows {
+            if let Err(e) = seeder.write("C", name) {
+                eprintln!("seeding C failed: {e}");
+                return ExitCode::FAILURE;
+            }
+            if let Err(e) = seeder.write("D", amount) {
+                eprintln!("seeding D failed: {e}");
+                return ExitCode::FAILURE;
+            }
+            if let Err(e) = seeder.advance(1) {
+                eprintln!("seeding advance failed: {e}");
+                return ExitCode::FAILURE;
+            }
+            println!("   seeded {name}/{amount}");
+        }
+    }
+
+    // ---- 2. Build a real playbook and template -----------------------------
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("db: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut stream = paradigm_lib::capture::CapturedStream::new(
+        paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
+    );
+    stream.admit(paradigm_lib::capture::ActionCandidate {
+        kind: paradigm_lib::capture::ActionKind::Click,
+        identifiers: vec!["msedge.exe".into()],
+        process_name: None,
+        element_role: Some("Button".into()),
+        element_name: Some("Next".into()),
+        payload: None,
+        detail: None,
+        timestamp_ms: 0,
+    });
+    let playbook = paradigm_lib::compile::compile(
+        stream.actions(),
+        "Templated run probe",
+        &paradigm_lib::compile::ReversibilityPolicy::placeholder(),
+        &paradigm_lib::labeling::RedactionPolicy::placeholder(),
+    );
+    let template = CompiledTemplate {
+        source_id: format!("{doc_id}!Sheet1"),
+        destination_id: format!("{doc_id}!Sheet2"),
+        source_step: 1,
+        destination_step: 1,
+        examples: 3,
+        fields: vec![
+            FieldMapping {
+                source_field: "C".into(),
+                destination_field: "A".into(),
+            },
+            FieldMapping {
+                source_field: "D".into(),
+                destination_field: "B".into(),
+            },
+        ],
+    };
+    let playbook = playbook.with_template(template.clone());
+    if let Err(e) = paradigm_lib::compile::store::store(&mut conn, &playbook) {
+        eprintln!("store: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("\nplaybook {} stored, template attached", playbook.id);
+
+    // ---- 3. The run, with a pause landing mid-record ------------------------
+    println!("\n-- run 1: three records, paused mid-record and resumed --");
+    let Some((window, _)) = sheets_window(&desktop).await else {
+        eprintln!("lost the spreadsheet window");
+        return ExitCode::FAILURE;
+    };
+
+    let mut reader = match SpreadsheetReader::open(
+        desktop.clone(),
+        &window,
+        format!("{doc_id}!Sheet1"),
+        Some("Sheet1".to_string()),
+        2,
+        1,
+        vec!["C".into(), "D".into()],
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not open the source reader: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let inner = match SpreadsheetWriter::open(
+        desktop.clone(),
+        &window,
+        format!("{doc_id}!Sheet2"),
+        Some("Sheet2".to_string()),
+        2,
+    )
+    .await
+    {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("could not open the destination writer: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let control = RunControl::new();
+    // Write #3 is record 2's FIRST field, so the pause lands between record 2's
+    // two fields -- the case that must be redone from the start.
+    let mut writer = PausingWriter {
+        inner,
+        control: control.clone(),
+        calls: 0,
+        pause_on: 3,
+        fired: false,
+    };
+
+    let resumer = {
+        let c = control.clone();
+        std::thread::spawn(move || {
+            while !c.is_paused() {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(1500));
+            println!("    [resuming]");
+            c.resume();
+        })
+    };
+
+    let report = match paradigm_lib::run::run_with_control(
+        &conn,
+        &playbook.id,
+        &template,
+        &mut reader,
+        &mut writer,
+        &control,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("run refused to start: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let _ = resumer.join();
+
+    println!("\n  stop      : {:?}", report.stop);
+    println!("  written   : {}", report.written());
+    println!("  skipped   : {}", report.skipped());
+    println!("  writes    : {} (a redo means more than 6)", writer.calls);
+    for r in &report.records {
+        println!(
+            "    row {} -> dest {} : {:?}",
+            r.position.row_key, r.destination, r.outcome
+        );
+    }
+
+    // ---- 4. Ground truth ----------------------------------------------------
+    println!("\n-- CSV ground truth --");
+    let Some(csv2) = download_csv(browser, &doc_id, &gid2).await else {
+        eprintln!("could not download the Sheet2 export; cannot verify");
+        return ExitCode::FAILURE;
+    };
+    println!("Sheet2 CSV:\n{}", csv2.trim());
+
+    // `csv_at` is 1-BASED on both axes -- column A is 1, and the row is the
+    // spreadsheet's own row number. Getting this wrong is not harmless: passing
+    // column 0 makes it return None for every cell, so a check written that way
+    // reports "empty" regardless of what is actually there and proves nothing.
+    let mut ok = true;
+    for (i, (name, amount)) in rows.iter().enumerate() {
+        let row = i + 2;
+        let a = csv_at(&csv2, 1, row).unwrap_or_default();
+        let b = csv_at(&csv2, 2, row).unwrap_or_default();
+        let good = a.trim() == *name && b.trim() == *amount;
+        println!(
+            "  Sheet2 A{row}={a:?} B{row}={b:?}  expected {name:?}/{amount:?}  {}",
+            if good { "OK" } else { "WRONG" }
+        );
+        ok &= good;
+    }
+
+    // The source must be untouched, checked two ways. Confirming only that the
+    // destination is right would pass a run that also wrote into its source,
+    // and confirming only that column A is empty would pass a run that had
+    // wiped the source entirely.
+    let Some(csv1) = download_csv(browser, &doc_id, &gid1).await else {
+        eprintln!("could not download the Sheet1 export; cannot verify the source");
+        return ExitCode::FAILURE;
+    };
+    println!("Sheet1 CSV:\n{}", csv1.trim());
+    for (i, (name, amount)) in rows.iter().enumerate() {
+        let row = i + 2;
+        let a = csv_at(&csv1, 1, row).unwrap_or_default();
+        let c = csv_at(&csv1, 3, row).unwrap_or_default();
+        let d = csv_at(&csv1, 4, row).unwrap_or_default();
+        let good = a.trim().is_empty() && c.trim() == *name && d.trim() == *amount;
+        println!(
+            "  Sheet1 A{row}={a:?} (empty) C{row}={c:?} D{row}={d:?} (intact)  {}",
+            if good { "OK" } else { "WRONG" }
+        );
+        ok &= good;
+    }
+
+    // ---- 5. Re-run: the ledger must prevent a second write ------------------
+    println!("\n-- run 2: same source, nothing new --");
+    let Some((window, _)) = sheets_window(&desktop).await else {
+        eprintln!("lost the window before the re-run");
+        return ExitCode::FAILURE;
+    };
+    let mut reader2 = match SpreadsheetReader::open(
+        desktop.clone(),
+        &window,
+        format!("{doc_id}!Sheet1"),
+        Some("Sheet1".to_string()),
+        2,
+        1,
+        vec!["C".into(), "D".into()],
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("reader: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut writer2 = match SpreadsheetWriter::open(
+        desktop.clone(),
+        &window,
+        format!("{doc_id}!Sheet2"),
+        Some("Sheet2".to_string()),
+        2,
+    )
+    .await
+    {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("writer: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let report2 = match paradigm_lib::run::run(
+        &conn,
+        &playbook.id,
+        &template,
+        &mut reader2,
+        &mut writer2,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("re-run refused: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  stop    : {:?}", report2.stop);
+    println!("  written : {} (must be 0)", report2.written());
+    println!("  skipped : {} (must be 3)", report2.skipped());
+    let rerun_ok = report2.written() == 0 && report2.skipped() == 3;
+    ok &= rerun_ok;
+
+    println!("\n== VERDICT ==");
+    println!(
+        "  run 1 completed cleanly     : {}",
+        report.stop == RunStop::Exhausted
+    );
+    println!("  a record was redone         : {}", writer.calls > 6);
+    println!("  destination matches source  : {ok}");
+    println!(
+        "\n{}",
+        if ok && report.stop == RunStop::Exhausted {
+            "PASS -- the loop drove a real spreadsheet end to end"
+        } else {
+            "FAIL -- see above"
+        }
+    );
+
+    if ok && report.stop == RunStop::Exhausted {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
