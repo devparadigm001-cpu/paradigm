@@ -7543,6 +7543,197 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// --------------------------------------------------- sheetsreplaytab mode ----
+//
+// One narrow question, and nothing else: does a SYNTHETIC click on the element
+// the recorder actually captured -- `role:text|name:Sheet1`, the Text node
+// inside the tab button -- switch sheets?
+//
+// It is worth asking separately because the automated runs only ever clicked at
+// the `Button` level, and those failed. The recorder attributes the click one
+// level deeper. See "Route 1, answered by a human click" in
+// docs/known-issues/complex-web-grid-capture-unreliable.md.
+//
+// The playbook is built from the real captured shape, through the real
+// exclusion gate and the real compiler, so the selector under test is the one
+// replay would genuinely resolve -- not a hand-written string.
+//
+// Success is the gid moving to 0. That is the direct observable for "the sheet
+// changed", needs no typing, and cannot be faked by a step reporting Ok.
+async fn sheetsreplaytab_mode() -> ExitCode {
+    use paradigm_lib::capture::{ActionCandidate, ActionKind, CapturedStream, ExclusionList};
+    use paradigm_lib::compile::{compile, store, ReversibilityPolicy};
+    use paradigm_lib::labeling::RedactionPolicy;
+
+    println!("== does replay's click on role:text|name:Sheet1 switch sheets? ==\n");
+
+    let browser = browser_order()[0];
+    let doc_arg = std::env::args().find(|a| {
+        a.len() >= 40
+            && a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    });
+    let url = match &doc_arg {
+        Some(id) => format!("https://docs.google.com/spreadsheets/d/{id}/edit"),
+        None => "https://sheets.new".to_string(),
+    };
+    println!("  opening {url}");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", &url])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((window, doc_id)) = sheets_window(&desktop).await else {
+        println!("  INCONCLUSIVE: no Sheets window.");
+        return ExitCode::FAILURE;
+    };
+    println!("  document: {doc_id}");
+
+    // The target must exist, and the document must NOT already be on it.
+    if !ensure_second_sheet(&desktop).await {
+        println!("\n  INCONCLUSIVE: could not get a second sheet.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::FAILURE;
+    }
+    let mut gid_before = current_gid(&desktop).await;
+    if gid_before.as_deref() == Some("0") {
+        println!("  on Sheet1 already; moving to Sheet2 so a switch is required");
+        gid_before = goto_sheet_via_namebox(&desktop, "Sheet2!A1").await;
+    }
+    println!("  showing gid before replay: {gid_before:?}");
+    if gid_before.as_deref() == Some("0") || gid_before.is_none() {
+        println!("\n  INCONCLUSIVE: could not park the document off Sheet1, so a replay");
+        println!("  that changed nothing would be indistinguishable from one that worked.");
+        println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+        return ExitCode::FAILURE;
+    }
+
+    // Is the captured element even resolvable here?
+    let matches = desktop
+        .locator("role:text|name:Sheet1")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .map(|v| v.len())
+        .unwrap_or(0);
+    println!("  elements matching role:text|name:Sheet1 : {matches}");
+
+    // ---- the playbook, built from the REAL captured shape -------------------
+    let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
+    stream.admit(ActionCandidate {
+        kind: ActionKind::Click,
+        identifiers: vec!["msedge.exe".into()],
+        process_name: Some("msedge.exe".into()),
+        // Exactly what sheetsmanual recorded from the human click.
+        element_role: Some("text".into()),
+        element_name: Some("Sheet1".into()),
+        payload: None,
+        detail: None,
+        timestamp_ms: 0,
+    });
+    let actions = stream.actions().to_vec();
+    if actions.is_empty() {
+        println!("  the action did not survive the exclusion gate; cannot test.");
+        return ExitCode::FAILURE;
+    }
+    let playbook = compile(
+        &actions,
+        "Replay Tab Click",
+        &ReversibilityPolicy::placeholder(),
+        &RedactionPolicy::placeholder(),
+    );
+    for s in &playbook.steps {
+        let sel = serde_json::from_str::<serde_json::Value>(&s.action_payload_json)
+            .ok()
+            .and_then(|v| v["target"]["selector"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "<none>".into());
+        println!("  step [{}] {} selector={sel:?}", s.step_order, s.action_type);
+    }
+
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("temp db failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = store::store(&mut conn, &playbook) {
+        eprintln!("store failed: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- replay -------------------------------------------------------------
+    println!("\n================ REPLAY ================\n");
+    let run = match paradigm_lib::replay::replay(&mut conn, &desktop, &playbook.id).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("replay failed to run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  status: {}", run.status);
+    for o in &run.outcomes {
+        println!("  [{}] {:<9} {}", o.step_order, o.action_type, o.result.label());
+        for line in o.detail.lines() {
+            println!("       {line}");
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let gid_after = current_gid(&desktop).await;
+
+    println!("\n================ VERDICT ================\n");
+    println!("  gid before : {gid_before:?}");
+    println!("  gid after  : {gid_after:?}");
+
+    // "The sheet did not change" has two completely different causes and the
+    // first version of this collapsed them, reporting "replay clicked and the
+    // document stayed put" for a run where replay REFUSED and never clicked.
+    // Whether a click was actually attempted is the thing that decides which
+    // question the run answered.
+    let clicked = run.outcomes.iter().any(|o| !o.result.is_failure());
+    let switched = gid_after.as_deref() == Some("0");
+
+    match (clicked, switched) {
+        (true, true) => {
+            println!("\n  SWITCHED. A synthetic click on the captured Text node DOES change");
+            println!("  sheets, even though Button-level clicks did not. Route 1 works end");
+            println!("  to end for the explicit-switch case.");
+        }
+        (true, false) => {
+            println!("\n  CLICKED, BUT DID NOT SWITCH. Replay acted on the recorded element");
+            println!("  and the document stayed put -- the same failure Button-level clicks");
+            println!("  had. Capture is not the blocker; the click is.");
+        }
+        (false, _) => {
+            println!("\n  UNANSWERED -- replay never clicked. Every step failed before acting,");
+            println!("  so nothing was learned about whether the click would have worked.");
+            println!("  See the step detail above for why it refused. This is NOT evidence");
+            println!("  that the click fails.");
+        }
+    }
+    println!("\n  DOCUMENT ID for cleanup: {doc_id}");
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------- sheetsmanual mode ----
 //
 // The one gesture five automated runs could not produce: a HUMAN clicking a
@@ -9410,6 +9601,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsreplaytab") {
+        return sheetsreplaytab_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsmanual") {
         return sheetsmanual_mode().await;

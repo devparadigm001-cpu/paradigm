@@ -1327,6 +1327,86 @@ record mode captures system-wide. Unrelated to this question, and already filed
 as `record-mode-unscoped-system-wide-capture.md`, but worth noting that a real
 recording of this gesture carries noise a user would have to trim.
 
+## Route 1 replay: the click does NOT switch sheets (2026-08-12)
+
+The narrow question left by the human-click result: replay would click the
+`Text` node the recorder captured, not the `Button` the earlier automated runs
+clicked. Does *that* click work?
+
+**No.** `text_capture_probe -- sheetsreplaytab` builds a playbook from exactly
+the captured shape — through the real exclusion gate and the real compiler, so
+the selector under test is the one replay genuinely resolves — parks a
+multi-sheet document off Sheet1, and replays.
+
+```
+  showing gid before replay: Some("1830015066")
+  elements matching role:text|name:Sheet1 : 1
+  step [1] click selector="role:text|name:Sheet1"
+
+  status: completed
+  [1] click  executed (coordinate-click fallback)
+       element.click() refused (Element not visible); clicked real
+       coordinates (2128, 648) instead -- known multi-monitor defect
+
+  gid before : Some("1830015066")
+  gid after  : Some("1830015066")
+```
+
+The click **executed** — it is not a refusal — and the document did not move.
+Same outcome as the Button-level clicks. So capture is not the blocker for route
+1; the click is.
+
+### A second, independent blocker found on the way
+
+The first attempt never clicked at all:
+
+```
+  [1] click FAILED (selector is ambiguous)
+       selector "role:text|name:Sheet1" matches 2 elements that all carry
+       the recorded name "Sheet1"
+```
+
+A stale Sheets window from an earlier run was open, and its tab bar has a
+`Sheet1` too. `role:text|name:Sheet1` carries **no scoping to a document or
+process**, so it is ambiguous whenever the user has a second spreadsheet open —
+which is not an edge case for someone automating spreadsheet work.
+
+That would block route 1 even if the click worked, and it is worth separating
+from the click failure because it has a known remedy: `StepPayload::scoped_selector`
+already exists and is unused by replay (see `replay-window-selector-ambiguity.md`).
+Note the ambiguity check behaved exactly as designed here — it refused rather
+than silently clicking a tab in the wrong document.
+
+### The honest status of route 1
+
+| Half | Status |
+|---|---|
+| Capture records the sheet | **Works** — `role:text \| name:Sheet1`, human click, gid-verified |
+| Replay clicks it | **Fails** — click executes, sheet does not change |
+| Selector is unambiguous | **Fails** with a second spreadsheet open |
+
+Not fixed, and not close. The capture finding stands and is worth keeping — it
+is the only mechanism found so far that recovers sheet identity at all — but
+route 1 does not currently produce a working replay, and no fix was built on it.
+
+**One caveat on the click result, stated so it is not over-read.** This is a
+single trial, and the click went through the coordinate-click fallback because
+`element.click()` was refused by the multi-monitor `is_visible()` defect (see
+`terminator-multi-monitor-visibility.md`). The fallback is measured working
+elsewhere — it moved focus to a real input in the `multimon` probe — so this is
+not obviously a fallback failure. But "a coordinate click at the tab's centre
+does not activate a Sheets tab" is what was measured, on a window on the
+secondary display, and a machine without that defect might behave differently.
+
+### A third probe defect, same shape as the other two
+
+The first version of this probe printed "Replay acted on the recorded element and
+the document stayed put" for the run where replay **refused and never clicked**.
+It inferred a click from the absence of a sheet change. Now it distinguishes
+`clicked && switched`, `clicked && !switched`, and `never clicked` — and says
+plainly that the last is *not* evidence the click fails. Three probes in this
+file have now made the same mistake in three different ways.
+
 ### Two probe defects found while measuring, both self-inflicted
 
 Recorded because each produced a confident verdict from evidence that did not
@@ -1440,13 +1520,21 @@ exist, which is the failure shape this project keeps rediscovering.
       switch (1202380086 → 0). See "Route 1, answered by a human click". The
       sheet identity is recoverable by recording the *switch*, which the
       accessibility tree could not provide as state.
-- [ ] **Replay a captured tab click — the remaining half of route 1.** Capture
-      works; replay is unmeasured and specifically doubtful, because synthetic
-      clicks on Sheets chrome failed throughout the automated runs and replay
-      clicks the same way. Check first that clicking the inner `Text` node (what
-      the recorder attributes, not the `Button` the locator finds) actually
-      activates the tab. Then replay into a fresh multi-sheet document showing a
-      different sheet, and confirm per-sheet by CSV.
+- [x] ~~**Replay a captured tab click — the remaining half of route 1.**~~
+      **Tested 2026-08-12: it does not work.** The click executes — via the
+      coordinate fallback — and the sheet does not change (gid 1830015066
+      unchanged). A second, independent blocker surfaced too: the captured
+      selector `role:text|name:Sheet1` carries no document scoping and is
+      ambiguous whenever another spreadsheet is open. See "Route 1 replay".
+- [ ] **Decide whether route 1 is worth reviving.** Capture works and is the only
+      mechanism found that recovers sheet identity at all, so the finding is
+      worth keeping — but replay needs a way to activate a sheet tab that a
+      synthetic click does not currently provide, *and* the recorded selector
+      needs scoping. The Name Box qualified reference (`Sheet2!B2`, confirmed
+      working) remains the only measured way to reach another sheet
+      programmatically; a replay that translated a recorded tab click into a Name
+      Box navigation would use the proven mechanism instead of the failing one.
+      Untested, and a design change rather than a fix.
 - [x] ~~**Measure the per-keystroke cost.**~~ **Measured: 2.22 ms per keystroke,
       and a confirmed non-issue.** The suspicion did not survive an A/B — see
       "The per-keystroke cost, measured".
