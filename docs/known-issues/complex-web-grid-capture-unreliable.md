@@ -1371,11 +1371,20 @@ A stale Sheets window from an earlier run was open, and its tab bar has a
 process**, so it is ambiguous whenever the user has a second spreadsheet open —
 which is not an edge case for someone automating spreadsheet work.
 
-That would block route 1 even if the click worked, and it is worth separating
-from the click failure because it has a known remedy: `StepPayload::scoped_selector`
-already exists and is unused by replay (see `replay-window-selector-ambiguity.md`).
-Note the ambiguity check behaved exactly as designed here — it refused rather
-than silently clicking a tab in the wrong document.
+That would block route 1 even if the click worked. The ambiguity check itself
+behaved exactly as designed — it refused rather than silently clicking a tab in
+the wrong document.
+
+> **Correction (2026-08-12).** This section first said the gap "has a known
+> remedy: `StepPayload::scoped_selector`". **That is wrong and was measured
+> wrong.** A `process:` prefix cannot separate two spreadsheets, because they are
+> windows of the same `msedge.exe` — and the scoped query returns top-level
+> `Window` elements while ignoring the selector's role and name, dropping the
+> exact-name count from 3 to **0**. Wiring it in would have converted a correct
+> refusal into `Inconclusive` and a desktop-wide guess. The real remedy is
+> scoping to the document **window**, which replay's `navigate` already activates
+> but does not retain. Measured under "Re-measured 2026-08-12" in
+> `replay-window-selector-ambiguity.md`.
 
 ### The honest status of route 1
 

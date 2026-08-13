@@ -7543,6 +7543,122 @@ async fn sheetsmulti_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------- sheetsscope mode ----
+//
+// Would `StepPayload::scoped_selector` fix the ambiguity that made a tab-click
+// replay refuse? It builds `process:<name>|<selector>`, and the ambiguity was
+// two Sheets documents each owning a `Sheet1` tab.
+//
+// The premise is worth testing before implementing, because both documents live
+// in the SAME browser process. If that is so, a process prefix cannot separate
+// them and wiring it in would change nothing while looking like a fix.
+//
+// Measured directly: the desktop-wide count replay actually uses, against the
+// process-scoped count the proposed fix would use.
+async fn sheetsscope_mode() -> ExitCode {
+    println!("== can a process: prefix separate two spreadsheets? ==\n");
+    println!("Needs TWO Sheets documents open, each with a Sheet1 tab.\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Which windows are open, and what process owns each.
+    let windows = desktop
+        .locator("role:Window|name:Google Sheets")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .unwrap_or_default();
+    println!("  Sheets windows open: {}", windows.len());
+    for w in &windows {
+        let app = w
+            .application()
+            .ok()
+            .flatten()
+            .and_then(|a| a.name())
+            .unwrap_or_else(|| "-".into());
+        println!("    {:?}  application={app:?}", w.name().unwrap_or_default());
+    }
+    if windows.len() < 2 {
+        println!("\n  INCONCLUSIVE: need two Sheets documents open to test this.");
+        return ExitCode::FAILURE;
+    }
+
+    // 1. The desktop-wide resolution replay actually performs today.
+    println!("\n================ desktop-wide (what replay does) ================\n");
+    let wide = desktop
+        .locator("role:text|name:Sheet1")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .unwrap_or_default();
+    let wide_exact: Vec<_> = wide
+        .iter()
+        .filter(|e| {
+            paradigm_lib::replay::resolved_is_recorded_target(
+                "Sheet1",
+                &e.name().unwrap_or_default(),
+            )
+        })
+        .collect();
+    println!("  role:text|name:Sheet1");
+    println!("    raw matches          : {}", wide.len());
+    println!("    exact-name matches   : {}", wide_exact.len());
+    for e in wide_exact.iter().take(6) {
+        let win = e
+            .window()
+            .ok()
+            .flatten()
+            .and_then(|w| w.name())
+            .unwrap_or_else(|| "-".into());
+        println!("      in window {win:?}");
+    }
+
+    // 2. What the proposed fix would resolve instead.
+    println!("\n================ process-scoped (the proposed fix) ================\n");
+    for proc_name in ["msedge.exe", "chrome.exe"] {
+        let sel = format!("process:{proc_name}|role:text|name:Sheet1");
+        match desktop
+            .locator(sel.as_str())
+            .all(Some(Duration::from_secs(5)), None)
+            .await
+        {
+            Ok(found) => {
+                let exact = found
+                    .iter()
+                    .filter(|e| {
+                        paradigm_lib::replay::resolved_is_recorded_target(
+                            "Sheet1",
+                            &e.name().unwrap_or_default(),
+                        )
+                    })
+                    .count();
+                println!("  {sel}");
+                println!("    raw matches        : {}", found.len());
+                println!("    exact-name matches : {exact}");
+                for e in found.iter().take(6) {
+                    println!(
+                        "      role={:<10} name={:?}",
+                        e.role(),
+                        e.name().unwrap_or_default()
+                    );
+                }
+            }
+            Err(e) => println!("  {sel}\n    error: {e}"),
+        }
+    }
+
+    println!("\n================ VERDICT ================\n");
+    println!("  If both documents are in the same process, a process: prefix cannot");
+    println!("  separate them, and the exact-name count above will be unchanged.");
+    ExitCode::SUCCESS
+}
+
 // --------------------------------------------------- sheetsreplaytab mode ----
 //
 // One narrow question, and nothing else: does a SYNTHETIC click on the element
@@ -9601,6 +9717,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "closewins") {
         return closewins_mode().await;
+    }
+    if std::env::args().any(|a| a == "sheetsscope") {
+        return sheetsscope_mode().await;
     }
     if std::env::args().any(|a| a == "sheetsreplaytab") {
         return sheetsreplaytab_mode().await;

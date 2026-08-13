@@ -312,6 +312,23 @@ impl StepPayload {
     /// because building the prefix correctly -- including the empty-string and
     /// missing-selector cases -- is the part a future attempt would otherwise
     /// get wrong again.
+    ///
+    /// **Do not wire this in to fix an ambiguous element selector.** Re-measured
+    /// 2026-08-12 against three open spreadsheets, because that is exactly what
+    /// it looks like the fix for. Two independent reasons it is not:
+    ///
+    /// * `process:<p>|role:text|name:Sheet1` returns top-level **Window**
+    ///   elements and ignores the role and name entirely, so the exact-name
+    ///   match count went 3 -> 0. Using it would turn a correct
+    ///   `Resolution::Ambiguous` refusal into `Inconclusive`, which falls back to
+    ///   `first()`'s desktop-wide guess -- the silent-wrong-target behaviour the
+    ///   ambiguity check exists to stop.
+    /// * Process is the wrong granularity. Two spreadsheets are windows of the
+    ///   same `msedge.exe`; no process prefix can separate them.
+    ///
+    /// What distinguishes them is the document **window**. See
+    /// "Re-measured 2026-08-12" in
+    /// docs/known-issues/replay-window-selector-ambiguity.md.
     #[allow(dead_code)]
     fn scoped_selector(&self) -> Option<String> {
         let selector = self.selector.as_deref()?;

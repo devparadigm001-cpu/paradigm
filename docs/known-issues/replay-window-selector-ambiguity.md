@@ -907,6 +907,66 @@ their contents — editors, browsers, mail clients, spreadsheets — produces
 recordings with this shape, and any workflow that opens a fresh document has a
 generic-titled window in step 1.
 
+## Re-measured 2026-08-12: `process:` scoping still cannot disambiguate
+
+Prompted by a real ambiguity refusal during the Sheets sheet-tab work
+(`complex-web-grid-capture-unreliable.md`), where replay refused a step because
+`role:text|name:Sheet1` matched two open spreadsheets. The obvious remedy looked
+like wiring in `StepPayload::scoped_selector`. **It was measured first, and it
+does not work** — for two independent reasons, both now confirmed on 0.23.35 and
+for an element selector rather than only `role:Window`.
+
+`text_capture_probe -- sheetsscope`, with three Sheets documents open:
+
+```
+  desktop-wide, which is what replay does today
+    role:text|name:Sheet1
+      raw matches        : 8
+      exact-name matches : 3      <- the real ambiguity
+
+  process-scoped, which is what the proposed fix would do
+    process:msedge.exe|role:text|name:Sheet1
+      raw matches        : 4
+      exact-name matches : 0
+        role=Window  name="Untitled spreadsheet - Google Sheets …"
+        role=Window  name="Untitled spreadsheet - Google Sheets …"
+        role=Window  name="Untitled spreadsheet - Google Sheets …"
+        role=Window  name="Home - The Pre Buy Guys and 38 more pages …"
+```
+
+**1. The scoped query does not return the target elements at all.** Every match
+is a top-level `Window` — the role and name in the selector are ignored, exactly
+as recorded in "Layer 4" above, and now shown to hold for `role:text` too. The
+exact-name count goes from 3 to **0**, so wiring this in would convert a correct
+ambiguity refusal into `Resolution::Inconclusive`. That is strictly worse: the
+step would fall through to checking `first()`'s desktop-wide pick, which is the
+silent-wrong-target behaviour this whole document exists to prevent.
+
+**2. Process is the wrong granularity anyway.** All three spreadsheets are
+windows of the *same* `msedge.exe`, so no process prefix can separate them — and
+the fourth match is not even a Sheets window. What distinguishes two open
+spreadsheets is the **document window**, not the process.
+
+### What would actually work, and why it was not just done
+
+Scope element resolution to **the window the run is acting in**. Replay's
+`navigate` step already activates the right window; it simply does not keep it.
+Threading that window through the run and resolving later steps `.within(it)` is
+the shape of the fix, and it is what the "Measure the cost on a real workload"
+item below already anticipated as the remedy.
+
+Not implemented, because it is not a small change and this file records two
+previous attempts that looked small and were wrong:
+
+* all three resolution sites are desktop-wide today —
+  `replay/mod.rs:479-480`, `:668`, `:903`;
+* `AMBIGUITY_DEPTH`'s derivation reasons specifically about `find_element` with
+  `root: None` versus `Desktop::root()`. Changing the traversal root invalidates
+  that argument; it would have to be redone rather than assumed to carry over;
+* a wrong or stale window makes elements that *are* present unfindable, turning
+  working playbooks into `FailedNotFound` — a regression traded for precision, on
+  the exact code path this document already broke twice.
+
 ## Next steps
 
 - [x] ~~**Give a replay run a notion of target identity.**~~ Attempted and
