@@ -2,6 +2,7 @@ pub mod capture;
 pub mod commands;
 pub mod compile;
 pub mod db;
+pub mod detect;
 pub mod labeling;
 pub mod replay;
 pub mod source;

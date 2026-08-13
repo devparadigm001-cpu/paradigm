@@ -144,6 +144,33 @@ pub fn cell_ref(sheet: Option<&str>, column: &str, row: u64) -> String {
     }
 }
 
+/// Split a cell reference into the general terms detection works in: a field
+/// and a record.
+///
+/// `"B2"` -> `("B", 2)`. A sheet qualifier is stripped first, so `"Sheet2!B2"`
+/// works too -- that is the form capture stamps a grid edit with once the sheet
+/// is known.
+///
+/// This is the adapter Section 3's interface exists for: `crate::detect` deals
+/// in fields and records and knows nothing about spreadsheets, so the
+/// spreadsheet-shaped knowledge lives here and a second source type writes its
+/// own equivalent rather than editing the rule.
+pub fn parse_cell_ref(reference: &str) -> Option<(String, i64)> {
+    let (_, bare) = crate::capture::grid::split_sheet_ref(reference.trim());
+    let split = bare.find(|c: char| c.is_ascii_digit())?;
+    let (column, row) = bare.split_at(split);
+    if column.is_empty() || !column.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let row: i64 = row.parse().ok()?;
+    // Row 0 does not exist in any spreadsheet; a reference claiming it is
+    // malformed rather than merely unusual.
+    if row < 1 {
+        return None;
+    }
+    Some((column.to_ascii_uppercase(), row))
+}
+
 /// How many rows past a blank one to look before calling the source exhausted.
 ///
 /// 4.10 wants "clearly more non-blank data further down" distinguished from the
@@ -488,6 +515,23 @@ mod tests {
             require_formula_bar(name_box(), &measured_edits()).expect("real window"),
             5
         );
+    }
+
+    #[test]
+    fn a_cell_reference_parses_into_a_field_and_a_record() {
+        assert_eq!(parse_cell_ref("B2"), Some(("B".into(), 2)));
+        assert_eq!(parse_cell_ref("AA47"), Some(("AA".into(), 47)));
+        // The qualified form capture stamps once the sheet is known.
+        assert_eq!(parse_cell_ref("Sheet2!B2"), Some(("B".into(), 2)));
+        assert_eq!(parse_cell_ref(" c9 "), Some(("C".into(), 9)));
+
+        // Not references. Each would otherwise become a field or record that
+        // detection then reasoned about as if it were real.
+        assert_eq!(parse_cell_ref("Name"), None);
+        assert_eq!(parse_cell_ref("2"), None);
+        assert_eq!(parse_cell_ref("B0"), None);
+        assert_eq!(parse_cell_ref(""), None);
+        assert_eq!(parse_cell_ref("B2C"), None);
     }
 
     #[test]
