@@ -34,6 +34,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "init_confidence_calibration",
         sql: include_str!("../../migrations/20260803000003_init_confidence_calibration.sql"),
     },
+    Migration {
+        version: "20260813000004",
+        name: "templated_workflow_state",
+        sql: include_str!("../../migrations/20260813000004_templated_workflow_state.sql"),
+    },
 ];
 
 /// FNV-1a over the migration text, ignoring `\r` so a git checkout with CRLF
@@ -104,4 +109,271 @@ pub fn applied_versions(conn: &Connection) -> Result<Vec<String>, DbError> {
     let mut stmt = conn.prepare("SELECT version FROM schema_migrations ORDER BY version")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    /// A real encrypted database with every migration applied, the same way the
+    /// product opens one. Testing the DDL against anything else would not be
+    /// testing the schema that ships.
+    fn scratch_db(dir: &TempDir) -> Connection {
+        let (db_path, key_path) = crate::db::paths_in(dir.path());
+        crate::db::open(&db_path, &key_path).expect("open encrypted db")
+    }
+
+    /// Insert a playbook the way a Phase 1 writer does -- naming only the
+    /// columns that existed before this migration.
+    fn insert_playbook(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO playbooks (id, name, source) VALUES (?1, ?2, 'record_mode')",
+            (id, format!("playbook {id}")),
+        )
+        .expect("insert playbook");
+    }
+
+    fn insert_processed(
+        conn: &Connection,
+        id: &str,
+        playbook: &str,
+        source: &str,
+        row: &str,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO workflow_processed_rows (id, playbook_id, source_id, row_key)
+             VALUES (?1, ?2, ?3, ?4)",
+            (id, playbook, source, row),
+        )
+    }
+
+    #[test]
+    fn the_templated_workflow_migration_is_applied() {
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+        let versions = super::applied_versions(&conn).expect("read versions");
+        assert!(
+            versions.iter().any(|v| v == "20260813000004"),
+            "migration should be recorded as applied, got {versions:?}"
+        );
+    }
+
+    #[test]
+    fn an_existing_playbook_is_untouched_by_the_new_columns() {
+        // The property that matters for every playbook already on disk: a
+        // writer that knows nothing about templated workflows keeps working,
+        // and the row it produces is inert -- not a template, not running.
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+        insert_playbook(&conn, "plain");
+
+        let (state, confirmed_at, run): (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT template_state, template_confirmed_at, run_state
+                   FROM playbooks WHERE id = 'plain'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("read back");
+
+        assert_eq!(state, "none");
+        assert_eq!(confirmed_at, None);
+        assert_eq!(run, "idle");
+    }
+
+    #[test]
+    fn the_state_columns_reject_values_outside_their_sets() {
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+        insert_playbook(&conn, "p");
+
+        assert!(
+            conn.execute(
+                "UPDATE playbooks SET template_state = 'maybe' WHERE id = 'p'",
+                []
+            )
+            .is_err(),
+            "template_state must be constrained to its three values"
+        );
+        assert!(
+            conn.execute("UPDATE playbooks SET run_state = 'stopped' WHERE id = 'p'", [])
+                .is_err(),
+            "run_state must be constrained to its three values"
+        );
+    }
+
+    #[test]
+    fn a_confirmation_timestamp_is_required_exactly_when_confirmed() {
+        // Structural rather than conventional: "confirmed" without a time, or a
+        // time without confirmation, are both nonsense and neither is
+        // representable.
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+        insert_playbook(&conn, "p");
+
+        assert!(
+            conn.execute(
+                "UPDATE playbooks SET template_state = 'confirmed' WHERE id = 'p'",
+                []
+            )
+            .is_err(),
+            "confirming without a timestamp must be rejected"
+        );
+        assert!(
+            conn.execute(
+                "UPDATE playbooks SET template_confirmed_at = '2026-08-13T00:00:00.000Z'
+                  WHERE id = 'p'",
+                []
+            )
+            .is_err(),
+            "a confirmation time without confirmation must be rejected"
+        );
+
+        // Both together is the only accepted shape.
+        conn.execute(
+            "UPDATE playbooks
+                SET template_state = 'confirmed',
+                    template_confirmed_at = '2026-08-13T00:00:00.000Z'
+              WHERE id = 'p'",
+            [],
+        )
+        .expect("confirming with a timestamp should succeed");
+
+        // And revoking must clear it, rather than leaving a stale claim that
+        // the user answered.
+        assert!(
+            conn.execute(
+                "UPDATE playbooks SET template_state = 'proposed' WHERE id = 'p'",
+                []
+            )
+            .is_err(),
+            "revoking must clear the timestamp in the same statement"
+        );
+        conn.execute(
+            "UPDATE playbooks
+                SET template_state = 'proposed', template_confirmed_at = NULL
+              WHERE id = 'p'",
+            [],
+        )
+        .expect("revoking and clearing together should succeed");
+    }
+
+    #[test]
+    fn a_workflow_cannot_record_the_same_source_row_twice() {
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+        insert_playbook(&conn, "w1");
+
+        insert_processed(&conn, "r1", "w1", "sheet-A", "row-7").expect("first insert");
+        assert!(
+            insert_processed(&conn, "r2", "w1", "sheet-A", "row-7").is_err(),
+            "the same workflow recording the same row twice must be rejected"
+        );
+    }
+
+    /// The 4.13 invariant, and the reason this table is keyed the way it is.
+    ///
+    /// Two saved workflows can read the SAME source for different purposes.
+    /// If tracking were keyed by source alone, running one would make the other
+    /// believe rows it has never touched were already handled, and it would skip
+    /// them permanently. This asserts the two are genuinely independent, in both
+    /// directions, rather than merely that the insert succeeds.
+    #[test]
+    fn two_workflows_tracking_the_same_source_stay_independent() {
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+        insert_playbook(&conn, "shipping");
+        insert_playbook(&conn, "accounting");
+
+        // The same source row, claimed by both workflows.
+        insert_processed(&conn, "s1", "shipping", "orders", "row-1")
+            .expect("shipping records row-1");
+        insert_processed(&conn, "a1", "accounting", "orders", "row-1")
+            .expect("accounting must be able to record the SAME row independently");
+
+        // Shipping gets ahead by one.
+        insert_processed(&conn, "s2", "shipping", "orders", "row-2")
+            .expect("shipping records row-2");
+
+        let processed = |workflow: &str, row: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM workflow_processed_rows
+                  WHERE playbook_id = ?1 AND source_id = 'orders' AND row_key = ?2",
+                (workflow, row),
+                |r| r.get(0),
+            )
+            .expect("count")
+        };
+
+        // Each sees exactly its own work, and neither is contaminated by the
+        // other -- the specific failure 4.13 exists to prevent.
+        assert_eq!(processed("shipping", "row-1"), 1);
+        assert_eq!(processed("accounting", "row-1"), 1);
+        assert_eq!(processed("shipping", "row-2"), 1);
+        assert_eq!(
+            processed("accounting", "row-2"),
+            0,
+            "accounting must NOT see row-2 as handled just because shipping did"
+        );
+
+        let total = |workflow: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM workflow_processed_rows WHERE playbook_id = ?1",
+                [workflow],
+                |r| r.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(total("shipping"), 2);
+        assert_eq!(total("accounting"), 1);
+    }
+
+    #[test]
+    fn deleting_a_workflow_removes_its_processed_rows_but_not_another_workflows() {
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+
+        // The cascade only means anything with foreign keys enforced, and
+        // SQLite parses ON DELETE clauses then ignores them when they are off.
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .expect("read PRAGMA foreign_keys");
+        assert_eq!(fk, 1, "foreign keys are OFF; ON DELETE is a no-op");
+
+        insert_playbook(&conn, "shipping");
+        insert_playbook(&conn, "accounting");
+        insert_processed(&conn, "s1", "shipping", "orders", "row-1").expect("insert");
+        insert_processed(&conn, "a1", "accounting", "orders", "row-1").expect("insert");
+
+        conn.execute("DELETE FROM playbooks WHERE id = 'shipping'", [])
+            .expect("delete playbook");
+
+        let remaining: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT playbook_id FROM workflow_processed_rows ORDER BY playbook_id")
+                .expect("prepare");
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect");
+            rows
+        };
+        assert_eq!(
+            remaining,
+            vec!["accounting".to_string()],
+            "the deleted workflow's tracking goes with it; the other's survives"
+        );
+    }
+
+    #[test]
+    fn processed_rows_require_a_real_workflow() {
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+        assert!(
+            insert_processed(&conn, "x", "no-such-playbook", "orders", "row-1").is_err(),
+            "tracking must not accumulate against a workflow that does not exist"
+        );
+    }
 }
