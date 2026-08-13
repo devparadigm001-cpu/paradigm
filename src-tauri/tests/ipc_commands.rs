@@ -151,9 +151,16 @@ const REGISTERED_COMMANDS: &[(&str, &str)] = &[
     ("replay_playbook", r#"{"playbookId":"does-not-exist"}"#),
     ("get_run_history", r#"{"playbookId":"does-not-exist"}"#),
     ("get_orphaned_run_history", "{}"),
+    // §4.6's run controls. Each legitimately errors here with "no workflow run
+    // is in progress", which is exactly the kind of error this test ignores --
+    // what it checks is reachability, not success.
+    ("pause_workflow_run", "{}"),
+    ("resume_workflow_run", "{}"),
+    ("stop_workflow_run", "{}"),
+    ("get_workflow_run_status", "{}"),
 ];
 
-/// The Step 1 regression test, extended to all eight commands.
+/// The Step 1 regression test, extended to every registered command.
 ///
 /// A command can compile, be listed in `generate_handler!`, and still be
 /// unreachable if a second `.invoke_handler()` call discards the registration.

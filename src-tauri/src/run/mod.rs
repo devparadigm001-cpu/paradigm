@@ -30,8 +30,13 @@
 //! the same one `workflow_processed_rows` was built for. A [`SourceRecord`]
 //! lives from its read to its write and is then dropped.
 
-use rusqlite::Connection;
+pub mod background;
+pub mod control;
+
+use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
+
+pub use control::{ControlState, RunControl};
 
 use crate::compile::CompiledTemplate;
 use crate::db::DbError;
@@ -175,6 +180,25 @@ pub enum RunStop {
         position: SourcePosition,
         reason: String,
     },
+    /// The user stopped the run (§4.6). Permanent, and not a failure.
+    ///
+    /// `mid_record` says which of §4.6's two arms this was, because the user
+    /// needs to know what happened to the record they interrupted:
+    ///
+    /// * `false` -- the stop landed between records. Everything read was
+    ///   written and marked; nothing was in progress. This is also where a stop
+    ///   pressed *during* a write arrives, after that record finished cleanly.
+    /// * `true` -- the run was paused mid-record and then stopped, so that one
+    ///   record was discarded. Any fields already written for it are still on
+    ///   the destination and it is NOT marked processed, so re-running the
+    ///   workflow will redo it from the start.
+    ///
+    /// `position` is the record the run had reached, which for `mid_record` is
+    /// exactly the discarded one.
+    Stopped {
+        position: SourcePosition,
+        mid_record: bool,
+    },
     /// The run hit the iteration ceiling. A backstop against a reader that
     /// never reports `Exhausted`, not an expected ending.
     LimitReached { limit: usize },
@@ -297,6 +321,70 @@ pub fn mark_processed(
     Ok(())
 }
 
+/// Whether a workflow is executing, and whether the user has paused it.
+///
+/// §4.11's `run_state`, which migration 20260813000004 added and nothing wrote
+/// until now. Orthogonal to `template_state`: a confirmed workflow can be idle,
+/// running or paused, and the two answer different questions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    Idle,
+    Running,
+    Paused,
+}
+
+impl RunState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunState::Idle => "idle",
+            RunState::Running => "running",
+            RunState::Paused => "paused",
+        }
+    }
+
+    /// Parse what the database holds. `None` for anything else, which the CHECK
+    /// constraint should already make impossible -- reported rather than
+    /// defaulted, because silently reading an unknown state as `Idle` would
+    /// make a running workflow look startable.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "idle" => Some(RunState::Idle),
+            "running" => Some(RunState::Running),
+            "paused" => Some(RunState::Paused),
+            _ => None,
+        }
+    }
+}
+
+/// Record that a workflow is idle, running or paused.
+///
+/// This is state the UI reads, so it is written when the user's intent arrives
+/// rather than when the loop next notices -- a run told to pause between two
+/// slow records should show as paused immediately, not once it gets there.
+pub fn set_run_state(
+    conn: &Connection,
+    playbook_id: &str,
+    state: RunState,
+) -> Result<(), DbError> {
+    conn.execute(
+        "UPDATE playbooks SET run_state = ?2 WHERE id = ?1",
+        rusqlite::params![playbook_id, state.as_str()],
+    )?;
+    Ok(())
+}
+
+/// Read a workflow's run state.
+pub fn get_run_state(conn: &Connection, playbook_id: &str) -> Result<Option<RunState>, DbError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT run_state FROM playbooks WHERE id = ?1",
+            [playbook_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.as_deref().and_then(RunState::parse))
+}
+
 /// How many rows this workflow has taken from a source. For the summary and for
 /// §4.8's "nothing new" reporting.
 pub fn processed_count(
@@ -346,12 +434,66 @@ fn source_fields(template: &CompiledTemplate) -> Vec<FieldRef> {
 ///
 /// The duplicate check happens before the read, not after: a row already
 /// processed should not have its content pulled into memory at all.
+///
+/// Runs to exhaustion with no way to intervene. For a run the user can stop or
+/// pause, see [`run_with_control`], which this delegates to.
 pub fn run(
     conn: &Connection,
     playbook_id: &str,
     template: &CompiledTemplate,
     reader: &mut dyn SourceReader,
     writer: &mut dyn DestinationWriter,
+) -> Result<RunReport, RunError> {
+    run_with_control(
+        conn,
+        playbook_id,
+        template,
+        reader,
+        writer,
+        &RunControl::new(),
+    )
+}
+
+/// §4.4's loop, with §4.6's Stop and Pause.
+///
+/// ## Where the safe points are, and why they are where they are
+///
+/// The record is durable only once [`mark_processed`] has written it, and
+/// neither the reader nor the writer advances until after that. Everything
+/// §4.6 asks for falls out of that ordering rather than needing machinery:
+///
+/// **Pause, between records.** Nothing is in progress, so the loop simply
+/// waits. Resuming carries on.
+///
+/// **Pause, mid-record.** Checked before each field write. The partial record
+/// is abandoned -- not marked, and neither side advanced -- so resuming
+/// re-reads the same position and rewrites every field from the top. That is
+/// §4.6's "backs up to the start of whatever record was in progress and redoes
+/// it cleanly from the beginning". The already-written fields are overwritten
+/// with the same values, which is the harmless redo §4.6 says it prefers "over
+/// any risk of a half-done state surviving a pause".
+///
+/// **Stop, during a normal run.** Checked at the top of each record, so a stop
+/// arriving mid-record lets that record finish and be marked before the loop
+/// exits. §4.6's "allowed to finish cleanly", and it leaves the destination and
+/// the ledger agreeing with each other.
+///
+/// **Stop, while paused mid-record.** The waiting loop is released with a halt
+/// and the abandoned record is never marked. §4.6's other arm, "fully
+/// discarded" -- and the only one of the two that is actually achievable
+/// mid-write, since undoing a write to a live spreadsheet is not something this
+/// system can do. §4.10 makes the same choice explicitly for prior records: a
+/// stopped run "keeps whatever it already successfully wrote".
+///
+/// So both arms of §4.6's Stop clause are real behaviours, reached by different
+/// routes, rather than one being picked and the other written off.
+pub fn run_with_control(
+    conn: &Connection,
+    playbook_id: &str,
+    template: &CompiledTemplate,
+    reader: &mut dyn SourceReader,
+    writer: &mut dyn DestinationWriter,
+    control: &RunControl,
 ) -> Result<RunReport, RunError> {
     if template.fields.is_empty() {
         return Err(RunError::NoFields);
@@ -369,6 +511,17 @@ pub fn run(
         }
 
         let position = reader.position();
+
+        // 0. The between-records safe point. Nothing is in progress here, so a
+        //    pause just waits and a stop just ends -- and a stop that arrived
+        //    while the previous record was being written lands here, which is
+        //    what lets that record finish cleanly first.
+        if !control.wait_while_paused() {
+            break RunStop::Stopped {
+                position,
+                mid_record: false,
+            };
+        }
 
         // 1. Is there anything here? `peek` rather than `read` so "is the run
         //    over" never pulls content into memory to find out.
@@ -433,7 +586,27 @@ pub fn run(
         let destination = writer.position();
         let mut wrote = Vec::new();
         let mut write_failure = None;
+        let mut interrupted = None;
         for mapping in &template.fields {
+            // The mid-record safe point. Asked cheaply and non-blockingly,
+            // because on almost every field the answer is no.
+            //
+            // Only Pause is honoured here. A Stop is deliberately NOT checked
+            // mid-record: letting the record finish is what makes it clean, and
+            // §4.6 offers exactly that as one of its two arms.
+            if control.is_paused() {
+                if control.wait_while_paused() {
+                    // Resumed. Abandon this attempt and redo the record from
+                    // the top -- nothing was marked and neither side advanced,
+                    // so `continue` re-reads this same position.
+                    interrupted = Some(false);
+                } else {
+                    // Stopped while paused: the record is discarded entirely.
+                    interrupted = Some(true);
+                }
+                break;
+            }
+
             let value = record
                 .fields
                 .get(&mapping.source_field)
@@ -453,6 +626,20 @@ pub fn run(
                 wrote,
                 reason,
             };
+        }
+
+        // A pause landed mid-record. The record is NOT marked either way, which
+        // is what makes both outcomes clean: on resume it is redone from the
+        // top, and on stop it is as though it never began.
+        match interrupted {
+            Some(true) => {
+                break RunStop::Stopped {
+                    position,
+                    mid_record: true,
+                }
+            }
+            Some(false) => continue,
+            None => {}
         }
 
         // 6. Mark done, durably, BEFORE either side advances.
@@ -637,6 +824,17 @@ mod tests {
         /// Fail on the Nth write call, to stage a partial record.
         fail_on_write: Option<usize>,
         calls: usize,
+        /// Fire a control action from inside the Nth write, so a pause or stop
+        /// lands at an exactly known point mid-record rather than at whatever
+        /// moment a sleeping test thread happens to wake up.
+        trigger: Option<(usize, Trigger)>,
+        control: Option<RunControl>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Trigger {
+        Pause,
+        Stop,
     }
 
     impl FakeWriter {
@@ -646,7 +844,16 @@ mod tests {
                 writes: Vec::new(),
                 fail_on_write: None,
                 calls: 0,
+                trigger: None,
+                control: None,
             }
+        }
+
+        /// Fire `what` from inside write call `nth`.
+        fn triggering(mut self, nth: usize, what: Trigger, control: &RunControl) -> Self {
+            self.trigger = Some((nth, what));
+            self.control = Some(control.clone());
+            self
         }
     }
 
@@ -659,6 +866,14 @@ mod tests {
             self.calls += 1;
             if self.fail_on_write == Some(self.calls) {
                 return Err(SourceError::Unreachable("destination closed".into()));
+            }
+            if let (Some((nth, what)), Some(control)) = (self.trigger, self.control.as_ref()) {
+                if nth == self.calls {
+                    match what {
+                        Trigger::Pause => control.pause(),
+                        Trigger::Stop => control.stop(),
+                    }
+                }
             }
             self.writes
                 .push((self.row.to_string(), field.to_string(), value.to_string()));
@@ -1236,6 +1451,291 @@ mod tests {
         let err = run(&conn, &id, &template(&[], 1, 1), &mut reader, &mut writer)
             .expect_err("must refuse");
         assert!(matches!(err, RunError::NoFields), "got {err:?}");
+    }
+
+    // ---------------- §4.6 run controls ----------------
+
+    /// Three records of two fields each, so a control can land *between* the
+    /// two writes of one record and the mid-record path is really exercised.
+    fn two_field_rows() -> Vec<Vec<(&'static str, &'static str)>> {
+        vec![
+            vec![("C", "Acme"), ("D", "100")],
+            vec![("C", "Globex"), ("D", "200")],
+            vec![("C", "Initech"), ("D", "300")],
+        ]
+    }
+
+    #[test]
+    fn a_stop_lets_the_record_being_written_finish_cleanly() {
+        // §4.6: "Whatever record was actively being written when Stop is
+        // pressed is either allowed to finish cleanly or fully discarded --
+        // never left half-written." This is the first arm. The stop fires
+        // during record 2's FIRST field, and record 2 must still come out whole.
+        let (_dir, conn, id) = db_with_playbook();
+        let control = RunControl::new();
+        let mut reader = FakeReader::new(two_field_rows());
+        let mut writer = FakeWriter::new().triggering(3, Trigger::Stop, &control);
+
+        let report = run_with_control(
+            &conn,
+            &id,
+            &template(&[("C", "A"), ("D", "B")], 1, 1),
+            &mut reader,
+            &mut writer,
+            &control,
+        )
+        .expect("run");
+
+        match &report.stop {
+            RunStop::Stopped {
+                position,
+                mid_record,
+            } => {
+                assert!(!mid_record, "nothing was in progress when it stopped");
+                assert_eq!(position.row_key, "3", "it stopped before record 3");
+            }
+            other => panic!("expected Stopped, got {other:?}"),
+        }
+
+        // Record 2 finished: BOTH its fields were written, not just the one
+        // that was in flight when the stop arrived.
+        assert_eq!(
+            writer.writes,
+            vec![
+                ("2".to_string(), "A".to_string(), "Acme".to_string()),
+                ("2".to_string(), "B".to_string(), "100".to_string()),
+                ("3".to_string(), "A".to_string(), "Globex".to_string()),
+                ("3".to_string(), "B".to_string(), "200".to_string()),
+            ]
+        );
+        assert_eq!(report.written(), 2);
+        // And the ledger agrees with the destination, which is the point of
+        // finishing rather than abandoning.
+        assert_eq!(processed_count(&conn, &id, "sheet-A").expect("count"), 2);
+    }
+
+    #[test]
+    fn a_stop_while_paused_mid_record_discards_that_record_entirely() {
+        // §4.6's other arm. Pause lands between record 2's two fields, then the
+        // run is stopped while it waits.
+        let (_dir, conn, id) = db_with_playbook();
+        let control = RunControl::new();
+        let mut reader = FakeReader::new(two_field_rows());
+        let mut writer = FakeWriter::new().triggering(3, Trigger::Pause, &control);
+
+        // Release the paused run with a stop rather than a resume. Waits until
+        // the pause is actually observable, so the stop cannot land early.
+        let stopper = {
+            let c = control.clone();
+            std::thread::spawn(move || {
+                while !c.is_paused() {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                c.stop();
+            })
+        };
+
+        let report = run_with_control(
+            &conn,
+            &id,
+            &template(&[("C", "A"), ("D", "B")], 1, 1),
+            &mut reader,
+            &mut writer,
+            &control,
+        )
+        .expect("run");
+        stopper.join().expect("join");
+
+        match &report.stop {
+            RunStop::Stopped {
+                position,
+                mid_record,
+            } => {
+                assert!(mid_record, "a record was in progress and was discarded");
+                assert_eq!(position.row_key, "2", "it names the discarded record");
+            }
+            other => panic!("expected Stopped, got {other:?}"),
+        }
+
+        // Record 2's first field did reach the destination -- undoing a write
+        // to a live sheet is not something this system can do, and §4.10 says a
+        // stopped run keeps what it wrote.
+        assert_eq!(writer.writes.len(), 3);
+        // What matters is that it is NOT marked processed, so a re-run redoes
+        // it from the start rather than skipping a half-written record forever.
+        assert_eq!(report.written(), 1, "only record 1 completed");
+        assert_eq!(processed_count(&conn, &id, "sheet-A").expect("count"), 1);
+        assert!(
+            !is_processed(
+                &conn,
+                &id,
+                &SourcePosition {
+                    source_id: "sheet-A".into(),
+                    row_key: "2".into()
+                }
+            )
+            .expect("check"),
+            "a discarded record must never be marked done"
+        );
+    }
+
+    #[test]
+    fn a_pause_mid_record_redoes_that_record_from_the_beginning() {
+        // §4.6: "backs up to the start of whatever record was in progress and
+        // redoes it cleanly from the beginning -- never resumes mid-write."
+        let (_dir, conn, id) = db_with_playbook();
+        let control = RunControl::new();
+        let mut reader = FakeReader::new(vec![
+            vec![("C", "Acme"), ("D", "100")],
+            vec![("C", "Globex"), ("D", "200")],
+        ]);
+        let mut writer = FakeWriter::new().triggering(3, Trigger::Pause, &control);
+
+        let resumer = {
+            let c = control.clone();
+            std::thread::spawn(move || {
+                while !c.is_paused() {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                c.resume();
+            })
+        };
+
+        let report = run_with_control(
+            &conn,
+            &id,
+            &template(&[("C", "A"), ("D", "B")], 1, 1),
+            &mut reader,
+            &mut writer,
+            &control,
+        )
+        .expect("run");
+        resumer.join().expect("join");
+
+        assert_eq!(report.stop, RunStop::Exhausted, "a pause must not end a run");
+        assert_eq!(report.written(), 2);
+
+        // The redo is visible and is the whole point: record 2's first field
+        // was written, the pause landed, and on resume the record was written
+        // again from its FIRST field -- not continued from its second.
+        assert_eq!(
+            writer.writes,
+            vec![
+                ("2".to_string(), "A".to_string(), "Acme".to_string()),
+                ("2".to_string(), "B".to_string(), "100".to_string()),
+                ("3".to_string(), "A".to_string(), "Globex".to_string()),
+                ("3".to_string(), "A".to_string(), "Globex".to_string()),
+                ("3".to_string(), "B".to_string(), "200".to_string()),
+            ],
+            "record 2 should be rewritten from its first field on resume"
+        );
+
+        // Redone, not double-counted: the harmless rewrite must not become a
+        // second ledger row, which the UNIQUE constraint would reject anyway.
+        assert_eq!(processed_count(&conn, &id, "sheet-A").expect("count"), 2);
+    }
+
+    #[test]
+    fn a_pause_between_records_waits_and_then_carries_on() {
+        // The simple case: nothing is in progress, so there is nothing to redo.
+        let (_dir, conn, id) = db_with_playbook();
+        let control = RunControl::new();
+        let mut reader = FakeReader::new(vec![vec![("C", "Acme")], vec![("C", "Globex")]]);
+        // One field per record, so the trigger fires on the last write of
+        // record 1 and the pause is seen at the top of record 2.
+        let mut writer = FakeWriter::new().triggering(1, Trigger::Pause, &control);
+
+        let resumer = {
+            let c = control.clone();
+            std::thread::spawn(move || {
+                while !c.is_paused() {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                c.resume();
+            })
+        };
+
+        let report = run_with_control(
+            &conn,
+            &id,
+            &template(&[("C", "A")], 1, 1),
+            &mut reader,
+            &mut writer,
+            &control,
+        )
+        .expect("run");
+        resumer.join().expect("join");
+
+        assert_eq!(report.stop, RunStop::Exhausted);
+        assert_eq!(report.written(), 2);
+        let values: Vec<&str> = writer.writes.iter().map(|w| w.2.as_str()).collect();
+        assert_eq!(values, vec!["Acme", "Globex"], "no record was redone");
+        assert_eq!(processed_count(&conn, &id, "sheet-A").expect("count"), 2);
+    }
+
+    #[test]
+    fn a_run_stopped_before_it_starts_writes_nothing() {
+        let (_dir, conn, id) = db_with_playbook();
+        let mut reader = FakeReader::new(two_field_rows());
+        let mut writer = FakeWriter::new();
+
+        let report = run_with_control(
+            &conn,
+            &id,
+            &template(&[("C", "A")], 1, 1),
+            &mut reader,
+            &mut writer,
+            &RunControl::stopped(),
+        )
+        .expect("run");
+
+        assert!(matches!(report.stop, RunStop::Stopped { .. }));
+        assert!(writer.writes.is_empty());
+        assert_eq!(processed_count(&conn, &id, "sheet-A").expect("count"), 0);
+    }
+
+    #[test]
+    fn a_stopped_run_can_be_resumed_by_rerunning_and_skips_what_it_finished() {
+        // Stop is permanent for the RUN, not for the workflow: §4.7's ledger is
+        // what makes picking up again safe, and this is the two features
+        // meeting. The second run must not rewrite records the first completed.
+        let (_dir, conn, id) = db_with_playbook();
+        let control = RunControl::new();
+        let tpl = template(&[("C", "A"), ("D", "B")], 1, 1);
+
+        let mut w1 = FakeWriter::new().triggering(3, Trigger::Stop, &control);
+        let first = run_with_control(
+            &conn,
+            &id,
+            &tpl,
+            &mut FakeReader::new(two_field_rows()),
+            &mut w1,
+            &control,
+        )
+        .expect("first run");
+        assert!(matches!(first.stop, RunStop::Stopped { .. }));
+        assert_eq!(first.written(), 2);
+
+        let mut w2 = FakeWriter::new();
+        let second = run_with_control(
+            &conn,
+            &id,
+            &tpl,
+            &mut FakeReader::new(two_field_rows()),
+            &mut w2,
+            &RunControl::new(),
+        )
+        .expect("second run");
+
+        assert_eq!(second.stop, RunStop::Exhausted);
+        assert_eq!(second.written(), 1, "only the record the stop never reached");
+        assert_eq!(second.skipped(), 2, "the two the first run completed");
+        let values: Vec<&str> = w2.writes.iter().map(|w| w.2.as_str()).collect();
+        assert_eq!(values, vec!["Initech", "300"]);
+        assert_eq!(processed_count(&conn, &id, "sheet-A").expect("count"), 3);
     }
 }
 

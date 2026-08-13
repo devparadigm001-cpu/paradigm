@@ -59,6 +59,17 @@ pub struct AppState {
     /// only until the compile decision is made -- §3's transient rule, which is
     /// why they live in memory and never in the database.
     pub pending_links: Mutex<Option<Vec<capture::grid::SourceLink>>>,
+    /// The templated workflow currently running, if any (§4.10).
+    ///
+    /// One at a time, matching `session`: the design describes a single run
+    /// with a single set of controls, and nothing in it asks for two at once.
+    ///
+    /// Holding the handle here is what makes the run outlive the command that
+    /// started it without outliving the app -- §4.10's "does not survive a full
+    /// app close" is a property of storing it in app state rather than
+    /// detaching it, so it needs no code to enforce and would take deliberate
+    /// effort to break.
+    pub active_run: Mutex<Option<run::background::ActiveRun>>,
 }
 
 pub const MODEL_FILE: &str = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
@@ -180,6 +191,7 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
                 session: Mutex::new(None),
                 pending_actions: Mutex::new(None),
                 pending_links: Mutex::new(None),
+                active_run: Mutex::new(None),
             });
             Ok(())
         })
@@ -194,6 +206,10 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
             commands::replay_playbook,
             commands::get_run_history,
             commands::get_orphaned_run_history,
+            commands::pause_workflow_run,
+            commands::resume_workflow_run,
+            commands::stop_workflow_run,
+            commands::get_workflow_run_status,
         ])
 }
 

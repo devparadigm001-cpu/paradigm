@@ -38,6 +38,7 @@ use crate::compile::{compile, store, validate, CompiledTemplate, ReversibilityPo
 use crate::detect::{self, Detection};
 use crate::labeling::{self, calibration, clean, CalibrationSample, RedactionPolicy};
 use crate::replay::{self, journal};
+use crate::run;
 use crate::AppState;
 
 // ---------------------------------------------------------------- views ----
@@ -566,6 +567,134 @@ fn confirmed_template(state: &State<'_, AppState>) -> Result<CompiledTemplate, S
                 .to_string(),
         ),
     }
+}
+
+// ------------------------------------------------------ run controls ----
+//
+// §4.6's Stop and Pause, reaching the run over IPC. Each is a thin wrapper: the
+// decisions -- stop being permanent, pause backing up to the start of the
+// in-progress record -- live in `run::control` and `run::run_with_control`,
+// where they can be tested without a window.
+//
+// `run_state` is written here, at the moment the user's intent arrives, rather
+// than when the loop next reaches a safe point. A run told to pause between two
+// slow records should read as paused immediately; the alternative is a UI that
+// ignores the button until the loop catches up.
+
+/// What the frontend needs to render the running-state overlay.
+#[derive(Debug, Serialize)]
+pub struct RunStatusView {
+    pub playbook_id: Option<String>,
+    /// `idle`, `running` or `paused`.
+    pub state: String,
+    /// True once the thread has ended, whatever the reason.
+    pub finished: bool,
+}
+
+/// The controls act on the run in progress, so they need one.
+fn with_active_run<T>(
+    state: &State<'_, AppState>,
+    f: impl FnOnce(&run::background::ActiveRun) -> T,
+) -> Result<T, String> {
+    let slot = state.active_run.lock().map_err(|e| e.to_string())?;
+    let active = slot
+        .as_ref()
+        .ok_or_else(|| "no workflow run is in progress".to_string())?;
+    Ok(f(active))
+}
+
+/// Pause the run at its next safe point (§4.6).
+#[tauri::command]
+pub async fn pause_workflow_run(state: State<'_, AppState>) -> Result<RunStatusView, String> {
+    let playbook_id = with_active_run(&state, |active| {
+        active.control.pause();
+        active.playbook_id.clone()
+    })?;
+
+    let conn = state.db.lock().await;
+    run::set_run_state(&conn, &playbook_id, run::RunState::Paused).map_err(|e| e.to_string())?;
+
+    Ok(RunStatusView {
+        playbook_id: Some(playbook_id),
+        state: run::RunState::Paused.as_str().to_string(),
+        finished: false,
+    })
+}
+
+/// Resume a paused run. It redoes the record it was in the middle of.
+///
+/// Refuses when there was nothing to resume, rather than reporting success:
+/// `RunControl::resume` deliberately will not restart a stopped run, and a
+/// caller told "resumed" about a run that stayed stopped would have no way to
+/// tell.
+#[tauri::command]
+pub async fn resume_workflow_run(state: State<'_, AppState>) -> Result<RunStatusView, String> {
+    let (playbook_id, resumed) = with_active_run(&state, |active| {
+        (active.playbook_id.clone(), active.control.resume())
+    })?;
+    if !resumed {
+        return Err("that run is not paused; a stopped run cannot be resumed".to_string());
+    }
+
+    let conn = state.db.lock().await;
+    run::set_run_state(&conn, &playbook_id, run::RunState::Running).map_err(|e| e.to_string())?;
+
+    Ok(RunStatusView {
+        playbook_id: Some(playbook_id),
+        state: run::RunState::Running.as_str().to_string(),
+        finished: false,
+    })
+}
+
+/// Stop the run for good (§4.6). The record in progress finishes cleanly, or --
+/// if the run was paused mid-record -- is discarded.
+///
+/// The handle is taken out of app state, because a stopped run is over and
+/// leaving it there would let a later Resume find something to talk to. The
+/// thread is not joined here: joining would block the caller until the current
+/// record finished, which is the opposite of what §4.10 asks for.
+#[tauri::command]
+pub async fn stop_workflow_run(state: State<'_, AppState>) -> Result<RunStatusView, String> {
+    let active = {
+        let mut slot = state.active_run.lock().map_err(|e| e.to_string())?;
+        slot.take()
+            .ok_or_else(|| "no workflow run is in progress".to_string())?
+    };
+    active.control.stop();
+
+    let conn = state.db.lock().await;
+    run::set_run_state(&conn, &active.playbook_id, run::RunState::Idle)
+        .map_err(|e| e.to_string())?;
+
+    Ok(RunStatusView {
+        playbook_id: Some(active.playbook_id.clone()),
+        state: run::RunState::Idle.as_str().to_string(),
+        finished: active.is_finished(),
+    })
+}
+
+/// The current run's state, for the overlay. Never an error when nothing is
+/// running -- "nothing is running" is an answer, not a failure.
+#[tauri::command]
+pub async fn get_workflow_run_status(state: State<'_, AppState>) -> Result<RunStatusView, String> {
+    let slot = state.active_run.lock().map_err(|e| e.to_string())?;
+    let Some(active) = slot.as_ref() else {
+        return Ok(RunStatusView {
+            playbook_id: None,
+            state: run::RunState::Idle.as_str().to_string(),
+            finished: true,
+        });
+    };
+    let state_str = match active.control.state() {
+        run::ControlState::Paused => run::RunState::Paused,
+        run::ControlState::Stopped => run::RunState::Idle,
+        run::ControlState::Running => run::RunState::Running,
+    };
+    Ok(RunStatusView {
+        playbook_id: Some(active.playbook_id.clone()),
+        state: state_str.as_str().to_string(),
+        finished: active.is_finished(),
+    })
 }
 
 /// Every stored playbook, for display.
