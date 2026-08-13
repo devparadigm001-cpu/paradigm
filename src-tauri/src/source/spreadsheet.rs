@@ -110,6 +110,29 @@ pub fn pick_formula_bar(name_box: Rect, candidates: &[(usize, Rect)]) -> Option<
         .map(|(i, _)| *i)
 }
 
+/// [`pick_formula_bar`], as the reader uses it: a failure to identify is an
+/// error, never a fallback.
+///
+/// Split out from `open` so the fail-loud behaviour is *tested* rather than
+/// merely asserted in a comment. There is no second-choice element and no
+/// "closest thing" -- the alternatives to the formula bar in a real window
+/// include the Name Box, which reports a plausible-looking cell reference, so a
+/// reader that degraded gracefully here would return `"B2"` where a customer
+/// name was meant and look like it was working.
+pub fn require_formula_bar(
+    name_box: Rect,
+    candidates: &[(usize, Rect)],
+) -> Result<usize, SourceError> {
+    pick_formula_bar(name_box, candidates).ok_or_else(|| {
+        SourceError::Unreachable(format!(
+            "no formula bar found on the Name Box's row at {name_box:?} and to its right, \
+             among {} candidate field(s). Refusing to read from another element: the Name Box \
+             itself reports a cell reference, which would pass for a value.",
+            candidates.len()
+        ))
+    })
+}
+
 /// A spreadsheet cell reference, sheet-qualified when the sheet is known.
 ///
 /// Qualifying is what makes a read land on the right sheet -- the same
@@ -199,13 +222,10 @@ impl SpreadsheetReader {
             .filter_map(|(i, el)| bounds_of(el).ok().map(|r| (i, r)))
             .collect();
 
-        let chosen = pick_formula_bar(name_box_rect, &rects).ok_or_else(|| {
-            SourceError::Unreachable(format!(
-                "no formula bar found to the right of the Name Box at {name_box_rect:?}; \
-                 refusing to read from another Edit, since the Name Box itself reports a cell \
-                 reference and would look like a plausible value"
-            ))
-        })?;
+        // Fails HERE, at construction, rather than on some later read. A reader
+        // that exists is a reader that knows where the value comes from; there
+        // is no half-built state in which reads quietly return the wrong thing.
+        let chosen = require_formula_bar(name_box_rect, &rects)?;
 
         Ok(Self {
             name_box,
@@ -437,6 +457,37 @@ mod tests {
     #[test]
     fn nothing_qualifying_returns_none_rather_than_a_guess() {
         assert_eq!(pick_formula_bar(name_box(), &[]), None);
+    }
+
+    #[test]
+    fn failing_to_identify_the_formula_bar_is_an_error_not_a_fallback() {
+        // The fail-loud property, tested rather than asserted. `open` calls
+        // exactly this, so a window without an identifiable formula bar
+        // produces NO reader at all -- there is no partially-built state in
+        // which reads quietly come from the wrong element.
+        let err = require_formula_bar(name_box(), &[]).expect_err("must not succeed");
+        assert!(
+            matches!(err, SourceError::Unreachable(_)),
+            "expected Unreachable, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("Refusing to read from another element"),
+            "the error must say why there is no fallback, got: {message}"
+        );
+
+        // And with only the Name Box present -- the specific wrong answer that
+        // would look plausible -- it still refuses rather than settling.
+        assert!(require_formula_bar(name_box(), &[(4, name_box())]).is_err());
+    }
+
+    #[test]
+    fn identifying_the_formula_bar_succeeds_on_the_real_window() {
+        // The other half of the same property: it is not refusing everything.
+        assert_eq!(
+            require_formula_bar(name_box(), &measured_edits()).expect("real window"),
+            5
+        );
     }
 
     #[test]

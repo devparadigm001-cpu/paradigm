@@ -27,19 +27,41 @@
 --   none      an ordinary recorded playbook. The default, so every existing
 --             row keeps behaving exactly as it does today.
 --   proposed  offered as a repeating pattern, not yet answered by the user.
+--             UNREACHABLE by the current design -- see below. Kept
+--             deliberately, not by oversight.
 --   confirmed the user said yes. Never ask again -- this is the state 4.2/4.8
 --             depend on surviving a restart.
 --
--- On `proposed`, honestly: the design's post-stop flow (4.1 detect -> 4.12
--- review screen -> 4.2 confirm) may never persist it, because a session is
--- reviewed BEFORE it is stored -- `stop_record_session` explicitly does not
--- compile, and 4.10 says rejecting leaves "an ordinary one-shot playbook".
--- Both outcomes therefore write a row that is already answered. It is kept
--- anyway because SQLite cannot alter a CHECK constraint without rebuilding the
--- table, so an unused enum value costs nothing while adding one later costs a
--- migration. If item 3 confirms detection never persists an unanswered
--- candidate, this value is dead and should be recorded as such rather than
--- left looking meaningful.
+-- ## `proposed` is unreachable today, and that is a conclusion, not an oversight
+--
+-- Checked against the code rather than inferred from the spec. There is exactly
+-- ONE production path that writes a `playbooks` row -- `store::store`, called
+-- only from `compile_and_store_playbook` (`commands.rs`). `stop_record_session`
+-- writes nothing: it hands the captured actions to an in-memory `pending`
+-- slot and returns a summary for review.
+--
+-- So the design's post-stop sequence -- 4.1 detect, 4.12 review, 4.2 confirm --
+-- runs entirely before anything is persisted. Whichever way the user answers,
+-- the row that eventually gets written is already answered: 'confirmed' if they
+-- said yes and the 4.3 preview passed, 'none' otherwise, since 4.10 says a
+-- rejected preview leaves "an ordinary one-shot playbook, unaffected". There is
+-- no moment at which a detected-but-unanswered workflow exists on disk.
+--
+-- ## Why it is kept anyway
+--
+-- Two reasons, and neither is "it might be useful someday":
+--
+--   * SQLite cannot alter a CHECK constraint without rebuilding the table.
+--     An unused enum value costs nothing; adding one later costs a migration
+--     against live user data.
+--   * Section 7 lists live pattern detection -- detecting WHILE recording
+--     rather than on stop -- as a deliberate future option. That flow has no
+--     natural "review before store" boundary, so a detected-but-unanswered
+--     state is exactly what it would need. This value is the seat kept for it.
+--
+-- What must NOT happen is code writing 'proposed' to mean something else
+-- because an unexplained value was sitting here. It means "detected, not yet
+-- answered", and nothing today can produce it.
 ALTER TABLE playbooks ADD COLUMN template_state TEXT NOT NULL DEFAULT 'none'
     CHECK (template_state IN ('none', 'proposed', 'confirmed'));
 

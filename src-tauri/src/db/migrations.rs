@@ -182,6 +182,44 @@ mod tests {
         assert_eq!(run, "idle");
     }
 
+    /// `proposed` is storable but unreachable, and both halves matter.
+    ///
+    /// Storable, so a future live-detection flow (Section 7) can use it without
+    /// a migration against live data -- SQLite cannot alter a CHECK without
+    /// rebuilding the table. Unreachable, because the only production writer is
+    /// `compile_and_store_playbook`, and the design's detect -> review ->
+    /// confirm sequence completes before anything is persisted:
+    /// `stop_record_session` writes nothing.
+    ///
+    /// This test exists so the value is documented as deliberate rather than
+    /// sitting in the schema unexplained. If a caller ever writes 'proposed',
+    /// that is a design change, not an accident, and it should be one someone
+    /// argued for.
+    #[test]
+    fn proposed_is_a_valid_state_that_nothing_currently_produces() {
+        let dir = TempDir::new().expect("temp dir");
+        let conn = scratch_db(&dir);
+        insert_playbook(&conn, "p");
+
+        // The real writer produces an answered row, never 'proposed'.
+        let after_store: String = conn
+            .query_row(
+                "SELECT template_state FROM playbooks WHERE id = 'p'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("read back");
+        assert_eq!(after_store, "none");
+
+        // But the schema accepts it, so the future flow that needs it is not
+        // blocked behind a migration.
+        conn.execute(
+            "UPDATE playbooks SET template_state = 'proposed' WHERE id = 'p'",
+            [],
+        )
+        .expect("'proposed' must remain storable");
+    }
+
     #[test]
     fn the_state_columns_reject_values_outside_their_sets() {
         let dir = TempDir::new().expect("temp dir");
