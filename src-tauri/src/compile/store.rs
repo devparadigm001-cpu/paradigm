@@ -476,6 +476,64 @@ mod tests {
         );
     }
 
+    /// The sheet-qualified cell reference must survive compile and the store.
+    ///
+    /// It rides in `element_name` precisely so it takes the path the bare cell
+    /// reference already took, but "should therefore work" is the kind of claim
+    /// this project keeps having to retract. So it is driven through the real
+    /// gate, the real compiler and a real encrypted database, and read back.
+    ///
+    /// Both halves matter. The qualified step must arrive intact *and* still be
+    /// recognised as a grid step by `is_cell_editor`, or replay would resolve it
+    /// as an ordinary selector instead of going through the Name Box.
+    #[test]
+    fn a_sheet_qualified_cell_survives_compile_store_and_load() {
+        use crate::capture::grid::is_cell_editor;
+
+        let dir = TempDir::new().expect("temp dir");
+        let mut conn = scratch_db(&dir);
+
+        let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
+        stream.admit(ActionCandidate {
+            kind: ActionKind::Type,
+            identifiers: vec!["msedge.exe".into()],
+            process_name: Some("msedge.exe".into()),
+            element_role: Some("ComboBox".into()),
+            element_name: Some("Sheet2!B2".into()),
+            payload: Some("hello".into()),
+            detail: None,
+            timestamp_ms: 0,
+        });
+        let playbook = compile(
+            stream.actions(),
+            "Qualified Cell",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        store(&mut conn, &playbook).expect("store playbook");
+
+        let loaded = load(&conn, &playbook.id).expect("load playbook");
+        assert_eq!(loaded.steps.len(), 1);
+        let step = &loaded.steps[0];
+
+        // The payload is where replay reads the target from, so that is what is
+        // asserted -- `StoredStep` exposes no separate name column.
+        let payload: serde_json::Value =
+            serde_json::from_str(&step.action_payload_json).expect("payload is json");
+        assert_eq!(payload["target"]["name"].as_str(), Some("Sheet2!B2"));
+        assert_eq!(payload["target"]["raw_role"].as_str(), Some("ComboBox"));
+
+        // Still a grid step after the round trip -- this is the check that
+        // decides whether replay uses the Name Box at all.
+        assert!(
+            is_cell_editor(
+                payload["target"]["raw_role"].as_str().unwrap_or_default(),
+                payload["target"]["name"].as_str().unwrap_or_default(),
+            ),
+            "a stored qualified reference must still take the grid path"
+        );
+    }
+
     /// Layer 2 of the process-name plumbing: it must survive compile, the
     /// store, and the read back. Verified against a real encrypted database
     /// rather than by inspecting the JSON that `compile` builds, because the
