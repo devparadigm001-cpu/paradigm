@@ -68,6 +68,37 @@ export type NewBatchView = {
   message: string;
 };
 
+/** One record worth looking at (§4.9). */
+export type FlaggedRecordView = {
+  source_row: string;
+  destination_row: string;
+  missing_fields: string[];
+};
+
+/** §4.9's end-of-run summary: quiet by default, detailed only when it matters. */
+export type RunSummaryView = {
+  playbook_id: string;
+  /** "completed" | "stopped" | "needs_correction" | "failed" | "incomplete" */
+  status: string;
+  /** The one plain line a clean run gets. */
+  headline: string;
+  /** "45–57", or null when nothing was written. */
+  processed_range: string | null;
+  written: number;
+  skipped: number;
+  /**
+   * §4.9: "shown only when greater than zero". Render nothing at 0 — a
+   * "0 flagged for review" line is exactly the noise quiet-by-default avoids.
+   */
+  flagged: number;
+  /** Whether the report should expand at all. */
+  needs_attention: boolean;
+  /** Empty on a clean run. */
+  flagged_records: FlaggedRecordView[];
+  /** Why the run ended, when it was not ordinary exhaustion. */
+  stop_reason: string | null;
+};
+
 /** What the running-state overlay renders (§4.6). */
 export type RunStatusView = {
   playbook_id: string | null;

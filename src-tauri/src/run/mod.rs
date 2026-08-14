@@ -257,6 +257,28 @@ impl RunReport {
             .count()
     }
 
+    /// The first and last source records actually written, for §4.9's
+    /// "Processed orders 45–57".
+    ///
+    /// Written records only. Including skipped ones would report a range the
+    /// run did not process, which is the opposite of what §4.9 wants the line
+    /// for -- it "confirms it found the right starting point", and a range
+    /// starting at a record this run deliberately skipped would confirm the
+    /// wrong thing.
+    ///
+    /// `None` when nothing was written, which is a real outcome (everything
+    /// already processed, or stopped before the first record) and not an error.
+    pub fn processed_range(&self) -> Option<(String, String)> {
+        let mut written = self
+            .records
+            .iter()
+            .filter(|r| matches!(r.outcome, RecordOutcome::Written { .. }))
+            .map(|r| r.position.row_key.clone());
+        let first = written.next()?;
+        let last = written.last().unwrap_or_else(|| first.clone());
+        Some((first, last))
+    }
+
     /// Records written despite a gap. §4.4: "log it clearly for the summary."
     pub fn incomplete(&self) -> Vec<&RecordReport> {
         self.records
@@ -1473,6 +1495,80 @@ mod tests {
         assert_eq!(r2.skipped(), 0);
         assert_eq!(processed_count(&conn, &first, "sheet-A").expect("c"), 2);
         assert_eq!(processed_count(&conn, &second, "sheet-A").expect("c"), 2);
+    }
+
+    #[test]
+    fn the_processed_range_covers_only_what_was_written() {
+        // §4.9's line "confirms it found the right starting point". A range
+        // that began at a record this run skipped would confirm the opposite.
+        let (_dir, conn, id) = db_with_playbook();
+        mark_processed(
+            &conn,
+            &id,
+            &SourcePosition {
+                source_id: "sheet-A".into(),
+                row_key: "1".into(),
+            },
+        )
+        .expect("pre-mark");
+
+        let mut reader = FakeReader::new(vec![
+            vec![("C", "Acme")],
+            vec![("C", "Globex")],
+            vec![("C", "Initech")],
+        ]);
+        let mut writer = FakeWriter::new();
+        let report = run(
+            &conn,
+            &id,
+            &template(&[("C", "A")], 1, 1),
+            &mut reader,
+            &mut writer,
+        )
+        .expect("run");
+
+        assert_eq!(report.skipped(), 1);
+        assert_eq!(
+            report.processed_range(),
+            Some(("2".to_string(), "3".to_string())),
+            "the skipped first record must not widen the range"
+        );
+    }
+
+    #[test]
+    fn a_run_that_wrote_nothing_has_no_range() {
+        let (_dir, conn, id) = db_with_playbook();
+        let mut reader = FakeReader::new(vec![]);
+        let mut writer = FakeWriter::new();
+        let report = run(
+            &conn,
+            &id,
+            &template(&[("C", "A")], 1, 1),
+            &mut reader,
+            &mut writer,
+        )
+        .expect("run");
+        assert_eq!(report.processed_range(), None);
+    }
+
+    #[test]
+    fn a_single_written_record_reports_a_range_of_one() {
+        let (_dir, conn, id) = db_with_playbook();
+        let mut reader = FakeReader::new(vec![vec![("C", "Acme")]]);
+        let mut writer = FakeWriter::new();
+        let report = run(
+            &conn,
+            &id,
+            &template(&[("C", "A")], 1, 1),
+            &mut reader,
+            &mut writer,
+        )
+        .expect("run");
+        assert_eq!(
+            report.processed_range(),
+            Some(("1".to_string(), "1".to_string())),
+            "one record is a range from itself to itself, not None"
+        );
     }
 
     #[test]

@@ -1150,6 +1150,193 @@ pub async fn stop_workflow_run(state: State<'_, AppState>) -> Result<RunStatusVi
     })
 }
 
+/// One record worth looking at. §4.9 shows these only when there are any.
+#[derive(Debug, Serialize)]
+pub struct FlaggedRecordView {
+    pub source_row: String,
+    pub destination_row: String,
+    /// Which mapped fields the source did not have a value for.
+    pub missing_fields: Vec<String>,
+}
+
+/// §4.9's end-of-run summary: quiet by default, detailed only when it matters.
+#[derive(Debug, Serialize)]
+pub struct RunSummaryView {
+    pub playbook_id: String,
+    /// `completed` | `stopped` | `needs_correction` | `failed` | `incomplete`
+    pub status: String,
+    /// The one plain line a clean run gets.
+    pub headline: String,
+    /// §4.9's "Processed orders 45–57". Null when nothing was written, which
+    /// is a real outcome rather than an error.
+    pub processed_range: Option<String>,
+    pub written: usize,
+    pub skipped: usize,
+    /// §4.9: "shown only when greater than zero". The frontend hides it at 0
+    /// rather than rendering "0 flagged for review", which would be exactly
+    /// the noise the quiet-by-default rule exists to avoid.
+    pub flagged: usize,
+    /// Whether the report should expand at all.
+    pub needs_attention: bool,
+    /// Empty on a clean run.
+    pub flagged_records: Vec<FlaggedRecordView>,
+    /// Why the run ended, when it was not ordinary exhaustion.
+    pub stop_reason: Option<String>,
+}
+
+/// The summary of the run that just finished (§4.9).
+///
+/// `None` while a run is still going, and `None` when there has not been one.
+/// Those are the same answer for a summary: there is nothing to show yet.
+///
+/// Reading does not clear it -- the user may close the summary and want it
+/// back, and a report that vanished on first read would make that impossible.
+/// `stop_workflow_run` and a new run are what replace it.
+#[tauri::command]
+pub async fn get_workflow_run_report(
+    state: State<'_, AppState>,
+) -> Result<Option<RunSummaryView>, String> {
+    let slot = state.active_run.lock().map_err(|e| e.to_string())?;
+    let Some(active) = slot.as_ref() else {
+        return Ok(None);
+    };
+    let Some(outcome) = active.outcome() else {
+        return Ok(None);
+    };
+    Ok(Some(summarise(&active.playbook_id, &outcome)))
+}
+
+fn summarise(playbook_id: &str, outcome: &run::background::RunOutcome) -> RunSummaryView {
+    use run::background::RunOutcome;
+
+    let base = |status: &str, headline: String, stop_reason: Option<String>| RunSummaryView {
+        playbook_id: playbook_id.to_string(),
+        status: status.to_string(),
+        headline,
+        processed_range: None,
+        written: 0,
+        skipped: 0,
+        flagged: 0,
+        needs_attention: true,
+        flagged_records: Vec::new(),
+        stop_reason,
+    };
+
+    let report = match outcome {
+        // Not a fault, and phrased so: §4.5 wants the correction panel, and a
+        // summary reading "failed" would send the user looking for a bug.
+        RunOutcome::DriftDetected(detail) => {
+            return base(
+                "needs_correction",
+                "Stopped before writing anything — the sheet has changed".to_string(),
+                Some(detail.clone()),
+            )
+        }
+        RunOutcome::Failed(e) => {
+            return base("failed", "The run could not start".to_string(), Some(e.clone()))
+        }
+        RunOutcome::Finished(r) => r,
+    };
+
+    let flagged_records: Vec<FlaggedRecordView> = report
+        .incomplete()
+        .into_iter()
+        .map(|r| FlaggedRecordView {
+            source_row: r.position.row_key.clone(),
+            destination_row: r.destination.clone(),
+            missing_fields: match &r.outcome {
+                run::RecordOutcome::Written {
+                    fit: run::RecordFit::MissingFields { fields },
+                } => fields.clone(),
+                _ => Vec::new(),
+            },
+        })
+        .collect();
+
+    let processed_range = report
+        .processed_range()
+        .map(|(first, last)| if first == last { first } else { format!("{first}–{last}") });
+
+    let (status, stop_reason) = match &report.stop {
+        run::RunStop::Exhausted => ("completed", None),
+        run::RunStop::Stopped { mid_record, .. } => (
+            "stopped",
+            Some(if *mid_record {
+                "You stopped it while it was paused mid-record, so that record was \
+                 discarded and will be redone next time."
+                    .to_string()
+            } else {
+                "You stopped it. The record it was working on finished first.".to_string()
+            }),
+        ),
+        run::RunStop::SuspiciousGap { position, rows_with_data_below } => (
+            "incomplete",
+            Some(format!(
+                "Stopped at row {}: the mapped columns are blank there but {rows_with_data_below} \
+                 row(s) below still have data.",
+                position.row_key
+            )),
+        ),
+        run::RunStop::RecordDoesNotFit { position } => (
+            "incomplete",
+            Some(format!(
+                "Stopped at row {}: it no longer matches the pattern.",
+                position.row_key
+            )),
+        ),
+        run::RunStop::SourceFailed { position, reason } => (
+            "incomplete",
+            Some(format!("Could not read row {}: {reason}", position.row_key)),
+        ),
+        run::RunStop::WriteFailed { position, wrote, reason } => (
+            "incomplete",
+            Some(format!(
+                "Row {} was only part-written ({}) before this failed: {reason}",
+                position.row_key,
+                if wrote.is_empty() { "nothing".to_string() } else { wrote.join(", ") }
+            )),
+        ),
+        run::RunStop::MarkFailed { position, reason } => (
+            "incomplete",
+            Some(format!(
+                "Row {} was written but could not be recorded as done, so a re-run would \
+                 write it twice: {reason}",
+                position.row_key
+            )),
+        ),
+        run::RunStop::LimitReached { limit } => (
+            "incomplete",
+            Some(format!("Stopped after {limit} records, the per-run ceiling.")),
+        ),
+    };
+
+    let written = report.written();
+    let needs_attention = status != "completed" || !flagged_records.is_empty();
+
+    // §4.9: "A clean run gets a short, plain line."
+    let headline = match &processed_range {
+        Some(range) if written == 1 => format!("Processed row {range}."),
+        Some(range) => format!("Processed rows {range} — {written} records."),
+        None if report.skipped() > 0 => {
+            "Nothing new to do — every record was already processed.".to_string()
+        }
+        None => "Nothing was written.".to_string(),
+    };
+
+    RunSummaryView {
+        playbook_id: playbook_id.to_string(),
+        status: status.to_string(),
+        headline,
+        processed_range,
+        written,
+        skipped: report.skipped(),
+        flagged: flagged_records.len(),
+        needs_attention,
+        flagged_records,
+        stop_reason,
+    }
+}
+
 /// The current run's state, for the overlay. Never an error when nothing is
 /// running -- "nothing is running" is an answer, not a failure.
 #[tauri::command]

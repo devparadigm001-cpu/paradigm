@@ -225,6 +225,7 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
             commands::resume_workflow_run,
             commands::stop_workflow_run,
             commands::get_workflow_run_status,
+            commands::get_workflow_run_report,
         ])
 }
 

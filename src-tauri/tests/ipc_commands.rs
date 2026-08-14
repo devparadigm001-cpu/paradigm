@@ -173,6 +173,7 @@ const REGISTERED_COMMANDS: &[(&str, &str)] = &[
     ("resume_workflow_run", "{}"),
     ("stop_workflow_run", "{}"),
     ("get_workflow_run_status", "{}"),
+    ("get_workflow_run_report", "{}"),
 ];
 
 /// The Step 1 regression test, extended to every registered command.

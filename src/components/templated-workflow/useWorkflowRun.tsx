@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { describeError } from "@/lib/errors";
-import type { NewBatchView, PreviewOutcome, PreviewView, RunStatusView } from "./types";
+import type {
+  NewBatchView,
+  PreviewOutcome,
+  PreviewView,
+  RunStatusView,
+  RunSummaryView,
+} from "./types";
 
 /**
  * The one path from "is there anything to do?" to a running workflow.
@@ -29,6 +35,8 @@ export type WorkflowRunStage =
   /** Nothing to preview: exhausted, or drift needs attention first. */
   | { name: "blocked"; reason: string; needsAttention: boolean }
   | { name: "running"; status: RunStatusView }
+  /** §4.9. The run has ended and there is something to say about it. */
+  | { name: "summary"; summary: RunSummaryView }
   | { name: "error"; message: string };
 
 /** How often the overlay asks the backend where the run has got to. */
@@ -110,21 +118,44 @@ export function useWorkflowRun() {
     [],
   );
 
+  /**
+   * §4.9. Fetch the report once the run has ended.
+   *
+   * Falls back to the running view if there is no report yet: a finished
+   * thread whose outcome has not been stored is a moment, not a state, and
+   * showing an error for it would be wrong.
+   */
+  const showSummary = useCallback(async (status: RunStatusView) => {
+    try {
+      const summary = await invoke<RunSummaryView | null>(
+        "get_workflow_run_report",
+      );
+      if (summary) setStage({ name: "summary", summary });
+      else setStage({ name: "running", status });
+    } catch (e) {
+      setStage({ name: "error", message: describeError(e) });
+    }
+  }, []);
+
   const pollStatus = useCallback(() => {
     stopPolling();
     pollRef.current = window.setInterval(() => {
       void (async () => {
         try {
           const status = await invoke<RunStatusView>("get_workflow_run_status");
-          setStage({ name: "running", status });
-          if (status.finished) stopPolling();
+          if (status.finished) {
+            stopPolling();
+            await showSummary(status);
+          } else {
+            setStage({ name: "running", status });
+          }
         } catch (e) {
           stopPolling();
           setStage({ name: "error", message: describeError(e) });
         }
       })();
     }, POLL_MS);
-  }, [stopPolling]);
+  }, [stopPolling, showSummary]);
 
   /** §4.3's "confirm". The only way into a run. */
   const confirmPreview = useCallback(async () => {
@@ -172,11 +203,14 @@ export function useWorkflowRun() {
     try {
       const status = await invoke<RunStatusView>("stop_workflow_run");
       stopPolling();
-      setStage({ name: "running", status: { ...status, finished: true } });
+      // Stop is permanent, so the next thing to show is the summary --
+      // but the run thread may still be finishing the record it was on, so
+      // the report is fetched rather than assumed to exist yet.
+      await showSummary({ ...status, finished: true });
     } catch (e) {
       setStage({ name: "error", message: describeError(e) });
     }
-  }, [stopPolling]);
+  }, [stopPolling, showSummary]);
 
   return {
     stage,

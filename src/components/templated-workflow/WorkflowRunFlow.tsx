@@ -1,5 +1,10 @@
 import { Button } from "@/components/ui/button";
-import type { NewBatchView, PreviewView, RunStatusView } from "./types";
+import type {
+  NewBatchView,
+  PreviewView,
+  RunStatusView,
+  RunSummaryView,
+} from "./types";
 import type { WorkflowRunStage } from "./useWorkflowRun";
 
 /**
@@ -78,6 +83,8 @@ export function WorkflowRunFlow({
           onDismiss={onDismiss}
         />
       );
+    case "summary":
+      return <RunSummary summary={stage.summary} onDismiss={onDismiss} />;
     case "error":
       return (
         <Card>
@@ -90,6 +97,90 @@ export function WorkflowRunFlow({
         </Card>
       );
   }
+}
+
+/**
+ * §4.9: "quiet by default, detailed only when it matters."
+ *
+ * A clean run renders one line and a Close button — no counts table, no
+ * per-record list, and specifically no "0 flagged for review", which is the
+ * noise the rule exists to prevent. Everything below the headline appears only
+ * when the backend says `needs_attention`.
+ */
+function RunSummary({
+  summary,
+  onDismiss,
+}: {
+  summary: RunSummaryView;
+  onDismiss: () => void;
+}) {
+  const clean = !summary.needs_attention;
+  return (
+    <Card wide={!clean}>
+      <div className="flex items-center gap-2">
+        <span
+          aria-hidden
+          className={
+            clean
+              ? "size-2 rounded-full bg-emerald-500"
+              : "size-2 rounded-full bg-amber-500"
+          }
+        />
+        <p className="text-sm font-medium">
+          {clean ? "Run finished" : "Run finished — needs a look"}
+        </p>
+      </div>
+
+      {/* §4.9's plain line. Always shown; on a clean run it is the whole
+          report. */}
+      <p className="mt-1 text-sm">{summary.headline}</p>
+
+      {summary.needs_attention ? (
+        <div className="mt-3 flex flex-col gap-2 border-t pt-3">
+          {summary.stop_reason ? (
+            <p className="text-sm">{summary.stop_reason}</p>
+          ) : null}
+
+          {/* Shown only when greater than zero — §4.9 is explicit. */}
+          {summary.flagged > 0 ? (
+            <>
+              <p className="text-sm font-medium">
+                {summary.flagged} flagged for review
+              </p>
+              <ul className="flex flex-col gap-1">
+                {summary.flagged_records.map((record) => (
+                  <li key={record.source_row} className="text-xs">
+                    <span className="font-mono">row {record.source_row}</span>{" "}
+                    → destination row{" "}
+                    <span className="font-mono">{record.destination_row}</span>
+                    {record.missing_fields.length > 0 ? (
+                      <span className="text-muted-foreground">
+                        {" "}
+                        — nothing in{" "}
+                        {record.missing_fields.join(", ")}, written blank
+                      </span>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : null}
+
+          {summary.skipped > 0 ? (
+            <p className="text-muted-foreground text-xs">
+              {summary.skipped} already processed, so left alone.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div className="mt-3 flex justify-end">
+        <Button variant="outline" size="sm" onClick={onDismiss}>
+          Close
+        </Button>
+      </div>
+    </Card>
+  );
 }
 
 /**
