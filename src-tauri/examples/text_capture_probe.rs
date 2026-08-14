@@ -11874,6 +11874,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "sheetsreplaytab") {
         return sheetsreplaytab_mode().await;
     }
+    if std::env::args().any(|a| a == "uiflow") {
+        return uiflow_mode().await;
+    }
     if std::env::args().any(|a| a == "templatedbatch") {
         return templatedbatch_mode().await;
     }
@@ -14170,6 +14173,444 @@ async fn templatedbatch_mode() -> ExitCode {
         "\n{}",
         if pass {
             "PASS -- §4.8 found exactly the new records and ran them through the gate"
+        } else {
+            "FAIL -- see above"
+        }
+    );
+    if pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// uiflow -- Section 6 driven through Paradigm's OWN accessibility tree.
+//
+// Every backend item in this build was verified by driving a real surface and
+// checking the result against CSV. This does the same to the product's own UI:
+// it clicks the real buttons, in the real running app, and then asks Google
+// Sheets what actually happened.
+//
+// Only possible since --force-renderer-accessibility; before that the window
+// exposed no operable controls at all.
+//
+// Usage: uiflow <data-dir>     (the same PARADIGM_DATA_DIR the app was given)
+// ---------------------------------------------------------------------------
+
+/// Find a button in the Paradigm window by exact accessible name.
+async fn app_button(desktop: &Desktop, name: &str) -> Option<UIElement> {
+    let windows = desktop
+        .locator("role:Window")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .ok()?;
+    let window = windows
+        .into_iter()
+        .find(|w| w.name().unwrap_or_default().trim() == "Paradigm")?;
+    let buttons = desktop
+        .locator("role:Button")
+        .within(window)
+        .all(Some(Duration::from_secs(6)), None)
+        .await
+        .ok()?;
+    buttons
+        .into_iter()
+        .find(|b| b.name().unwrap_or_default().trim() == name)
+}
+
+/// Every piece of text currently on screen in the app window.
+async fn app_text(desktop: &Desktop) -> Vec<String> {
+    let Ok(windows) = desktop
+        .locator("role:Window")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+    else {
+        return Vec::new();
+    };
+    let Some(window) = windows
+        .into_iter()
+        .find(|w| w.name().unwrap_or_default().trim() == "Paradigm")
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for role in ["role:Text", "role:Button"] {
+        if let Ok(found) = desktop
+            .locator(role)
+            .within(window.clone())
+            .all(Some(Duration::from_secs(5)), None)
+            .await
+        {
+            for el in found {
+                let n = el.name().unwrap_or_default().trim().to_string();
+                if !n.is_empty() {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Click a named button, reporting honestly if it is not there.
+async fn click_app_button(desktop: &Desktop, name: &str) -> Result<(), String> {
+    let el = app_button(desktop, name)
+        .await
+        .ok_or_else(|| format!("no button named {name:?} in the Paradigm window"))?;
+    el.click()
+        .map_err(|e| format!("clicking {name:?} failed: {e}"))?;
+    Ok(())
+}
+
+/// Wait until some text appears on screen, or give up and say what WAS there.
+async fn wait_for_text(desktop: &Desktop, needle: &str, secs: u64) -> Result<String, String> {
+    for _ in 0..secs {
+        let text = app_text(desktop).await;
+        if let Some(hit) = text.iter().find(|t| t.contains(needle)) {
+            return Ok(hit.clone());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let text = app_text(desktop).await;
+    Err(format!(
+        "waited {secs}s for text containing {needle:?}; on screen instead:\n    {}",
+        text.join("\n    ")
+    ))
+}
+
+async fn uiflow_mode() -> ExitCode {
+    use paradigm_lib::compile::CompiledTemplate;
+    use paradigm_lib::detect::FieldMapping;
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::DestinationWriter;
+
+    let data_dir = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| String::from("C:\\Users\\amitj\\AppData\\Local\\Temp\\claude\\paradigm-ui-test"));
+    println!("== uiflow: Section 6 through the app's own accessibility tree ==\n");
+    println!("data dir: {data_dir}");
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Confirm the app is up and its controls are reachable BEFORE doing any
+    // setup, so a failure here is unambiguous.
+    match app_button(&desktop, "Refresh").await {
+        Some(_) => println!("app window reachable, controls exposed\n"),
+        None => {
+            eprintln!("the Paradigm window has no reachable 'Refresh' button.");
+            eprintln!("Is it running, and is --force-renderer-accessibility in effect?");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // ---- a real source and destination -------------------------------------
+    let browser = "msedge";
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let Some((_w, doc_id)) = sheets_window(&desktop).await else {
+        eprintln!("no spreadsheet window");
+        return ExitCode::FAILURE;
+    };
+    println!("doc id: {doc_id}");
+    if !ensure_second_sheet(&desktop).await {
+        eprintln!("could not add Sheet2");
+        return ExitCode::FAILURE;
+    }
+    let gid2 = match goto_sheet_via_namebox(&desktop, "Sheet2!A1").await {
+        Some(g) => g,
+        None => {
+            eprintln!("could not reach Sheet2");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let rows = [("Acme", "100"), ("Globex", "200"), ("Initech", "300")];
+    println!("seeding Sheet1 + Sheet2 headers...");
+    {
+        let Some((window, _)) = sheets_window(&desktop).await else {
+            eprintln!("lost the window");
+            return ExitCode::FAILURE;
+        };
+        let Ok(mut src) = SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet1"),
+            Some("Sheet1".into()),
+            1,
+        )
+        .await
+        else {
+            eprintln!("Sheet1 writer failed");
+            return ExitCode::FAILURE;
+        };
+        for (c, v) in [("C", "Customer"), ("D", "Amount")] {
+            if let Err(e) = src.write(c, v) {
+                eprintln!("header {c}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        let _ = src.advance(1);
+        for (n, a) in rows {
+            if let Err(e) = src.write("C", n).and_then(|_| src.write("D", a)) {
+                eprintln!("seed row: {e}");
+                return ExitCode::FAILURE;
+            }
+            let _ = src.advance(1);
+        }
+        let Ok(mut dst) = SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet2"),
+            Some("Sheet2".into()),
+            1,
+        )
+        .await
+        else {
+            eprintln!("Sheet2 writer failed");
+            return ExitCode::FAILURE;
+        };
+        for (c, v) in [("A", "Client"), ("B", "Total")] {
+            if let Err(e) = dst.write(c, v) {
+                eprintln!("destination header {c}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    println!("  seeded\n");
+
+    // ---- a templated playbook in the APP's own database ---------------------
+    //
+    // Written directly rather than recorded through the UI: the post-stop
+    // prompt needs a genuine copy-paste recording, which is a separate live
+    // exercise. What this drives is everything from the stored workflow
+    // onwards -- §4.8's prompt, §4.3's preview, §4.6's controls, §4.9's
+    // summary -- through the real buttons.
+    let (db_path, key_path) = paradigm_lib::db::paths_in(std::path::Path::new(&data_dir));
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("could not open the app's database: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stream = paradigm_lib::capture::CapturedStream::new(
+        paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
+    );
+    stream.admit(paradigm_lib::capture::ActionCandidate {
+        kind: paradigm_lib::capture::ActionKind::Click,
+        identifiers: vec!["msedge.exe".into()],
+        process_name: None,
+        element_role: Some("Button".into()),
+        element_name: Some("Next".into()),
+        payload: None,
+        detail: None,
+        timestamp_ms: 0,
+    });
+    let template = CompiledTemplate {
+        source_id: format!("{doc_id}!Sheet1"),
+        destination_id: format!("{doc_id}!Sheet2"),
+        source_step: 1,
+        destination_step: 1,
+        examples: 3,
+        fields: vec![
+            FieldMapping {
+                source_field: "C".into(),
+                destination_field: "A".into(),
+            },
+            FieldMapping {
+                source_field: "D".into(),
+                destination_field: "B".into(),
+            },
+        ],
+    };
+    let playbook = paradigm_lib::compile::compile(
+        stream.actions(),
+        "UI flow probe",
+        &paradigm_lib::compile::ReversibilityPolicy::placeholder(),
+        &paradigm_lib::labeling::RedactionPolicy::placeholder(),
+    )
+    .with_template(template.clone());
+    if let Err(e) = paradigm_lib::compile::store::store(&mut conn, &playbook) {
+        eprintln!("store: {e}");
+        return ExitCode::FAILURE;
+    }
+    drop(conn);
+    println!("stored templated playbook {}\n", playbook.id);
+
+    // ---- now drive the real UI ---------------------------------------------
+    println!("-- clicking Refresh --");
+    if let Err(e) = click_app_button(&desktop, "Refresh").await {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    match wait_for_text(&desktop, "repeating", 10).await {
+        Ok(t) => println!("  list shows the templated badge: {t:?}"),
+        Err(e) => {
+            eprintln!("  the repeating badge never appeared.\n{e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    println!("\n-- §4.8: clicking 'Check for new' --");
+    let check = app_button(&desktop, "Check for new").await;
+    let check_label = match &check {
+        Some(_) => "Check for new".to_string(),
+        None => {
+            // The aria-label carries position, so match on a prefix instead.
+            let Ok(windows) = desktop
+                .locator("role:Window")
+                .within(desktop.root())
+                .all(Some(Duration::from_secs(8)), Some(3))
+                .await
+            else {
+                eprintln!("lost the window");
+                return ExitCode::FAILURE;
+            };
+            let Some(window) = windows
+                .into_iter()
+                .find(|w| w.name().unwrap_or_default().trim() == "Paradigm")
+            else {
+                eprintln!("lost the window");
+                return ExitCode::FAILURE;
+            };
+            let buttons = desktop
+                .locator("role:Button")
+                .within(window)
+                .all(Some(Duration::from_secs(6)), None)
+                .await
+                .unwrap_or_default();
+            match buttons
+                .iter()
+                .find(|b| b.name().unwrap_or_default().starts_with("Check for new records"))
+            {
+                Some(b) => b.name().unwrap_or_default(),
+                None => {
+                    eprintln!("no 'Check for new' button found. Buttons on screen:");
+                    for b in &buttons {
+                        eprintln!("  {:?}", b.name().unwrap_or_default());
+                    }
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+    if let Err(e) = click_app_button(&desktop, &check_label).await {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+
+    // "Run the workflow on these" and NOT "new record": the loading text is
+    // "Looking for new records…", which contains the shorter needle, so the
+    // first version of this matched the spinner and clicked on before the scan
+    // had finished. Each peek is a real navigation, so the scan takes seconds.
+    let batch_line = match wait_for_text(&desktop, "Run the workflow on these", 120).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  the batch prompt never appeared.\n{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  prompt: {batch_line:?}");
+    let batch_ok = batch_line.contains("3 new") && batch_line.contains("row 2");
+
+    println!("\n-- §4.3: clicking 'Preview first record' --");
+    if let Err(e) = click_app_button(&desktop, "Preview first record").await {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    let preview_line = match wait_for_text(&desktop, "About to write", 120).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  the preview never appeared.\n{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  preview: {preview_line:?}");
+    let on_screen = app_text(&desktop).await;
+    let shows_value = on_screen.iter().any(|t| t.contains("Acme"));
+    println!("  shows the real value 'Acme': {shows_value}");
+    let preview_ok = preview_line.contains("row 2") && shows_value;
+
+    println!("\n-- confirming: 'Looks right — run the rest' --");
+    let confirm = on_screen
+        .iter()
+        .find(|t| t.starts_with("Looks right"))
+        .cloned()
+        .unwrap_or_else(|| "Looks right — run the rest".to_string());
+    if let Err(e) = click_app_button(&desktop, &confirm).await {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+
+    // §4.6's overlay, then §4.9's summary.
+    let running = wait_for_text(&desktop, "Running", 30).await;
+    match &running {
+        Ok(t) => println!("  overlay: {t:?}"),
+        Err(_) => println!("  (never caught the Running state -- may have completed too fast)"),
+    }
+
+    let summary_line = match wait_for_text(&desktop, "Processed", 240).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  the summary never appeared.\n{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  summary: {summary_line:?}");
+    let summary_ok = summary_line.contains("2") && summary_line.contains("4");
+
+    // ---- ground truth -------------------------------------------------------
+    println!("\n-- CSV ground truth --");
+    let Some(csv) = download_csv(browser, &doc_id, &gid2).await else {
+        eprintln!("could not download Sheet2");
+        return ExitCode::FAILURE;
+    };
+    println!("{}", csv.trim());
+    let mut written_ok = true;
+    for (i, (name, amount)) in rows.iter().enumerate() {
+        let row = i + 2;
+        let a = csv_at(&csv, 1, row).unwrap_or_default();
+        let b = csv_at(&csv, 2, row).unwrap_or_default();
+        let good = a.trim() == *name && b.trim() == *amount;
+        println!(
+            "  A{row}={a:?} B{row}={b:?} expected {name:?}/{amount:?}  {}",
+            if good { "OK" } else { "WRONG" }
+        );
+        written_ok &= good;
+    }
+
+    println!("\n== VERDICT ==");
+    println!("  templated badge in the list        : true");
+    println!("  §4.8 prompt: 3 new, at row 2       : {batch_ok}");
+    println!("  §4.3 preview: row 2, real value    : {preview_ok}");
+    println!("  §4.6 overlay appeared              : {}", running.is_ok());
+    println!("  §4.9 summary: processed 2-4        : {summary_ok}");
+    println!("  destination matches source (CSV)   : {written_ok}");
+    println!("\n  doc id for cleanup: {doc_id}");
+
+    let pass = batch_ok && preview_ok && summary_ok && written_ok;
+    println!(
+        "\n{}",
+        if pass {
+            "PASS -- Section 6 driven end to end through the app's real UI"
         } else {
             "FAIL -- see above"
         }
