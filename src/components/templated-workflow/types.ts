@@ -54,8 +54,17 @@ export type PreviewView = {
  */
 export type PreviewOutcome =
   | ({ kind: "ready" } & PreviewView)
-  | { kind: "nothingToDo"; reason: string }
-  | { kind: "needsAttention"; reason: string };
+  | { kind: "nothingToDo"; reason: string; corrections: CorrectionRequestView[] }
+  | { kind: "needsAttention"; reason: string; corrections: CorrectionRequestView[] };
+
+/** One blocking drift, structured enough to drive the correction panel. */
+export type CorrectionRequestView = {
+  side: CorrectionSide;
+  old_locator: string;
+  old_label: string | null;
+  best_guess: string | null;
+  detail: string;
+};
 
 /** The answer to "is there anything new to do?" (§4.8). */
 export type NewBatchView = {
@@ -97,6 +106,41 @@ export type RunSummaryView = {
   flagged_records: FlaggedRecordView[];
   /** Why the run ended, when it was not ordinary exhaustion. */
   stop_reason: string | null;
+};
+
+/** Which side of a mapping a correction applies to. */
+export type CorrectionSide = "source" | "destination";
+
+/** What the user has selected in the live spreadsheet (§4.5). */
+export type SelectionView = {
+  column: string;
+  /** The header at that column. Null when the column has none. */
+  label: string | null;
+};
+
+/**
+ * What the correction panel is being asked to fix.
+ *
+ * Built from a blocking `DriftFinding`: the side and the locator that moved,
+ * plus the best guess when the backend has one (`Drift::Moved` carries it).
+ */
+export type CorrectionRequest = {
+  playbookId: string;
+  side: CorrectionSide;
+  /** The locator the template names, and which is now wrong. */
+  oldLocator: string;
+  /** What that column was called when the workflow was confirmed. */
+  oldLabel: string | null;
+  /** §4.5's "Looks like column D now?" — null when there is no plausible one. */
+  bestGuess: string | null;
+  /** Human-readable description of what drifted. */
+  detail: string;
+  /**
+   * The source row a one-off would apply to. Null when no run is in progress,
+   * which is what makes the one-off option unavailable — a one-off correction
+   * with no record to attach to is not a thing §4.5 describes.
+   */
+  sourceRow: string | null;
 };
 
 /** What the running-state overlay renders (§4.6). */

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { describeError } from "@/lib/errors";
 import type {
+  CorrectionRequestView,
   NewBatchView,
   PreviewOutcome,
   PreviewView,
@@ -33,7 +34,14 @@ export type WorkflowRunStage =
   /** §4.3's confirm/cancel. */
   | { name: "preview"; preview: PreviewView }
   /** Nothing to preview: exhausted, or drift needs attention first. */
-  | { name: "blocked"; reason: string; needsAttention: boolean }
+  | {
+      name: "blocked";
+      reason: string;
+      needsAttention: boolean;
+      /** §4.5: what the correction panel can offer to repoint. Empty when
+       * nothing here is correctable -- a suspicious gap, for instance. */
+      corrections: CorrectionRequestView[];
+    }
   | { name: "running"; status: RunStatusView }
   /** §4.9. The run has ended and there is something to say about it. */
   | { name: "summary"; summary: RunSummaryView }
@@ -101,6 +109,7 @@ export function useWorkflowRun() {
               name: "blocked",
               reason: outcome.reason,
               needsAttention: false,
+              corrections: outcome.corrections,
             });
             break;
           case "needsAttention":
@@ -108,6 +117,7 @@ export function useWorkflowRun() {
               name: "blocked",
               reason: outcome.reason,
               needsAttention: true,
+              corrections: outcome.corrections,
             });
             break;
         }

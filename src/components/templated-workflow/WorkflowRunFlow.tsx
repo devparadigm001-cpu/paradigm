@@ -21,6 +21,7 @@ export function WorkflowRunFlow({
   onCancelPreview,
   onPause,
   onResume,
+  onCorrect,
   onStop,
   onDismiss,
 }: {
@@ -30,6 +31,8 @@ export function WorkflowRunFlow({
   onCancelPreview: () => void;
   onPause: () => void;
   onResume: () => void;
+  /** §4.5: open the correction panel for the blocking drift. */
+  onCorrect: () => void;
   onStop: () => void;
   onDismiss: () => void;
 }) {
@@ -66,10 +69,18 @@ export function WorkflowRunFlow({
           >
             {stage.reason}
           </p>
-          <div className="mt-3 flex justify-end">
+          <div className="mt-3 flex justify-end gap-2">
             <Button variant="outline" size="sm" onClick={onDismiss}>
               Close
             </Button>
+            {/* §4.5: offered only when something is actually repointable. A
+                suspicious gap is blocking and has no column to correct, and a
+                Fix button there would lead to a panel with nothing to do. */}
+            {stage.corrections.length > 0 ? (
+              <Button size="sm" onClick={onCorrect}>
+                Fix the column
+              </Button>
+            ) : null}
           </div>
         </Card>
       );

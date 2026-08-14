@@ -155,6 +155,10 @@ const REGISTERED_COMMANDS: &[(&str, &str)] = &[
     // against a playbook that does not exist; the one-off errors with "no
     // workflow run is in progress", which is the command working.
     (
+        "read_selected_column",
+        r#"{"playbookId":"x","side":"source"}"#,
+    ),
+    (
         "apply_permanent_correction",
         r#"{"playbookId":"x","side":"source","oldLocator":"C","newLocator":"D","newLabel":"L"}"#,
     ),

@@ -14848,7 +14848,7 @@ async fn uiflow_mode() -> ExitCode {
 async fn templatedcorrection_mode() -> ExitCode {
     use paradigm_lib::compile::CompiledTemplate;
     use paradigm_lib::detect::FieldMapping;
-    use paradigm_lib::run::correction::{OneOffCorrection, RunCorrections};
+    use paradigm_lib::run::correction::OneOffCorrection;
     use paradigm_lib::run::drift::Side;
     use paradigm_lib::run::preview::{next_record, Upcoming};
     use paradigm_lib::run::spreadsheet::SpreadsheetWriter;

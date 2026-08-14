@@ -217,6 +217,7 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
             commands::replay_playbook,
             commands::get_run_history,
             commands::get_orphaned_run_history,
+            commands::read_selected_column,
             commands::apply_permanent_correction,
             commands::apply_one_off_correction,
             commands::check_for_new_records,

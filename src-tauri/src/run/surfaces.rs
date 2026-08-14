@@ -22,6 +22,7 @@ use terminator::{Desktop, UIElement};
 use crate::compile::CompiledTemplate;
 use crate::run::background::{SurfaceFactory, Surfaces};
 use crate::run::spreadsheet::SpreadsheetWriter;
+use crate::run::DestinationWriter;
 use crate::source::spreadsheet::SpreadsheetReader;
 
 /// Split `<document>!<sheet>` into its two halves.
@@ -127,6 +128,94 @@ pub async fn open_for(
     .map_err(|e| format!("could not open the destination: {e}"))?;
 
     Ok((Box::new(reader), Box::new(writer)))
+}
+
+/// What the user has selected in a surface, in the terms a correction needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    /// The column letter, e.g. `"D"`.
+    pub column: String,
+    /// The header at that column, when it has one. §4.5's panel says "You
+    /// selected column D — 'Client Phone.'", and the quoted half comes from
+    /// here; without it the confirmation can only name a letter, which is a
+    /// far weaker guard against a mis-click.
+    pub label: Option<String>,
+}
+
+/// Read the cell the user currently has selected on one side of a workflow.
+///
+/// This is what makes §4.5's interaction *click-only*: the user clicks a column
+/// in the live spreadsheet, and this reports which one, so nothing has to be
+/// typed. Nothing else in the system asks this question -- readers and writers
+/// both *set* the selection through the Name Box and never read it back as user
+/// input.
+///
+/// ## It puts the selection back
+///
+/// Reading the header label means navigating to the header row, which moves the
+/// user's cursor. Leaving it there would be a UI that quietly rearranges the
+/// document it is asking about -- and worse, a second read would then report
+/// the header cell as the user's selection. So the original cell is restored
+/// afterwards, best-effort: failing to restore is not worth failing the read
+/// the user is waiting on.
+pub async fn read_selection(
+    desktop: &Desktop,
+    surface_id: &str,
+    header_row: u64,
+) -> Result<Selection, String> {
+    let (document, sheet) = split_surface_id(surface_id);
+    let window = window_for(desktop, document)
+        .await
+        .ok_or_else(|| format!("no open window is showing {document}"))?;
+
+    let name_box = desktop
+        .locator("name:Name box")
+        .within(window.clone())
+        .all(Some(std::time::Duration::from_secs(5)), None)
+        .await
+        .map_err(|e| format!("Name Box lookup failed: {e}"))?
+        .into_iter()
+        .next()
+        .and_then(|g| {
+            g.children()
+                .ok()
+                .and_then(|c| c.into_iter().find(|e| e.role() == "Edit"))
+        })
+        .ok_or_else(|| "no Name Box, so there is no way to tell what is selected".to_string())?;
+
+    let raw = name_box.text(0).unwrap_or_default();
+    let raw = raw.trim().to_string();
+    let (column, _row) = crate::source::spreadsheet::parse_cell_ref(&raw)
+        .ok_or_else(|| format!("the Name Box reads {raw:?}, which is not a single cell"))?;
+
+    // The header for that column, read through a writer because it is the one
+    // that exposes `shape` for arbitrary columns.
+    let label = match SpreadsheetWriter::open(
+        desktop.clone(),
+        &window,
+        surface_id.to_string(),
+        sheet.map(str::to_string),
+        header_row,
+    )
+    .await
+    {
+        Ok(mut w) => w
+            .shape(&[column.clone()], header_row)
+            .ok()
+            .and_then(|s| s.columns.into_iter().next())
+            .map(|c| c.label),
+        Err(_) => None,
+    };
+
+    // Put the cursor back where the user left it.
+    let restore = match sheet {
+        Some(s) => format!("{s}!{raw}"),
+        None => raw.clone(),
+    };
+    let _ = name_box.set_value(&restore);
+    let _ = name_box.press_key("{Enter}");
+
+    Ok(Selection { column, label })
 }
 
 /// A [`SurfaceFactory`] that resolves the windows on the run's own thread.

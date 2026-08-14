@@ -18,7 +18,12 @@ import {
   type ReplayReportView,
 } from "@/components/record-mode";
 import { ReplayProgressScreen, ReplayResultScreen } from "@/components/replay";
-import { useWorkflowRun, WorkflowRunFlow } from "@/components/templated-workflow";
+import {
+  CorrectionPanel,
+  useWorkflowRun,
+  WorkflowRunFlow,
+  type CorrectionRequest,
+} from "@/components/templated-workflow";
 import {
   isProofWindow,
   isRecordingBadgeWindow,
@@ -312,6 +317,11 @@ function MainWindowView() {
   }
 
   const workflowRun = useWorkflowRun();
+  // §4.5's panel is held here rather than inside WorkflowRunFlow: it must stay
+  // on screen while the user clicks into the spreadsheet, which means it cannot
+  // be owned by a component that re-renders on every run-status poll.
+  const [correction, setCorrection] = useState<CorrectionRequest | null>(null);
+  const [correctionResult, setCorrectionResult] = useState<string | null>(null);
   const recordMode = useRecordMode();
 
   if (recordMode.captureSummary) {
@@ -422,8 +432,62 @@ function MainWindowView() {
         onPause={() => void workflowRun.pause()}
         onResume={() => void workflowRun.resume()}
         onStop={() => void workflowRun.stop()}
+        onCorrect={() => {
+          // Only reachable when the blocked stage actually carries something
+          // repointable -- the button that leads here is not rendered
+          // otherwise.
+          if (
+            workflowRun.stage.name === "blocked" &&
+            workflowRun.stage.corrections.length > 0 &&
+            workflowRun.playbookId
+          ) {
+            const first = workflowRun.stage.corrections[0];
+            setCorrection({
+              playbookId: workflowRun.playbookId,
+              side: first.side,
+              oldLocator: first.old_locator,
+              oldLabel: first.old_label,
+              bestGuess: first.best_guess,
+              detail: first.detail,
+              // Drift is checked before a run starts, so nothing is in
+              // progress and there is no record for a one-off to attach to.
+              // The panel disables that option rather than offering one that
+              // would fail.
+              sourceRow: null,
+            });
+          }
+        }}
         onDismiss={workflowRun.reset}
       />
+
+      {correction ? (
+        <CorrectionPanel
+          request={correction}
+          onResolved={(summary) => setCorrectionResult(summary)}
+          onDismiss={() => {
+            setCorrection(null);
+            workflowRun.reset();
+          }}
+        />
+      ) : null}
+
+      {correctionResult ? (
+        <div
+          role="status"
+          className="bg-background fixed bottom-4 left-4 z-50 w-80 rounded-md border p-3 shadow-lg"
+        >
+          <p className="text-sm">{correctionResult}</p>
+          <div className="mt-2 flex justify-end">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setCorrectionResult(null)}
+            >
+              Close
+            </Button>
+          </div>
+        </div>
+      ) : null}
 
       <div className="mt-4 flex w-full max-w-md flex-col items-center gap-2 rounded-md border border-dashed p-4">
         <p className="text-muted-foreground text-center text-xs font-medium tracking-wide uppercase">

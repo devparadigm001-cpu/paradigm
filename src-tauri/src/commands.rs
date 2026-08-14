@@ -581,6 +581,48 @@ fn parse_side(raw: &str) -> Result<run::drift::Side, String> {
         .ok_or_else(|| format!("side must be \"source\" or \"destination\", not {raw:?}"))
 }
 
+/// What the user has selected, for the correction panel's confirm step.
+#[derive(Debug, Serialize)]
+pub struct SelectionView {
+    pub column: String,
+    pub label: Option<String>,
+}
+
+/// Read the column the user has clicked in the live spreadsheet (§4.5).
+///
+/// This is what makes the interaction click-only: the panel asks the user to
+/// click the right column and then reads which one, so nothing is typed and a
+/// mis-typed letter cannot silently repoint a mapping.
+#[tauri::command]
+pub async fn read_selected_column(
+    state: State<'_, AppState>,
+    playbook_id: String,
+    side: String,
+    header_row: Option<u64>,
+) -> Result<SelectionView, String> {
+    let side = parse_side(&side)?;
+    let template = {
+        let conn = state.db.lock().await;
+        store::load_template(&conn, &playbook_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "that playbook is not a templated workflow".to_string())?
+    };
+    let surface = match side {
+        run::drift::Side::Source => template.source_id,
+        run::drift::Side::Destination => template.destination_id,
+    };
+
+    let desktop = terminator::Desktop::new(false, false)
+        .map_err(|e| format!("accessibility engine unavailable: {e}"))?;
+    let selection =
+        run::surfaces::read_selection(&desktop, &surface, header_row.unwrap_or(1)).await?;
+
+    Ok(SelectionView {
+        column: selection.column,
+        label: selection.label,
+    })
+}
+
 /// Repoint a mapped column permanently (§4.5's "the format actually changed").
 ///
 /// Updates the stored mapping AND re-records the shape, so the next drift
@@ -757,6 +799,60 @@ pub struct PreviewView {
 #[derive(Debug, Serialize)]
 pub struct NothingToPreview {
     pub reason: String,
+    /// Empty unless something is correctable.
+    ///
+    /// A prose reason cannot drive §4.5's panel: it needs the side, the locator
+    /// that moved and the best guess as separate values in order to build a
+    /// correction out of them.
+    pub corrections: Vec<CorrectionRequestView>,
+}
+
+/// One blocking drift, structured enough to drive the correction panel.
+#[derive(Debug, Serialize)]
+pub struct CorrectionRequestView {
+    /// `source` or `destination`.
+    pub side: String,
+    /// The locator the template names, and which is now wrong.
+    pub old_locator: String,
+    /// What that column was called when the workflow was confirmed.
+    pub old_label: Option<String>,
+    /// §4.5's "Looks like column D now?", when there is a plausible one.
+    pub best_guess: Option<String>,
+    pub detail: String,
+}
+
+/// Turn the blocking half of a drift check into correction requests.
+fn correctable(check: &run::drift::DriftCheck) -> Vec<CorrectionRequestView> {
+    check
+        .findings()
+        .iter()
+        .filter(|f| f.blocking)
+        .map(|f| {
+            // The locator and label the recorded shape knew, which is what the
+            // panel has to name when it asks "use this for X?".
+            let (old_locator, old_label) = match &f.drift {
+                crate::source::Drift::LabelChanged { locator, was, .. } => {
+                    (locator.clone(), Some(was.clone()))
+                }
+                crate::source::Drift::Moved { label, was, .. } => {
+                    (was.clone(), Some(label.clone()))
+                }
+                crate::source::Drift::Missing { locator, label } => {
+                    (locator.clone(), Some(label.clone()))
+                }
+                crate::source::Drift::Added { locator, label } => {
+                    (locator.clone(), Some(label.clone()))
+                }
+            };
+            CorrectionRequestView {
+                side: f.side.as_str().to_string(),
+                old_locator,
+                old_label,
+                best_guess: f.best_guess.clone(),
+                detail: f.describe(),
+            }
+        })
+        .collect()
 }
 
 /// The answer to "what would this workflow do next?".
@@ -894,6 +990,9 @@ pub async fn preview_workflow_run(
                     })
                     .collect::<Vec<_>>()
                     .join("; "),
+                // The same findings as structure, so the panel can build a
+                // correction rather than parse a sentence.
+                corrections: correctable(&check),
             }));
         }
 
@@ -948,6 +1047,7 @@ pub async fn preview_workflow_run(
     match upcoming {
         run::preview::Upcoming::NothingToDo => Ok(PreviewOutcome::NothingToDo(NothingToPreview {
             reason: "every record in the source has already been processed".to_string(),
+            corrections: Vec::new(),
         })),
         run::preview::Upcoming::SuspiciousGap {
             position,
@@ -958,6 +1058,9 @@ pub async fn preview_workflow_run(
                  it still have data, so this may not be the end of the source",
                 position.row_key
             ),
+            // A suspicious gap is not a mapping problem: there is nothing here
+            // for the correction panel to repoint.
+            corrections: Vec::new(),
         })),
         run::preview::Upcoming::Ready(mut preview) => {
             run::preview::label_fields(&mut preview, &source_shape, &destination_shape);
@@ -1786,6 +1889,7 @@ mod tests {
 
         let nothing = PreviewOutcome::NothingToDo(NothingToPreview {
             reason: "all done".into(),
+            corrections: Vec::new(),
         });
         assert_eq!(
             serde_json::to_value(&nothing).expect("serialise")["kind"],
@@ -1795,6 +1899,13 @@ mod tests {
 
         let attention = PreviewOutcome::NeedsAttention(NothingToPreview {
             reason: "a column moved".into(),
+            corrections: vec![CorrectionRequestView {
+                side: "destination".into(),
+                old_locator: "A".into(),
+                old_label: Some("Client".into()),
+                best_guess: Some("D".into()),
+                detail: "The destination column A was \"Client\"".into(),
+            }],
         });
         assert_eq!(
             serde_json::to_value(&attention).expect("serialise")["kind"],
