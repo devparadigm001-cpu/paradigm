@@ -532,10 +532,12 @@ as an extension of what already exists there, not a separate flow.
 > ```
 >
 > Reproduce with `text_capture_probe -- uiflow <data-dir>` against a running
-> `npm run tauri dev`. **The app must have OPENED its database rather than
-> created it** — see
-> [cross-connection-writes-invisible-when-app-created-the-db.md](../known-issues/cross-connection-writes-invisible-when-app-created-the-db.md),
-> which is an open question in its own right.
+> `npm run tauri dev`. (An earlier note here claimed the app had to have
+> *opened* its database rather than created it. That was a wrong inference
+> from a coincidence — see
+> [the closed investigation](../known-issues/cross-connection-writes-invisible-when-app-created-the-db.md).
+> The real cause was a driver click that was delivered and never acted on;
+> either configuration works.)
 >
 > **Items 5 and 6 remain blocked on backend item 12.** Building either against
 > an assumed backend would produce a correction panel that collects a column

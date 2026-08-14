@@ -14515,13 +14515,11 @@ async fn uiflow_mode() -> ExitCode {
 
     // ---- now drive the real UI ---------------------------------------------
     println!("-- clicking Refresh --");
-    if let Err(e) = click_app_button(&desktop, "Refresh").await {
-        eprintln!("{e}");
-        return ExitCode::FAILURE;
-    }
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    match wait_for_text(&desktop, "repeating", 10).await {
+    // Retried, like every other click here. This was the last one still
+    // trusting that `click()` returning Ok meant the page had reacted, and it
+    // is the click whose failures were misread as a database-visibility
+    // problem for an entire investigation.
+    match click_and_wait(&desktop, "Refresh", "repeating", 15, 4).await {
         Ok(t) => println!("  list shows the templated badge: {t:?}"),
         Err(e) => {
             eprintln!("  the repeating badge never appeared.\n{e}");
