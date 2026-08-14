@@ -15544,25 +15544,26 @@ async fn uicorrection_mode() -> ExitCode {
     // Row 3 is the corrected one. Row 4 is the assertion that matters: with a
     // one-off it must read C ("Initech"); with a permanent correction it must
     // read E ("INITECH INC").
+    // Rows 4 and 5 read the OLD column in BOTH scopes, and that is correct
+    // rather than a miss. The loop takes the template by value at spawn, so a
+    // permanent correction repoints the STORED mapping and this batch keeps
+    // using its snapshot. What the permanent scope must fix inside this run is
+    // the record the user was paused on -- row 3. The new mapping is verified
+    // on a SUBSEQUENT run, below, which is the only place it can honestly be
+    // observed.
     let expected: [(usize, &str); 4] = [
         (2, "Acme"),
         (3, "GLOBEX LTD"),
-        (4, if permanent { "INITECH INC" } else { "Initech" }),
-        (5, if permanent { "UMBRELLA PLC" } else { "Umbrella" }),
+        (4, "Initech"),
+        (5, "Umbrella"),
     ];
     let mut all_ok = true;
     for (row, name) in expected {
         let a = csv_at(&csv, 1, row).unwrap_or_default();
         let good = a.trim() == name;
         let note = match row {
-            3 => "corrected",
-            4 | 5 => {
-                if permanent {
-                    "should follow the new mapping"
-                } else {
-                    "must be UNAFFECTED"
-                }
-            }
+            3 => "the record the user corrected",
+            4 | 5 => "same run, so still the snapshot mapping",
             _ => "before the correction",
         };
         println!(
@@ -15570,6 +15571,67 @@ async fn uicorrection_mode() -> ExitCode {
             if good { "OK" } else { "WRONG" }
         );
         all_ok &= good;
+    }
+
+    // For the permanent scope, a SECOND run over NEW rows is the only place
+    // the repointed mapping can be observed: rows 2-5 are already marked
+    // processed, so a re-run skips them.
+    let mut new_rows_use_e = true;
+    if permanent {
+        println!("
+-- adding rows 6-7 and running again --");
+        let more: [(&str, &str, &str); 2] =
+            [("Tyrell", "500", "TYRELL CORP"), ("Soylent", "600", "SOYLENT LLC")];
+        if let Some((window, _)) = sheets_window(&desktop).await {
+            if let Ok(mut src) = SpreadsheetWriter::open(
+                desktop.clone(),
+                &window,
+                format!("{doc_id}!Sheet1"),
+                Some("Sheet1".into()),
+                6,
+            )
+            .await
+            {
+                for (n, a, alt) in more {
+                    let _ = src.write("C", n);
+                    let _ = src.write("D", a);
+                    let _ = src.write("E", alt);
+                    let _ = src.advance(1);
+                }
+            }
+        }
+        let _ = click_app_button(&desktop, "Close").await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if click_and_wait(&desktop, &check_label, "Run the workflow on these", 150, 3)
+            .await
+            .is_ok()
+            && click_and_wait(&desktop, "Preview first record", "About to write", 90, 3)
+                .await
+                .is_ok()
+        {
+            let c2 = app_text(&desktop)
+                .await
+                .into_iter()
+                .find(|t| t.starts_with("Looks right"))
+                .unwrap_or_else(|| "Looks right {2014} run the rest".to_string());
+            let _ = click_app_button(&desktop, &c2).await;
+            let _ = wait_for_text(&desktop, "Processed", 300).await;
+        }
+        if let Some(csv2) = download_csv(browser, &doc_id, &gid2).await {
+            println!("Sheet2 after the second run:
+{}", csv2.trim());
+            for (row, want) in [(6usize, "TYRELL CORP"), (7usize, "SOYLENT LLC")] {
+                let a = csv_at(&csv2, 1, row).unwrap_or_default();
+                let good = a.trim() == want;
+                println!(
+                    "  A{row}={a:?} expected {want:?} (new run, repointed mapping)  {}",
+                    if good { "OK" } else { "WRONG" }
+                );
+                new_rows_use_e &= good;
+            }
+        } else {
+            new_rows_use_e = false;
+        }
     }
 
     // For the permanent scope, the stored mapping must genuinely be repointed.
@@ -15601,13 +15663,16 @@ async fn uicorrection_mode() -> ExitCode {
     println!("\n== VERDICT ({scope}) ==");
     println!("  run paused on the incomplete record : {names_row_3}");
     println!("  panel understood column E           : {understood_e}");
-    println!("  CSV matches the expected shape      : {all_ok}");
+    println!("  the corrected record was written    : {all_ok}");
+    if permanent {
+        println!("  a LATER run uses the new mapping    : {new_rows_use_e}");
+    }
     if permanent {
         println!("  template genuinely repointed        : {repointed}");
     }
     println!("\n  doc id for cleanup: {doc_id}");
 
-    let pass = names_row_3 && understood_e && all_ok && repointed;
+    let pass = names_row_3 && understood_e && all_ok && repointed && new_rows_use_e;
     println!(
         "\n{}",
         if pass {

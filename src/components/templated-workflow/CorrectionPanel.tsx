@@ -89,8 +89,33 @@ export function CorrectionPanel({
           // shape that no longer describes the sheet.
           newLabel: label ?? column,
         });
+
+        // ALSO fix the record in hand.
+        //
+        // The permanent correction repoints the stored template, and the run in
+        // progress does not read it again — `spawn` takes the template by value
+        // and the loop uses that clone for the life of the batch. So without
+        // this, the record the user was paused on and had just corrected got
+        // written blank and marked processed, and a re-run then skipped it: the
+        // correction never reached the one row it was made from. Measured live
+        // before this line existed.
+        //
+        // One click writing to two places is the cost, and it is the smaller
+        // one: the alternative is a permanent correction that visibly fails to
+        // fix the record the user was looking at when they made it.
+        if (request.sourceRow) {
+          await invoke("apply_one_off_correction", {
+            sourceRow: request.sourceRow,
+            side: request.side,
+            oldLocator: request.oldLocator,
+            newLocator: column,
+          });
+        }
+
         onResolved(
-          `${columnName} now reads from column ${column}, from now on.`,
+          request.sourceRow
+            ? `Row ${request.sourceRow} is fixed, and ${columnName} reads from column ${column} from now on.`
+            : `${columnName} now reads from column ${column}, from now on.`,
         );
       } else {
         if (!request.sourceRow) {
