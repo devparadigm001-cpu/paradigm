@@ -11874,6 +11874,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "sheetsreplaytab") {
         return sheetsreplaytab_mode().await;
     }
+    if std::env::args().any(|a| a == "templatedbatch") {
+        return templatedbatch_mode().await;
+    }
     if std::env::args().any(|a| a == "templateddrift") {
         return templateddrift_mode().await;
     }
@@ -13753,6 +13756,420 @@ async fn templateddrift_mode() -> ExitCode {
         "\n{}",
         if pass {
             "PASS -- §4.5 caught a real alteration before any write"
+        } else {
+            "FAIL -- see above"
+        }
+    );
+    if pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// templatedbatch -- §4.8 against a real spreadsheet.
+//
+// The claim is not "scan can count rows". It is that after a workflow has run,
+// a scan of the SAME source reports nothing new -- and then, once rows are
+// genuinely added, reports exactly those and nothing already processed. Then
+// that confirmation has to lead into the ordinary gated run, appending rather
+// than overwriting what the first batch wrote.
+//
+// Ground truth is the per-sheet CSV export.
+// ---------------------------------------------------------------------------
+
+async fn templatedbatch_mode() -> ExitCode {
+    use paradigm_lib::compile::CompiledTemplate;
+    use paradigm_lib::detect::FieldMapping;
+    use paradigm_lib::run::batch::{resume_destination_row, scan, BatchScan};
+    use paradigm_lib::run::preview::{next_record, Upcoming};
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::{background::RunOutcome, DestinationWriter, RunControl};
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+
+    println!("== templatedbatch: §4.8 against a real spreadsheet ==\n");
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let browser = "msedge";
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let Some((_w, doc_id)) = sheets_window(&desktop).await else {
+        eprintln!("no 'Untitled spreadsheet' window");
+        return ExitCode::FAILURE;
+    };
+    println!("doc id: {doc_id}");
+    if !ensure_second_sheet(&desktop).await {
+        eprintln!("could not create a second sheet");
+        return ExitCode::FAILURE;
+    }
+    let gid2 = match goto_sheet_via_namebox(&desktop, "Sheet2!A1").await {
+        Some(g) => g,
+        None => {
+            eprintln!("could not reach Sheet2");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("Sheet2 gid={gid2}\n");
+
+    let first_batch = [("Acme", "100"), ("Globex", "200"), ("Initech", "300")];
+    let second_batch = [("Umbrella", "400"), ("Tyrell", "500")];
+
+    // Seeds `rows` into Sheet1 starting at `start_row`.
+    async fn seed(
+        desktop: &Desktop,
+        doc_id: &str,
+        start_row: u64,
+        rows: &[(&str, &str)],
+        headers: bool,
+    ) -> Result<(), String> {
+        let (window, _) = sheets_window(desktop)
+            .await
+            .ok_or_else(|| "no spreadsheet window".to_string())?;
+        let mut w = SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet1"),
+            Some("Sheet1".into()),
+            start_row,
+        )
+        .await
+        .map_err(|e| format!("opening a writer on Sheet1: {e}"))?;
+
+        if headers {
+            for (c, v) in [("C", "Customer"), ("D", "Amount")] {
+                w.write(c, v).map_err(|e| format!("header {c}: {e}"))?;
+            }
+            w.advance(1).map_err(|e| format!("advance: {e}"))?;
+        }
+        for (n, a) in rows {
+            w.write("C", n).map_err(|e| format!("C={n:?}: {e}"))?;
+            w.write("D", a).map_err(|e| format!("D={a:?}: {e}"))?;
+            w.advance(1).map_err(|e| format!("advance: {e}"))?;
+        }
+        Ok(())
+    }
+
+    println!("-- seeding Sheet1 (headers + 3 rows) --");
+    if let Err(e) = seed(&desktop, &doc_id, 1, &first_batch, true).await {
+        eprintln!("seeding failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    {
+        let Some((window, _)) = sheets_window(&desktop).await else {
+            eprintln!("lost window");
+            return ExitCode::FAILURE;
+        };
+        let Ok(mut dst) = SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet2"),
+            Some("Sheet2".into()),
+            1,
+        )
+        .await
+        else {
+            eprintln!("Sheet2 writer failed");
+            return ExitCode::FAILURE;
+        };
+        for (c, v) in [("A", "Client"), ("B", "Total")] {
+            if dst.write(c, v).is_err() {
+                eprintln!("destination header failed");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    println!("   done\n");
+
+    // ---- the workflow -------------------------------------------------------
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("db: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stream = paradigm_lib::capture::CapturedStream::new(
+        paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
+    );
+    stream.admit(paradigm_lib::capture::ActionCandidate {
+        kind: paradigm_lib::capture::ActionKind::Click,
+        identifiers: vec!["msedge.exe".into()],
+        process_name: None,
+        element_role: Some("Button".into()),
+        element_name: Some("Next".into()),
+        payload: None,
+        detail: None,
+        timestamp_ms: 0,
+    });
+    let template = CompiledTemplate {
+        source_id: format!("{doc_id}!Sheet1"),
+        destination_id: format!("{doc_id}!Sheet2"),
+        source_step: 1,
+        destination_step: 1,
+        examples: 3,
+        fields: vec![
+            FieldMapping {
+                source_field: "C".into(),
+                destination_field: "A".into(),
+            },
+            FieldMapping {
+                source_field: "D".into(),
+                destination_field: "B".into(),
+            },
+        ],
+    };
+    let playbook = paradigm_lib::compile::compile(
+        stream.actions(),
+        "Batch probe",
+        &paradigm_lib::compile::ReversibilityPolicy::placeholder(),
+        &paradigm_lib::labeling::RedactionPolicy::placeholder(),
+    )
+    .with_template(template.clone());
+    if let Err(e) = paradigm_lib::compile::store::store(&mut conn, &playbook) {
+        eprintln!("store: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let unsure = paradigm_lib::detect::verify::Verdict::Unsure {
+        confidence: 0.0,
+        reason: "not the subject of this probe".into(),
+    };
+
+    // Opens a source reader at row 2.
+    async fn source_reader(
+        desktop: &Desktop,
+        doc_id: &str,
+    ) -> Option<SpreadsheetReader> {
+        let (window, _) = sheets_window(desktop).await?;
+        SpreadsheetReader::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet1"),
+            Some("Sheet1".into()),
+            2,
+            1,
+            vec!["C".into(), "D".into()],
+        )
+        .await
+        .ok()
+    }
+
+    // ---- scan BEFORE any run: everything is new ----------------------------
+    println!("-- scan before the first run --");
+    let Some(mut r0) = source_reader(&desktop, &doc_id).await else {
+        eprintln!("reader failed");
+        return ExitCode::FAILURE;
+    };
+    let scan0 = match scan(&conn, &playbook.id, &template, &mut r0) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("scan: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  {}", scan0.describe());
+    let initial_ok = scan0
+        == BatchScan::Found {
+            count: 3,
+            first_row: "2".into(),
+            capped: false,
+        };
+    println!("  expected 3 new starting at row 2: {initial_ok}");
+
+    // ---- run the first batch ------------------------------------------------
+    println!("\n-- running the first batch --");
+    let Some(mut r1) = source_reader(&desktop, &doc_id).await else {
+        eprintln!("reader failed");
+        return ExitCode::FAILURE;
+    };
+    let Ok(Upcoming::Ready(p1)) =
+        next_record(&conn, &playbook.id, &template, &mut r1, 2, unsure.clone())
+    else {
+        eprintln!("preview failed");
+        return ExitCode::FAILURE;
+    };
+    let auth1 = p1.accept();
+    let a1 = match paradigm_lib::run::background::spawn(
+        db_path.clone(),
+        key_path.clone(),
+        playbook.id.clone(),
+        template.clone(),
+        1,
+        RunControl::new(),
+        auth1,
+        paradigm_lib::run::surfaces::factory_for(template.clone(), 2, 1, 2),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("spawn: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let o1 = a1.join();
+    let ran1 = matches!(&o1, Some(RunOutcome::Finished(r)) if r.written() == 3);
+    println!("  first batch written: {ran1}");
+
+    // ---- scan again: nothing new -------------------------------------------
+    println!("\n-- scan after the first run, source unchanged --");
+    let Some(mut r2) = source_reader(&desktop, &doc_id).await else {
+        eprintln!("reader failed");
+        return ExitCode::FAILURE;
+    };
+    let scan1 = match scan(&conn, &playbook.id, &template, &mut r2) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("scan: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  {}", scan1.describe());
+    let nothing_new_ok = scan1 == BatchScan::NothingNew;
+    println!("  expected NothingNew: {nothing_new_ok}");
+
+    // ---- add genuinely new rows --------------------------------------------
+    println!("\n-- adding 2 new rows to the source --");
+    if let Err(e) = seed(&desktop, &doc_id, 5, &second_batch, false).await {
+        eprintln!("could not add new rows: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("   Sheet1 rows 5-6 added");
+
+    println!("\n-- scan after adding --");
+    let Some(mut r3) = source_reader(&desktop, &doc_id).await else {
+        eprintln!("reader failed");
+        return ExitCode::FAILURE;
+    };
+    let scan2 = match scan(&conn, &playbook.id, &template, &mut r3) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("scan: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  {}", scan2.describe());
+    let found_ok = scan2
+        == BatchScan::Found {
+            count: 2,
+            first_row: "5".into(),
+            capped: false,
+        };
+    println!("  expected exactly 2 new starting at row 5: {found_ok}");
+
+    // ---- confirm, and run through the ordinary gate -------------------------
+    println!("\n-- confirming the batch: into the SAME preview + authorization path --");
+    let resume = match resume_destination_row(
+        &conn,
+        &playbook.id,
+        &template.source_id,
+        2,
+        template.destination_step,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("resume row: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  destination resumes at row {resume} (derived from the ledger count)");
+
+    let Some(mut r4) = source_reader(&desktop, &doc_id).await else {
+        eprintln!("reader failed");
+        return ExitCode::FAILURE;
+    };
+    let Ok(Upcoming::Ready(p2)) =
+        next_record(&conn, &playbook.id, &template, &mut r4, resume, unsure)
+    else {
+        eprintln!("preview failed");
+        return ExitCode::FAILURE;
+    };
+    println!(
+        "  preview: source row {} -> destination row {}, first field {:?}",
+        p2.position().row_key,
+        p2.destination_row(),
+        p2.fields()[0].value
+    );
+    let preview_ok = p2.position().row_key == "5" && p2.fields()[0].value == "Umbrella";
+    let auth2 = p2.accept();
+
+    let a2 = match paradigm_lib::run::background::spawn(
+        db_path.clone(),
+        key_path.clone(),
+        playbook.id.clone(),
+        template.clone(),
+        1,
+        RunControl::new(),
+        auth2,
+        paradigm_lib::run::surfaces::factory_for(template.clone(), 2, 1, resume),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("spawn: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let o2 = a2.join();
+    println!("  outcome: {o2:?}");
+    let ran2 = matches!(&o2, Some(RunOutcome::Finished(r)) if r.written() == 2 && r.skipped() == 3);
+
+    // ---- ground truth -------------------------------------------------------
+    let Some(csv) = download_csv(browser, &doc_id, &gid2).await else {
+        eprintln!("could not download Sheet2");
+        return ExitCode::FAILURE;
+    };
+    println!("\nSheet2 CSV:\n{}", csv.trim());
+
+    let mut all = Vec::new();
+    all.extend_from_slice(&first_batch);
+    all.extend_from_slice(&second_batch);
+    let mut written_ok = true;
+    for (i, (name, amount)) in all.iter().enumerate() {
+        let row = i + 2;
+        let a = csv_at(&csv, 1, row).unwrap_or_default();
+        let b = csv_at(&csv, 2, row).unwrap_or_default();
+        let good = a.trim() == *name && b.trim() == *amount;
+        println!(
+            "  Sheet2 A{row}={a:?} B{row}={b:?}  expected {name:?}/{amount:?}  {}",
+            if good { "OK" } else { "WRONG" }
+        );
+        written_ok &= good;
+    }
+
+    println!("\n== VERDICT ==");
+    println!("  fresh source: all 3 detected as new    : {initial_ok}");
+    println!("  after running: nothing new detected    : {nothing_new_ok}");
+    println!("  after adding 2: exactly 2, at row 5    : {found_ok}");
+    println!("  confirmation led into the gated preview: {preview_ok}");
+    println!("  second run wrote 2, skipped 3          : {ran2}");
+    println!("  first batch not overwritten            : {written_ok}");
+
+    let pass =
+        initial_ok && ran1 && nothing_new_ok && found_ok && preview_ok && ran2 && written_ok;
+    println!(
+        "\n{}",
+        if pass {
+            "PASS -- §4.8 found exactly the new records and ran them through the gate"
         } else {
             "FAIL -- see above"
         }

@@ -31,6 +31,7 @@
 //! lives from its read to its write and is then dropped.
 
 pub mod background;
+pub mod batch;
 pub mod control;
 pub mod drift;
 pub mod preview;
@@ -575,7 +576,20 @@ pub fn run_with_control(
                     destination: writer.position(),
                     outcome: RecordOutcome::AlreadyProcessed,
                 });
-                if let Some(stop) = advance_both(reader, writer, template, &position) {
+                // The SOURCE advances; the destination does NOT.
+                //
+                // The destination position means "where the next write goes",
+                // and skipping a record writes nothing, so moving it would
+                // leave a gap the size of however many records were skipped.
+                //
+                // This was wrong until a live run caught it: a second batch
+                // resumed the destination at row 5 (correct), then skipped the
+                // three already-processed source rows and advanced the writer
+                // three times along with them, so the new records landed at
+                // rows 8 and 9 with three blank rows above them. Both halves
+                // were individually defensible and together they double-counted
+                // the same three records.
+                if let Some(stop) = advance_source(reader, template, &position) {
                     break stop;
                 }
                 continue;
@@ -696,9 +710,8 @@ pub fn run_with_control(
 /// The source advances one position at a time, `source_step` times, because
 /// that is the only motion [`SourceReader`] exposes -- a step of 2 means every
 /// other row, so it takes two moves to get there.
-fn advance_both(
+fn advance_source(
     reader: &mut dyn SourceReader,
-    writer: &mut dyn DestinationWriter,
     template: &CompiledTemplate,
     position: &SourcePosition,
 ) -> Option<RunStop> {
@@ -709,6 +722,18 @@ fn advance_both(
                 reason: e.to_string(),
             });
         }
+    }
+    None
+}
+
+fn advance_both(
+    reader: &mut dyn SourceReader,
+    writer: &mut dyn DestinationWriter,
+    template: &CompiledTemplate,
+    position: &SourcePosition,
+) -> Option<RunStop> {
+    if let Some(stop) = advance_source(reader, template, position) {
+        return Some(stop);
     }
     if let Err(e) = writer.advance(template.destination_step) {
         return Some(RunStop::WriteFailed {
@@ -1145,8 +1170,19 @@ mod tests {
 
         assert_eq!(report.written(), 2);
         assert_eq!(report.skipped(), 1);
-        let values: Vec<&str> = writer.writes.iter().map(|w| w.2.as_str()).collect();
-        assert_eq!(values, vec!["Acme", "Initech"], "Globex was already done");
+
+        // Rows, not just values. This test previously asserted only the values
+        // and passed while the destination was advancing on skipped records --
+        // which put a blank row in the middle of every resumed batch. A live
+        // run caught it; the assertion that should have is this one.
+        assert_eq!(
+            writer.writes,
+            vec![
+                ("2".to_string(), "A".to_string(), "Acme".to_string()),
+                ("3".to_string(), "A".to_string(), "Initech".to_string()),
+            ],
+            "a skipped record must not leave a gap in the destination"
+        );
     }
 
     #[test]

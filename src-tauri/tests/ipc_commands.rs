@@ -151,6 +151,12 @@ const REGISTERED_COMMANDS: &[(&str, &str)] = &[
     ("replay_playbook", r#"{"playbookId":"does-not-exist"}"#),
     ("get_run_history", r#"{"playbookId":"does-not-exist"}"#),
     ("get_orphaned_run_history", "{}"),
+    // §4.8's batch scan. Reaches the "not a templated workflow" error, which
+    // is the command working -- reachability is what this list checks.
+    (
+        "check_for_new_records",
+        r#"{"playbookId":"does-not-exist"}"#,
+    ),
     // §4.3's preview and the run start it gates. `start_workflow_run` errors
     // here with "no confirmed first-record preview", which is the gate working
     // rather than a fault -- reachability is what this test checks.

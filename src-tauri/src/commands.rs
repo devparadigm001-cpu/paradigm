@@ -570,6 +570,89 @@ fn confirmed_template(state: &State<'_, AppState>) -> Result<CompiledTemplate, S
     }
 }
 
+// ------------------------------------------- §4.8 new-batch detection ----
+
+/// The answer to "is there anything new to do?".
+#[derive(Debug, Serialize)]
+pub struct NewBatchView {
+    pub playbook_id: String,
+    /// True only when there is work. The frontend shows the confirmation on
+    /// this and nothing else.
+    pub has_work: bool,
+    pub count: usize,
+    pub first_row: Option<String>,
+    /// The count is a floor, because the scan stopped at its ceiling.
+    pub capped: bool,
+    /// The sentence §4.8 asks for, already worded.
+    pub message: String,
+}
+
+/// Look for new, unprocessed records in a workflow's source (§4.8).
+///
+/// ## This cannot start a run
+///
+/// It returns a count and a sentence. Answering "yes, run these" means calling
+/// `preview_workflow_run` and then `start_workflow_run`, exactly as any other
+/// route to a run does -- there is no batch-specific entry point, because a
+/// second way in would be a second gate to keep correct, and the weaker one
+/// would win.
+///
+/// §4.10 scopes the watching: "whenever the app is open (including minimized)
+/// -- not a separate, persistent background service". This is a command the app
+/// calls; nothing here runs on its own.
+#[tauri::command]
+pub async fn check_for_new_records(
+    state: State<'_, AppState>,
+    playbook_id: String,
+    source_row: Option<u64>,
+    header_row: Option<u64>,
+) -> Result<NewBatchView, String> {
+    let template = {
+        let conn = state.db.lock().await;
+        store::load_template(&conn, &playbook_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "that playbook is not a templated workflow".to_string())?
+    };
+
+    let desktop = terminator::Desktop::new(false, false)
+        .map_err(|e| format!("accessibility engine unavailable: {e}"))?;
+    let (mut reader, _writer) = run::surfaces::open_for(
+        &desktop,
+        &template,
+        source_row.unwrap_or(2),
+        header_row.unwrap_or(1),
+        // The scan never writes, so where the destination would start is
+        // irrelevant to it. Passed only because opening a writer is part of
+        // resolving the pair.
+        2,
+    )
+    .await?;
+
+    let scan = {
+        let conn = state.db.lock().await;
+        run::batch::scan(&conn, &playbook_id, &template, reader.as_mut())
+            .map_err(|e| e.to_string())?
+    };
+
+    let (count, first_row, capped) = match &scan {
+        run::batch::BatchScan::Found {
+            count,
+            first_row,
+            capped,
+        } => (*count, Some(first_row.clone()), *capped),
+        _ => (0, None, false),
+    };
+
+    Ok(NewBatchView {
+        playbook_id,
+        has_work: scan.has_work() && count > 0,
+        count,
+        first_row,
+        capped,
+        message: scan.describe(),
+    })
+}
+
 // ------------------------------------- §4.3 first-record safety check ----
 
 /// One mapped field of the record about to be written.
@@ -635,7 +718,29 @@ pub async fn preview_workflow_run(
 
     let source_row = source_row.unwrap_or(2);
     let header_row = header_row.unwrap_or(1);
-    let destination_row = destination_row.unwrap_or(2);
+
+    // Where the destination carries on, derived rather than assumed.
+    //
+    // Defaulting this to "the first row" would be wrong for every run after
+    // the first: a second batch would overwrite the first batch's output
+    // instead of appending to it. The ledger knows how many records this
+    // workflow has taken from this source, and a count plus the advancement
+    // rule gives the row -- without ever storing a row index, which §3 does
+    // not allow. An explicit value from the caller still wins.
+    let destination_row = match destination_row {
+        Some(r) => r,
+        None => {
+            let conn = state.db.lock().await;
+            run::batch::resume_destination_row(
+                &conn,
+                &playbook_id,
+                &template.source_id,
+                2,
+                template.destination_step,
+            )
+            .map_err(|e| e.to_string())?
+        }
+    };
 
     let desktop = terminator::Desktop::new(false, false)
         .map_err(|e| format!("accessibility engine unavailable: {e}"))?;
@@ -886,6 +991,24 @@ pub async fn start_workflow_run(
     );
 
     let control = run::RunControl::new();
+    // Resolved the same way the preview resolves it, so the run writes where
+    // the user was shown it would. Two different defaults here would mean the
+    // preview showed row 5 and the run wrote row 2.
+    let destination_row = match destination_row {
+        Some(r) => r,
+        None => {
+            let conn = state.db.lock().await;
+            run::batch::resume_destination_row(
+                &conn,
+                &playbook_id,
+                &template.source_id,
+                2,
+                template.destination_step,
+            )
+            .map_err(|e| e.to_string())?
+        }
+    };
+
     let active = run::background::spawn(
         db_path,
         key_path,
@@ -898,7 +1021,7 @@ pub async fn start_workflow_run(
             template,
             source_row.unwrap_or(2),
             header_row.unwrap_or(1),
-            destination_row.unwrap_or(2),
+            destination_row,
         ),
     )?;
 

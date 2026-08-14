@@ -217,6 +217,7 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
             commands::replay_playbook,
             commands::get_run_history,
             commands::get_orphaned_run_history,
+            commands::check_for_new_records,
             commands::preview_workflow_run,
             commands::cancel_workflow_preview,
             commands::start_workflow_run,
