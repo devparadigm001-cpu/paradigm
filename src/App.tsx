@@ -493,8 +493,15 @@ function MainWindowView() {
           request={correction}
           onResolved={(summary) => setCorrectionResult(summary)}
           onDismiss={() => {
+            // Closes the PANEL only.
+            //
+            // This used to call `workflowRun.reset()` as well, which was wrong
+            // in the case that matters: a supervised run is paused while the
+            // panel is open, and resetting drops the overlay -- taking the
+            // Resume button with it and leaving the run paused with no way to
+            // continue it. Correcting a record and dismissing the panel should
+            // hand the user straight back to the run they were in.
             setCorrection(null);
-            workflowRun.reset();
           }}
         />
       ) : null}

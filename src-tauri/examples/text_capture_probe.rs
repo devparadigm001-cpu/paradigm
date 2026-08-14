@@ -11874,6 +11874,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "sheetsreplaytab") {
         return sheetsreplaytab_mode().await;
     }
+    if std::env::args().any(|a| a == "uicorrection") {
+        return uicorrection_mode().await;
+    }
     if std::env::args().any(|a| a == "uiflow") {
         return uiflow_mode().await;
     }
@@ -15148,6 +15151,467 @@ async fn templatedcorrection_mode() -> ExitCode {
         "\n{}",
         if pass {
             "PASS -- the correction applied to exactly one record and no other"
+        } else {
+            "FAIL -- see above"
+        }
+    );
+    if pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// uicorrection -- §4.5's correction flow, driven through the app's own UI.
+//
+// Sheet1 carries THREE mapped-ish columns: C (customer), D (amount) and E (the
+// same customer worded differently). Row 3 is missing C but has D and E, which
+// is the only shape that produces MissingFields: with a single mapped column,
+// "missing" and "blank" are the same thing and `peek` reports a gap before the
+// record is ever read.
+//
+// Run with `oneoff` or `permanent` to pick which scope to drive.
+// ---------------------------------------------------------------------------
+
+async fn uicorrection_mode() -> ExitCode {
+    use paradigm_lib::compile::CompiledTemplate;
+    use paradigm_lib::detect::FieldMapping;
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::DestinationWriter;
+
+    let permanent = std::env::args().any(|a| a == "permanent");
+    let scope = if permanent { "permanent" } else { "one-off" };
+    let data_dir = std::env::args()
+        .find(|a| a.contains("paradigm-ui-test"))
+        .unwrap_or_else(|| {
+            String::from("C:\\Users\\amitj\\AppData\\Local\\Temp\\claude\\paradigm-ui-test")
+        });
+
+    println!("== uicorrection: §4.5 through the app's UI, scope = {scope} ==\n");
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if app_button(&desktop, "Refresh").await.is_none() {
+        eprintln!("the Paradigm window is not reachable. Is it running?");
+        return ExitCode::FAILURE;
+    }
+    println!("app reachable\n");
+
+    let browser = "msedge";
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let Some((_w, doc_id)) = sheets_window(&desktop).await else {
+        eprintln!("no spreadsheet window");
+        return ExitCode::FAILURE;
+    };
+    println!("doc id: {doc_id}");
+    if !ensure_second_sheet(&desktop).await {
+        eprintln!("could not add Sheet2");
+        return ExitCode::FAILURE;
+    }
+    let gid2 = match goto_sheet_via_namebox(&desktop, "Sheet2!A1").await {
+        Some(g) => g,
+        None => {
+            eprintln!("could not reach Sheet2");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Row 3 is the odd one: no C, but D and E are present.
+    let rows: [(&str, &str, &str); 4] = [
+        ("Acme", "100", "ACME CORP"),
+        ("", "200", "GLOBEX LTD"), // <- missing the mapped column C
+        ("Initech", "300", "INITECH INC"),
+        ("Umbrella", "400", "UMBRELLA PLC"),
+    ];
+
+    println!("\n-- seeding --");
+    {
+        let Some((window, _)) = sheets_window(&desktop).await else {
+            eprintln!("lost the window");
+            return ExitCode::FAILURE;
+        };
+        let Ok(mut src) = SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet1"),
+            Some("Sheet1".into()),
+            1,
+        )
+        .await
+        else {
+            eprintln!("Sheet1 writer failed");
+            return ExitCode::FAILURE;
+        };
+        for (c, v) in [("C", "Customer"), ("D", "Amount"), ("E", "Customer Alt")] {
+            if let Err(e) = src.write(c, v) {
+                eprintln!("header {c}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        let _ = src.advance(1);
+        for (n, a, alt) in rows {
+            // A blank C is written as a blank, which is what makes the record
+            // incomplete rather than absent.
+            if !n.is_empty() {
+                if let Err(e) = src.write("C", n) {
+                    eprintln!("C: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            if src.write("D", a).is_err() || src.write("E", alt).is_err() {
+                eprintln!("seeding row failed");
+                return ExitCode::FAILURE;
+            }
+            let _ = src.advance(1);
+        }
+        let Ok(mut dst) = SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet2"),
+            Some("Sheet2".into()),
+            1,
+        )
+        .await
+        else {
+            eprintln!("Sheet2 writer failed");
+            return ExitCode::FAILURE;
+        };
+        for (c, v) in [("A", "Client"), ("B", "Total")] {
+            if let Err(e) = dst.write(c, v) {
+                eprintln!("destination header: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    println!("   Sheet1 rows 2-5 (row 3 has no C), Sheet2 headers\n");
+
+    // ---- the workflow, into the app's own database --------------------------
+    let (db_path, key_path) = paradigm_lib::db::paths_in(std::path::Path::new(&data_dir));
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("db: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stream = paradigm_lib::capture::CapturedStream::new(
+        paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
+    );
+    stream.admit(paradigm_lib::capture::ActionCandidate {
+        kind: paradigm_lib::capture::ActionKind::Click,
+        identifiers: vec!["msedge.exe".into()],
+        process_name: None,
+        element_role: Some("Button".into()),
+        element_name: Some("Next".into()),
+        payload: None,
+        detail: None,
+        timestamp_ms: 0,
+    });
+    let template = CompiledTemplate {
+        source_id: format!("{doc_id}!Sheet1"),
+        destination_id: format!("{doc_id}!Sheet2"),
+        source_step: 1,
+        destination_step: 1,
+        examples: 3,
+        fields: vec![
+            FieldMapping {
+                source_field: "C".into(),
+                destination_field: "A".into(),
+            },
+            FieldMapping {
+                source_field: "D".into(),
+                destination_field: "B".into(),
+            },
+        ],
+    };
+    let playbook = paradigm_lib::compile::compile(
+        stream.actions(),
+        &format!("Correction UI probe ({scope})"),
+        &paradigm_lib::compile::ReversibilityPolicy::placeholder(),
+        &paradigm_lib::labeling::RedactionPolicy::placeholder(),
+    )
+    .with_template(template.clone());
+    if let Err(e) = paradigm_lib::compile::store::store(&mut conn, &playbook) {
+        eprintln!("store: {e}");
+        return ExitCode::FAILURE;
+    }
+    drop(conn);
+    println!("stored playbook {}\n", playbook.id);
+
+    // ---- drive the app ------------------------------------------------------
+    println!("-- Refresh --");
+    if let Err(e) = click_and_wait(&desktop, "Refresh", "repeating", 15, 4).await {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+    let check_label = {
+        let Some(window) = app_window(&desktop).await else {
+            eprintln!("lost the app window");
+            return ExitCode::FAILURE;
+        };
+        let buttons = desktop
+            .locator("role:Button")
+            .within(window)
+            .all(Some(Duration::from_secs(6)), None)
+            .await
+            .unwrap_or_default();
+        match buttons.iter().find(|b| {
+            b.name()
+                .unwrap_or_default()
+                .starts_with("Check for new records")
+        }) {
+            Some(b) => b.name().unwrap_or_default(),
+            None => {
+                eprintln!("no 'Check for new' button");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    println!("-- Check for new --");
+    if let Err(e) = click_and_wait(
+        &desktop,
+        &check_label,
+        "Run the workflow on these",
+        120,
+        3,
+    )
+    .await
+    {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("-- Preview --");
+    if let Err(e) =
+        click_and_wait(&desktop, "Preview first record", "About to write", 90, 3).await
+    {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+    let confirm = app_text(&desktop)
+        .await
+        .into_iter()
+        .find(|t| t.starts_with("Looks right"))
+        .unwrap_or_else(|| "Looks right — run the rest".to_string());
+    println!("-- Confirm, run starts (supervised) --");
+    if let Err(e) = click_app_button(&desktop, &confirm).await {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- the pause §4.5 needs ----------------------------------------------
+    println!("\n-- waiting for the run to pause on the incomplete record --");
+    let awaiting_line = match wait_for_text(&desktop, "has nothing in", 240).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  the run never paused on the incomplete record.\n{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  overlay: {awaiting_line:?}");
+    // Joined across ALL nodes, not searched within one. React splits
+    // "Row {3} has nothing in {C}" into separate text nodes, so no single
+    // accessibility node ever contains both halves -- the first version of
+    // this check looked inside one and reported false while the UI was right.
+    let screen = app_text(&desktop).await.join(" | ");
+    println!("  screen: {screen}");
+    let names_row_3 = screen.contains("has nothing in") && screen.contains("3");
+    println!("  names row 3 and column C: {names_row_3}");
+
+    // ---- point at column E --------------------------------------------------
+    println!("\n-- selecting column E in the spreadsheet --");
+    if goto_sheet_via_namebox(&desktop, "Sheet1!E3").await.is_none() {
+        eprintln!("  could not select E3");
+        return ExitCode::FAILURE;
+    }
+    println!("   E3 selected");
+
+    println!("\n-- opening the correction panel --");
+    if let Err(e) = click_and_wait(
+        &desktop,
+        "Point at the right column",
+        "click the correct column",
+        30,
+        3,
+    )
+    .await
+    {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("-- 'Use the column I selected' --");
+    let confirm_line = match click_and_wait(
+        &desktop,
+        "Use the column I selected",
+        "You selected",
+        90,
+        3,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  panel: {confirm_line:?}");
+    let panel_text = app_text(&desktop).await.join(" | ");
+    println!("  panel text: {panel_text}");
+    // The header, not the letter. Node names join with " | ", so "column E"
+    // never appears literally -- but reading back E's header "Customer Alt"
+    // is stronger evidence anyway: it proves the panel resolved the SELECTED
+    // column, not just echoed a letter.
+    let understood_e = panel_text.contains("Customer Alt");
+    println!("  understood column E: {understood_e}");
+
+    println!("-- 'Use this' --");
+    if let Err(e) = click_and_wait(
+        &desktop,
+        "Use this",
+        "Should this be permanent",
+        30,
+        3,
+    )
+    .await
+    {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let scope_button = app_text(&desktop)
+        .await
+        .into_iter()
+        .find(|t| {
+            if permanent {
+                t.starts_with("The format changed")
+            } else {
+                t.starts_with("Just row")
+            }
+        })
+        .unwrap_or_default();
+    if scope_button.is_empty() {
+        eprintln!("  no {scope} button on screen");
+        return ExitCode::FAILURE;
+    }
+    println!("-- scope: {scope_button:?} --");
+    if let Err(e) = click_and_wait(&desktop, &scope_button, "Close", 60, 3).await {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("   applied");
+
+    // Close the panel, then resume the run.
+    let _ = click_app_button(&desktop, "Close").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("\n-- Resume --");
+    if let Err(e) = click_and_wait(&desktop, "Resume", "Running", 60, 4).await {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let summary = match wait_for_text(&desktop, "Processed", 300).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  no summary.\n{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  summary: {summary:?}");
+
+    // ---- ground truth -------------------------------------------------------
+    println!("\n-- CSV ground truth --");
+    let Some(csv) = download_csv(browser, &doc_id, &gid2).await else {
+        eprintln!("could not download Sheet2");
+        return ExitCode::FAILURE;
+    };
+    println!("{}", csv.trim());
+
+    // Row 3 is the corrected one. Row 4 is the assertion that matters: with a
+    // one-off it must read C ("Initech"); with a permanent correction it must
+    // read E ("INITECH INC").
+    let expected: [(usize, &str); 4] = [
+        (2, "Acme"),
+        (3, "GLOBEX LTD"),
+        (4, if permanent { "INITECH INC" } else { "Initech" }),
+        (5, if permanent { "UMBRELLA PLC" } else { "Umbrella" }),
+    ];
+    let mut all_ok = true;
+    for (row, name) in expected {
+        let a = csv_at(&csv, 1, row).unwrap_or_default();
+        let good = a.trim() == name;
+        let note = match row {
+            3 => "corrected",
+            4 | 5 => {
+                if permanent {
+                    "should follow the new mapping"
+                } else {
+                    "must be UNAFFECTED"
+                }
+            }
+            _ => "before the correction",
+        };
+        println!(
+            "  A{row}={a:?}  expected {name:?} ({note})  {}",
+            if good { "OK" } else { "WRONG" }
+        );
+        all_ok &= good;
+    }
+
+    // For the permanent scope, the stored mapping must genuinely be repointed.
+    let mut repointed = true;
+    if permanent {
+        let conn = match paradigm_lib::db::open(&db_path, &key_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("reopen: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match paradigm_lib::compile::store::load_template(&conn, &playbook.id) {
+            Ok(Some(t)) => {
+                let sources: Vec<String> =
+                    t.fields.iter().map(|f| f.source_field.clone()).collect();
+                repointed = sources.contains(&"E".to_string())
+                    && !sources.contains(&"C".to_string());
+                println!("\n  stored mapping source columns: {sources:?}");
+                println!("  repointed C -> E in the template: {repointed}");
+            }
+            other => {
+                eprintln!("could not load the template back: {other:?}");
+                repointed = false;
+            }
+        }
+    }
+
+    println!("\n== VERDICT ({scope}) ==");
+    println!("  run paused on the incomplete record : {names_row_3}");
+    println!("  panel understood column E           : {understood_e}");
+    println!("  CSV matches the expected shape      : {all_ok}");
+    if permanent {
+        println!("  template genuinely repointed        : {repointed}");
+    }
+    println!("\n  doc id for cleanup: {doc_id}");
+
+    let pass = names_row_3 && understood_e && all_ok && repointed;
+    println!(
+        "\n{}",
+        if pass {
+            "PASS"
         } else {
             "FAIL -- see above"
         }
