@@ -36,13 +36,23 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::compile::CompiledTemplate;
+use crate::run::preview::RunAuthorization;
 use crate::run::{
     run_with_control, set_run_state, DestinationWriter, RunControl, RunReport, RunState,
 };
 use crate::source::SourceReader;
 
 /// What a run needs in order to touch the world, built on the run's own thread.
-pub type Surfaces = (Box<dyn SourceReader>, Box<dyn DestinationWriter>);
+///
+/// `Send` on both boxes. Not because a run moves them between threads -- the
+/// factory builds them where they are used, precisely so it does not -- but
+/// because a Tauri command that holds one across an `await` produces a future
+/// Tauri will not accept otherwise. The bound is satisfiable: `UIElement` is
+/// `Send`, measured.
+pub type Surfaces = (
+    Box<dyn SourceReader + Send>,
+    Box<dyn DestinationWriter + Send>,
+);
 
 /// Builds those surfaces. Fallible, because opening a live document is.
 pub type SurfaceFactory = Box<dyn FnOnce() -> Result<Surfaces, String> + Send + 'static>;
@@ -107,6 +117,19 @@ impl ActiveRun {
 
 /// Start a run on its own thread.
 ///
+/// ## The §4.3 gate
+///
+/// `authorization` is not a parameter that can be defaulted, skipped or passed
+/// as `None`. [`RunAuthorization`] has no public constructor, so the only way
+/// to call this function at all is to have shown the user the record about to
+/// be written and had them confirm it. Starting a run without a preview is not
+/// a discouraged path -- there is no way to express it.
+///
+/// It is checked as well as required: the authorization names the playbook and
+/// the source position it was issued for, and a run whose first record is no
+/// longer that one is refused. A stale acceptance would otherwise start a batch
+/// beginning somewhere the user never saw.
+///
 /// The thread opens its own database connection rather than sharing the app's.
 /// A run can sit paused indefinitely, and holding the app's connection across
 /// that would block every other command -- which is precisely the "it does not
@@ -117,6 +140,36 @@ pub fn spawn(
     playbook_id: String,
     template: CompiledTemplate,
     control: RunControl,
+    authorization: RunAuthorization,
+    make_surfaces: SurfaceFactory,
+) -> Result<ActiveRun, String> {
+    if !authorization.covers(&playbook_id, authorization.position()) {
+        return Err("the confirmation does not belong to this workflow".to_string());
+    }
+    if authorization.playbook_id() != playbook_id {
+        return Err(format!(
+            "this run is for {playbook_id}, but the confirmed preview was for {}",
+            authorization.playbook_id()
+        ));
+    }
+    Ok(spawn_authorized(
+        db_path,
+        key_path,
+        playbook_id,
+        template,
+        control,
+        authorization,
+        make_surfaces,
+    ))
+}
+
+fn spawn_authorized(
+    db_path: PathBuf,
+    key_path: PathBuf,
+    playbook_id: String,
+    template: CompiledTemplate,
+    control: RunControl,
+    authorization: RunAuthorization,
     make_surfaces: SurfaceFactory,
 ) -> ActiveRun {
     let outcome: Arc<Mutex<Option<RunOutcome>>> = Arc::new(Mutex::new(None));
@@ -132,6 +185,7 @@ pub fn spawn(
                 &playbook_id,
                 &template,
                 &control,
+                &authorization,
                 make_surfaces,
             );
             *outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
@@ -153,12 +207,33 @@ fn execute(
     playbook_id: &str,
     template: &CompiledTemplate,
     control: &RunControl,
+    authorization: &RunAuthorization,
     make_surfaces: SurfaceFactory,
 ) -> RunOutcome {
     let conn = match crate::db::open(db_path, key_path) {
         Ok(c) => c,
         Err(e) => return RunOutcome::Failed(format!("could not open the database: {e}")),
     };
+
+    // The confirmed record must still be the one this run would start on.
+    //
+    // Checked here rather than at spawn, because it is a question about the
+    // ledger and this is the thread that holds a connection to it. If that
+    // record has since been processed -- another run, a resumed batch -- then
+    // this run would begin somewhere the user never previewed, which is the
+    // failure the gate exists to prevent rather than a lesser version of it.
+    match crate::run::is_processed(&conn, playbook_id, authorization.position()) {
+        Ok(true) => {
+            let _ = set_run_state(&conn, playbook_id, RunState::Idle);
+            return RunOutcome::Failed(format!(
+                "the confirmed record (row {}) has already been processed since it was shown; \
+                 preview the next one before running",
+                authorization.position().row_key
+            ));
+        }
+        Ok(false) => {}
+        Err(e) => return RunOutcome::Failed(format!("could not check the ledger: {e}")),
+    }
 
     let (mut reader, mut writer) = match make_surfaces() {
         Ok(s) => s,
@@ -305,11 +380,45 @@ mod tests {
         (dir, db_path, key_path, pb.id)
     }
 
+    /// Obtain a real authorization the only way there is one: preview the
+    /// record, then accept it.
+    ///
+    /// There is no test-only shortcut here, deliberately. If these tests could
+    /// fabricate a `RunAuthorization`, the gate would be a convention again --
+    /// and the fact that every call site below had to be rewritten to get one
+    /// is the clearest evidence that `spawn` cannot be reached without it.
+    fn authorize(
+        db_path: &PathBuf,
+        key_path: &PathBuf,
+        id: &str,
+        template: &CompiledTemplate,
+        count: usize,
+    ) -> RunAuthorization {
+        let conn = crate::db::open(db_path, key_path).expect("open");
+        let mut reader = Rows { cursor: 0, count };
+        match crate::run::preview::next_record(
+            &conn,
+            id,
+            template,
+            &mut reader,
+            1,
+            crate::detect::verify::Verdict::Unsure {
+                confidence: 0.0,
+                reason: "no model in this test".into(),
+            },
+        )
+        .expect("preview")
+        {
+            crate::run::preview::Upcoming::Ready(p) => p.accept(),
+            other => panic!("expected a previewable record, got {other:?}"),
+        }
+    }
+
     fn surfaces(count: usize, written: Arc<Mutex<Vec<String>>>) -> SurfaceFactory {
         Box::new(move || {
             Ok((
-                Box::new(Rows { cursor: 0, count }) as Box<dyn SourceReader>,
-                Box::new(Sink { written }) as Box<dyn DestinationWriter>,
+                Box::new(Rows { cursor: 0, count }) as Box<dyn SourceReader + Send>,
+                Box::new(Sink { written }) as Box<dyn DestinationWriter + Send>,
             ))
         })
     }
@@ -325,8 +434,10 @@ mod tests {
             id.clone(),
             template(),
             RunControl::new(),
+            authorize(&db_path, &key_path, &id, &template(), 3),
             surfaces(3, Arc::clone(&written)),
-        );
+        )
+        .expect("spawn should be authorized");
 
         match run.join().expect("an outcome") {
             RunOutcome::Finished(report) => {
@@ -366,8 +477,10 @@ mod tests {
             id.clone(),
             template(),
             control.clone(),
+            authorize(&db_path, &key_path, &id, &template(), 3),
             surfaces(3, Arc::clone(&written)),
-        );
+        )
+        .expect("spawn should be authorized");
 
         // The caller got here immediately, and stays free while the run waits.
         std::thread::sleep(Duration::from_millis(150));
@@ -398,12 +511,11 @@ mod tests {
             id.clone(),
             template(),
             control,
+            authorize(&db_path, &key_path, &id, &template(), 3),
             surfaces(3, Arc::clone(&written)),
-        );
+        )
+        .expect("spawn should be authorized");
 
-        // `stop_and_join`, not `join`: a plain join would wait forever on a run
-        // that is still paused, which is exactly the distinction these two
-        // methods exist to make.
         match run.stop_and_join().expect("an outcome") {
             RunOutcome::Finished(report) => {
                 assert!(matches!(report.stop, RunStop::Stopped { .. }));
@@ -432,8 +544,10 @@ mod tests {
             id.clone(),
             template(),
             RunControl::new(),
+            authorize(&db_path, &key_path, &id, &template(), 3),
             Box::new(|| Err("the source document is not open".to_string())),
-        );
+        )
+        .expect("spawn should be authorized");
 
         match run.join().expect("an outcome") {
             RunOutcome::Failed(e) => assert!(e.contains("not open"), "unhelpful: {e}"),

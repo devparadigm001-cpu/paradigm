@@ -151,6 +151,15 @@ const REGISTERED_COMMANDS: &[(&str, &str)] = &[
     ("replay_playbook", r#"{"playbookId":"does-not-exist"}"#),
     ("get_run_history", r#"{"playbookId":"does-not-exist"}"#),
     ("get_orphaned_run_history", "{}"),
+    // §4.3's preview and the run start it gates. `start_workflow_run` errors
+    // here with "no confirmed first-record preview", which is the gate working
+    // rather than a fault -- reachability is what this test checks.
+    (
+        "preview_workflow_run",
+        r#"{"playbookId":"does-not-exist"}"#,
+    ),
+    ("cancel_workflow_preview", "{}"),
+    ("start_workflow_run", "{}"),
     // §4.6's run controls. Each legitimately errors here with "no workflow run
     // is in progress", which is exactly the kind of error this test ignores --
     // what it checks is reachability, not success.
@@ -622,4 +631,47 @@ fn unregistered_command_is_rejected() {
         "an unregistered command returned success -- these tests cannot detect \
          a missing registration"
     );
+}
+
+/// §4.3's gate, at the IPC boundary.
+///
+/// The type system already makes `run::background::spawn` unreachable without a
+/// `RunAuthorization`, and a `RunAuthorization` unobtainable without a preview.
+/// This checks the other end of the same rule: the command a frontend can
+/// actually call refuses, with an error that says what to do instead.
+///
+/// Worth testing separately from the compile-time guarantee because the two
+/// fail differently. A missing type would not compile; a command that quietly
+/// started an unpreviewed run would compile perfectly.
+#[test]
+fn a_run_cannot_be_started_without_a_confirmed_preview() {
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+
+    let err = invoke(&webview, "start_workflow_run", InvokeBody::default())
+        .expect_err("starting a run with no preview must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("preview"),
+        "the refusal should name what is missing, got: {msg}"
+    );
+    assert!(
+        !msg.contains("not found"),
+        "the command must exist -- this is about the gate, not registration: {msg}"
+    );
+}
+
+/// Declining is not an error, and does not need a preview to have existed.
+///
+/// §4.10: rejecting "cancels cleanly". A cancel that errored when there was
+/// nothing to cancel would make the frontend's tidy-up path conditional on
+/// state it should not have to track.
+#[test]
+fn cancelling_a_preview_that_was_never_shown_is_not_an_error() {
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+
+    invoke(&webview, "cancel_workflow_preview", InvokeBody::default())
+        .expect("cancelling with nothing pending should succeed quietly");
 }

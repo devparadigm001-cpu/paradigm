@@ -70,6 +70,16 @@ pub struct AppState {
     /// detaching it, so it needs no code to enforce and would take deliberate
     /// effort to break.
     pub active_run: Mutex<Option<run::background::ActiveRun>>,
+    /// The first-record preview awaiting the user's answer (§4.3).
+    ///
+    /// Held here rather than round-tripped through the frontend for the same
+    /// reason `pending_actions` is: what comes back over IPC is a display view,
+    /// and a confirmation has to be checked against what the backend actually
+    /// read, not against what a caller says it saw.
+    ///
+    /// It carries real cell values, so it is transient -- taken when answered,
+    /// never written to the database.
+    pub pending_preview: Mutex<Option<run::preview::Preview>>,
 }
 
 pub const MODEL_FILE: &str = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf";
@@ -192,6 +202,7 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
                 pending_actions: Mutex::new(None),
                 pending_links: Mutex::new(None),
                 active_run: Mutex::new(None),
+                pending_preview: Mutex::new(None),
             });
             Ok(())
         })
@@ -206,6 +217,9 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
             commands::replay_playbook,
             commands::get_run_history,
             commands::get_orphaned_run_history,
+            commands::preview_workflow_run,
+            commands::cancel_workflow_preview,
+            commands::start_workflow_run,
             commands::pause_workflow_run,
             commands::resume_workflow_run,
             commands::stop_workflow_run,

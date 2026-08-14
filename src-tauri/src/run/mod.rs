@@ -32,7 +32,9 @@
 
 pub mod background;
 pub mod control;
+pub mod preview;
 pub mod spreadsheet;
+pub mod surfaces;
 
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;

@@ -11874,6 +11874,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "sheetsreplaytab") {
         return sheetsreplaytab_mode().await;
     }
+    if std::env::args().any(|a| a == "templatedpreview") {
+        return templatedpreview_mode().await;
+    }
     if std::env::args().any(|a| a == "templatedrun") {
         return templatedrun_mode().await;
     }
@@ -12801,6 +12804,494 @@ async fn templatedrun_mode() -> ExitCode {
     );
 
     if ok && report.stop == RunStop::Exhausted {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// templatedpreview -- §4.3's first-record safety check against a real
+// spreadsheet, both answers.
+//
+// Two things have to be true and neither can be shown with fakes:
+//
+//   * the preview shows the REAL next record, in the REAL destination cell,
+//     before anything is committed -- so the destination must still be empty
+//     at the moment the preview is displayed;
+//   * declining cancels cleanly (§4.10) -- nothing activates, nothing is
+//     written, and the playbook is left exactly as usable as it was.
+//
+// Ground truth is the per-sheet CSV export, as everywhere else in this file.
+// ---------------------------------------------------------------------------
+
+async fn templatedpreview_mode() -> ExitCode {
+    use paradigm_lib::compile::CompiledTemplate;
+    use paradigm_lib::detect::FieldMapping;
+    use paradigm_lib::run::preview::{next_record, Upcoming};
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::{DestinationWriter, RunControl};
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+    use paradigm_lib::source::SourceReader;
+
+    println!("== templatedpreview: §4.3 against a real spreadsheet ==\n");
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let browser = "msedge";
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets to load...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let Some((_w, doc_id)) = sheets_window(&desktop).await else {
+        eprintln!("no 'Untitled spreadsheet' window");
+        return ExitCode::FAILURE;
+    };
+    println!("doc id: {doc_id}");
+
+    if !ensure_second_sheet(&desktop).await {
+        eprintln!("could not create a second sheet");
+        return ExitCode::FAILURE;
+    }
+    let gid2 = match goto_sheet_via_namebox(&desktop, "Sheet2!A1").await {
+        Some(g) => g,
+        None => {
+            eprintln!("could not reach Sheet2");
+            return ExitCode::FAILURE;
+        }
+    };
+    let gid1 = match goto_sheet_via_namebox(&desktop, "Sheet1!A1").await {
+        Some(g) => g,
+        None => {
+            eprintln!("could not reach Sheet1");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("Sheet1 gid={gid1}  Sheet2 gid={gid2}\n");
+
+    // ---- seed: headers on BOTH sheets, data on the source ------------------
+    //
+    // Headers matter here in a way they did not for `templatedrun`: the Qwen
+    // check turns column letters into words using them, and the preview shows
+    // the user "Customer -> Client" rather than "C -> A".
+    let rows = [("Acme", "100"), ("Globex", "200"), ("Initech", "300")];
+    println!("-- seeding --");
+    {
+        let Some((window, _)) = sheets_window(&desktop).await else {
+            eprintln!("lost the window");
+            return ExitCode::FAILURE;
+        };
+        let mut src = match SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet1"),
+            Some("Sheet1".to_string()),
+            1,
+        )
+        .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("writer on Sheet1: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        for (col, val) in [("C", "Customer"), ("D", "Amount")] {
+            if let Err(e) = src.write(col, val) {
+                eprintln!("header {col}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        if let Err(e) = src.advance(1) {
+            eprintln!("advance: {e}");
+            return ExitCode::FAILURE;
+        }
+        for (name, amount) in rows {
+            if src.write("C", name).is_err() || src.write("D", amount).is_err() {
+                eprintln!("seeding row failed");
+                return ExitCode::FAILURE;
+            }
+            let _ = src.advance(1);
+            println!("   Sheet1 {name}/{amount}");
+        }
+
+        let mut dst = match SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet2"),
+            Some("Sheet2".to_string()),
+            1,
+        )
+        .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("writer on Sheet2: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        for (col, val) in [("A", "Client"), ("B", "Total")] {
+            if let Err(e) = dst.write(col, val) {
+                eprintln!("destination header {col}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        println!("   Sheet2 headers Client/Total");
+    }
+
+    // ---- a stored templated playbook ---------------------------------------
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("db: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut stream = paradigm_lib::capture::CapturedStream::new(
+        paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
+    );
+    for name in ["Next", "Back"] {
+        stream.admit(paradigm_lib::capture::ActionCandidate {
+            kind: paradigm_lib::capture::ActionKind::Click,
+            identifiers: vec!["msedge.exe".into()],
+            process_name: None,
+            element_role: Some("Button".into()),
+            element_name: Some(name.to_string()),
+            payload: None,
+            detail: None,
+            timestamp_ms: 0,
+        });
+    }
+    let template = CompiledTemplate {
+        source_id: format!("{doc_id}!Sheet1"),
+        destination_id: format!("{doc_id}!Sheet2"),
+        source_step: 1,
+        destination_step: 1,
+        examples: 3,
+        fields: vec![
+            FieldMapping {
+                source_field: "C".into(),
+                destination_field: "A".into(),
+            },
+            FieldMapping {
+                source_field: "D".into(),
+                destination_field: "B".into(),
+            },
+        ],
+    };
+    let playbook = paradigm_lib::compile::compile(
+        stream.actions(),
+        "Preview probe",
+        &paradigm_lib::compile::ReversibilityPolicy::placeholder(),
+        &paradigm_lib::labeling::RedactionPolicy::placeholder(),
+    )
+    .with_template(template.clone());
+    let steps_before = playbook.steps.len();
+    if let Err(e) = paradigm_lib::compile::store::store(&mut conn, &playbook) {
+        eprintln!("store: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("\nplaybook {} stored ({steps_before} steps)", playbook.id);
+
+    // ---- the preview --------------------------------------------------------
+    println!("\n-- §4.3: showing the next record BEFORE anything is written --");
+    let Some((window, _)) = sheets_window(&desktop).await else {
+        eprintln!("lost the window");
+        return ExitCode::FAILURE;
+    };
+    let mut reader = match SpreadsheetReader::open(
+        desktop.clone(),
+        &window,
+        format!("{doc_id}!Sheet1"),
+        Some("Sheet1".to_string()),
+        2,
+        1,
+        vec!["C".into(), "D".into()],
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("reader: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let source_shape = match reader.shape() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("source shape: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  source headers: {:?}", source_shape.columns);
+
+    let mut dst_reader = match SpreadsheetReader::open(
+        desktop.clone(),
+        &window,
+        format!("{doc_id}!Sheet2"),
+        Some("Sheet2".to_string()),
+        2,
+        1,
+        vec!["A".into(), "B".into()],
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("destination reader: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let destination_shape = dst_reader
+        .shape()
+        .unwrap_or(paradigm_lib::source::SourceShape { columns: vec![] });
+    println!("  destination headers: {:?}", destination_shape.columns);
+
+    // The Qwen check, at its one real call site.
+    let model = std::path::Path::new("models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+    let verdict = match paradigm_lib::labeling::shared(model) {
+        Ok(engine) => match paradigm_lib::run::preview::verdict_for(
+            &engine,
+            &template,
+            &source_shape,
+            &destination_shape,
+        ) {
+            Ok(v) => v,
+            Err(e) => paradigm_lib::detect::verify::Verdict::Unsure {
+                confidence: 0.0,
+                reason: format!("model error: {e}"),
+            },
+        },
+        Err(e) => paradigm_lib::detect::verify::Verdict::Unsure {
+            confidence: 0.0,
+            reason: format!("model unavailable: {e}"),
+        },
+    };
+    println!("  verdict (advisory): {verdict:?}");
+
+    let up = match next_record(&conn, &playbook.id, &template, &mut reader, 2, verdict.clone()) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("preview failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Upcoming::Ready(mut preview) = up else {
+        eprintln!("expected a record to preview, got {up:?}");
+        return ExitCode::FAILURE;
+    };
+    paradigm_lib::run::preview::label_fields(&mut preview, &source_shape, &destination_shape);
+
+    println!("\n  ABOUT TO WRITE, source row {}:", preview.position().row_key);
+    for f in preview.fields() {
+        println!(
+            "    {} ({}) -> {}{} ({}) = {:?}",
+            f.source_field,
+            f.source_label.clone().unwrap_or_else(|| "?".into()),
+            f.destination_field,
+            preview.destination_row(),
+            f.destination_label.clone().unwrap_or_else(|| "?".into()),
+            f.value
+        );
+    }
+
+    let shows_real_values = preview.fields().len() == 2
+        && preview.fields()[0].value == "Acme"
+        && preview.fields()[1].value == "100"
+        && preview.position().row_key == "2";
+    let shows_labels = preview.fields()[0].source_label.as_deref() == Some("Customer")
+        && preview.fields()[0].destination_label.as_deref() == Some("Client");
+
+    // Nothing may have been written yet. This is the claim §4.3 rests on.
+    let Some(csv_before) = download_csv(browser, &doc_id, &gid2).await else {
+        eprintln!("could not download Sheet2 before answering");
+        return ExitCode::FAILURE;
+    };
+    println!("\nSheet2 CSV at preview time:\n{}", csv_before.trim());
+    let untouched_before = ["2", "3", "4"].iter().all(|r| {
+        let row: usize = r.parse().unwrap();
+        csv_at(&csv_before, 1, row).unwrap_or_default().trim().is_empty()
+            && csv_at(&csv_before, 2, row).unwrap_or_default().trim().is_empty()
+    });
+    println!(
+        "  destination data rows still empty at preview time: {}",
+        if untouched_before { "OK" } else { "WRONG" }
+    );
+
+    // ---- answer 1: DECLINE (§4.10) -----------------------------------------
+    println!("\n-- §4.10: declining --");
+    preview.decline();
+    println!("  preview declined; no authorization was produced");
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let Some(csv_after_decline) = download_csv(browser, &doc_id, &gid2).await else {
+        eprintln!("could not download Sheet2 after declining");
+        return ExitCode::FAILURE;
+    };
+    let untouched_after = ["2", "3", "4"].iter().all(|r| {
+        let row: usize = r.parse().unwrap();
+        csv_at(&csv_after_decline, 1, row)
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+            && csv_at(&csv_after_decline, 2, row)
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+    });
+    println!(
+        "  nothing written after declining: {}",
+        if untouched_after { "OK" } else { "WRONG" }
+    );
+
+    // "the recording stands as an ordinary one-shot playbook, unaffected"
+    let stored = match paradigm_lib::compile::store::load(&conn, &playbook.id) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("the playbook is no longer loadable after declining: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ledger_after_decline =
+        paradigm_lib::run::processed_count(&conn, &playbook.id, &template.source_id)
+            .unwrap_or(usize::MAX);
+    let run_state_after = paradigm_lib::run::get_run_state(&conn, &playbook.id)
+        .ok()
+        .flatten();
+    let playbook_intact = stored.steps.len() == steps_before
+        && ledger_after_decline == 0
+        && run_state_after == Some(paradigm_lib::run::RunState::Idle);
+    println!(
+        "  playbook still an ordinary playbook: {} steps (was {steps_before}), ledger {ledger_after_decline}, run_state {run_state_after:?}  {}",
+        stored.steps.len(),
+        if playbook_intact { "OK" } else { "WRONG" }
+    );
+
+    // ---- answer 2: ACCEPT, and the run actually happens ---------------------
+    println!("\n-- confirming instead, and running --");
+    let Some((window, _)) = sheets_window(&desktop).await else {
+        eprintln!("lost the window");
+        return ExitCode::FAILURE;
+    };
+    let mut reader2 = match SpreadsheetReader::open(
+        desktop.clone(),
+        &window,
+        format!("{doc_id}!Sheet1"),
+        Some("Sheet1".to_string()),
+        2,
+        1,
+        vec!["C".into(), "D".into()],
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("reader: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let up2 = match next_record(&conn, &playbook.id, &template, &mut reader2, 2, verdict) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("second preview failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Upcoming::Ready(preview2) = up2 else {
+        eprintln!("expected a record, got {up2:?}");
+        return ExitCode::FAILURE;
+    };
+    let authorization = preview2.accept();
+    println!("  confirmed -- authorization issued for row {}", authorization.position().row_key);
+
+    let active = match paradigm_lib::run::background::spawn(
+        db_path.clone(),
+        key_path.clone(),
+        playbook.id.clone(),
+        template.clone(),
+        RunControl::new(),
+        authorization,
+        paradigm_lib::run::surfaces::factory_for(template.clone(), 2, 1, 2),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("spawn refused: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  run started on its own thread; waiting...");
+    let outcome = active.join();
+    println!("  outcome: {outcome:?}");
+
+    let ran_clean = matches!(
+        &outcome,
+        Some(paradigm_lib::run::background::RunOutcome::Finished(r))
+            if r.stop == paradigm_lib::run::RunStop::Exhausted && r.written() == 3
+    );
+
+    let Some(csv_final) = download_csv(browser, &doc_id, &gid2).await else {
+        eprintln!("could not download Sheet2 after the run");
+        return ExitCode::FAILURE;
+    };
+    println!("\nSheet2 CSV after the confirmed run:\n{}", csv_final.trim());
+    let mut written_ok = true;
+    for (i, (name, amount)) in rows.iter().enumerate() {
+        let row = i + 2;
+        let a = csv_at(&csv_final, 1, row).unwrap_or_default();
+        let b = csv_at(&csv_final, 2, row).unwrap_or_default();
+        let good = a.trim() == *name && b.trim() == *amount;
+        println!(
+            "  Sheet2 A{row}={a:?} B{row}={b:?}  expected {name:?}/{amount:?}  {}",
+            if good { "OK" } else { "WRONG" }
+        );
+        written_ok &= good;
+    }
+
+    println!("\n== VERDICT ==");
+    println!("  preview showed the real next record   : {shows_real_values}");
+    println!("  preview showed header labels          : {shows_labels}");
+    println!("  destination untouched at preview time : {untouched_before}");
+    println!("  declining wrote nothing               : {untouched_after}");
+    println!("  declining left the playbook usable    : {playbook_intact}");
+    println!("  confirming ran and wrote correctly    : {}", ran_clean && written_ok);
+
+    let pass = shows_real_values
+        && shows_labels
+        && untouched_before
+        && untouched_after
+        && playbook_intact
+        && ran_clean
+        && written_ok;
+    println!(
+        "\n{}",
+        if pass {
+            "PASS -- the gate holds both ways against a real spreadsheet"
+        } else {
+            "FAIL -- see above"
+        }
+    );
+    if pass {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

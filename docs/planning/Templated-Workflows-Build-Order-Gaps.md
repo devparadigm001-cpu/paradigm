@@ -6,13 +6,15 @@ these — capture recording *where a value came from* — was produced in item 2
 consumed by nothing until item 6, and was one review away from being finished
 without anyone noticing.
 
-**Both are now items in the design document's Section 5** — the destination
-writer as item 8 (built), the first-record check as item 9 (not built). This
-file is the record of how each was found and why it was missing; Section 5 is
-where the work is tracked. A gap recorded only here would repeat the exact
-failure it describes.
+**Both are now items in the design document's Section 5, and both are built** —
+the destination writer as item 8, the first-record check as item 9. This file
+is the record of how each was found and why it was missing; Section 5 is where
+the work is tracked. A gap recorded only here would repeat the exact failure it
+describes.
 
-Status as of item 8 (destination writer, built and proven end to end).
+Status: both closed. Kept because *how* they were missed is the reusable part —
+one was an interface without an implementation, the other was a behaviour
+specified in Section 4 and scheduled only on the frontend.
 
 ---
 
@@ -59,9 +61,20 @@ item for the thing that would populate it.
 controls, and folding it into them would bury a user-facing safety check inside
 an item about pause and stop.
 
-**Resolved as a tracking matter:** it is now **Section 5, item 9** of the design
-document, placed before new-batch detection because it gates whether a run
-starts at all. Still unbuilt — this is a scheduling fix, not an implementation.
+**Resolved.** It is **Section 5, item 9** of the design document, placed before
+new-batch detection because it gates whether a run starts at all, and it is now
+built.
+
+The gate is a type rather than a convention: `RunAuthorization` has no public
+constructor and no public fields, `Preview::accept` is the only thing that
+returns one, and `run::background::spawn` takes one by value. Starting a run
+without a preview does not compile. `detect::verify` now has its call site.
+
+Proven live, both answers, in `examples/text_capture_probe.rs --
+templatedpreview`: the preview showed `C (Customer) -> A2 (Client) = "Acme"`
+while the destination CSV still held only its header row; declining wrote
+nothing and left the playbook intact; confirming ran and wrote all three
+records.
 
 ---
 
@@ -95,12 +108,11 @@ Sheet2, paused mid-record and resumed, verified by per-sheet CSV export, then
 re-run to confirm the ledger prevented a second write. See
 `examples/text_capture_probe.rs -- templatedrun`.
 
-### What it did NOT resolve
+### The start command, and why it waited
 
-There is still no command that **starts** a run, so the four run-control
-commands (`pause_workflow_run`, `resume_workflow_run`, `stop_workflow_run`,
-`get_workflow_run_status`) remain registered and reachable with nothing to act
-on. A start command is now unblocked — `run::background::spawn` can be handed a
-real reader and writer — but it belongs with item 9, because §4.3 says the
-first-record preview gates the run, and adding a start command that skips that
-gate would build the thing item 9 exists to prevent.
+Item 8 deliberately did not add one. §4.3 says the first-record preview gates
+the run, so a start command written before item 9 would have been the thing
+item 9 exists to prevent. It landed with item 9 instead, as
+`start_workflow_run` — which takes **no playbook id**, because the run is
+defined by the preview that was confirmed, leaving no parameter a caller could
+use to start something other than what they were shown.

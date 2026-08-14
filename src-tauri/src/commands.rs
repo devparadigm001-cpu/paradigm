@@ -39,6 +39,7 @@ use crate::detect::{self, Detection};
 use crate::labeling::{self, calibration, clean, CalibrationSample, RedactionPolicy};
 use crate::replay::{self, journal};
 use crate::run;
+use crate::source::SourceReader;
 use crate::AppState;
 
 // ---------------------------------------------------------------- views ----
@@ -567,6 +568,297 @@ fn confirmed_template(state: &State<'_, AppState>) -> Result<CompiledTemplate, S
                 .to_string(),
         ),
     }
+}
+
+// ------------------------------------- §4.3 first-record safety check ----
+
+/// One mapped field of the record about to be written.
+#[derive(Debug, Serialize)]
+pub struct PreviewFieldView {
+    pub source_field: String,
+    pub source_label: Option<String>,
+    pub destination_field: String,
+    pub destination_label: Option<String>,
+    /// The real value, which is the whole point -- §4.3 asks for "real values,
+    /// in the real destination". Shown, never stored.
+    pub value: String,
+}
+
+/// What the user answers confirm/cancel about.
+#[derive(Debug, Serialize)]
+pub struct PreviewView {
+    pub playbook_id: String,
+    pub source_row: String,
+    pub destination_row: u64,
+    pub fields: Vec<PreviewFieldView>,
+    /// The model's read on the mapping. **Advisory** -- see `run::preview`:
+    /// the measured confidence band does not separate sensible mappings from
+    /// nonsense, so this informs the user rather than deciding for them.
+    pub verdict: String,
+    pub verdict_is_reassuring: bool,
+}
+
+/// Nothing to preview, and why. §4.8's "nothing new" is an answer, not a fault.
+#[derive(Debug, Serialize)]
+pub struct NothingToPreview {
+    pub reason: String,
+}
+
+/// The answer to "what would this workflow do next?".
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PreviewOutcome {
+    Ready(PreviewView),
+    NothingToDo(NothingToPreview),
+    NeedsAttention(NothingToPreview),
+}
+
+/// Show the very next record this workflow would write, without writing it.
+///
+/// §4.3. This is the only way to obtain the authorization `start_workflow_run`
+/// needs, so it is not merely the recommended first step -- it is the only
+/// first step there is.
+#[tauri::command]
+pub async fn preview_workflow_run(
+    state: State<'_, AppState>,
+    playbook_id: String,
+    source_row: Option<u64>,
+    header_row: Option<u64>,
+    destination_row: Option<u64>,
+) -> Result<PreviewOutcome, String> {
+    let template = {
+        let conn = state.db.lock().await;
+        store::load_template(&conn, &playbook_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "that playbook is not a templated workflow".to_string())?
+    };
+
+    let source_row = source_row.unwrap_or(2);
+    let header_row = header_row.unwrap_or(1);
+    let destination_row = destination_row.unwrap_or(2);
+
+    let desktop = terminator::Desktop::new(false, false)
+        .map_err(|e| format!("accessibility engine unavailable: {e}"))?;
+    let (mut reader, _writer) =
+        run::surfaces::open_for(&desktop, &template, source_row, header_row, destination_row)
+            .await
+            .map_err(|e| e)?;
+
+    // Header rows first: the verdict needs words, not column letters, and the
+    // preview shows the user which column is which.
+    let source_shape = reader.shape().map_err(|e| e.to_string())?;
+    let destination_shape = {
+        // A second reader on the destination, purely to read its header row.
+        // Reading is non-destructive, and `SourceShape` is the only thing that
+        // can turn a destination column letter into a word.
+        let (destination_doc, destination_sheet) =
+            run::surfaces::split_surface_id(&template.destination_id);
+        match run::surfaces::window_for(&desktop, destination_doc).await {
+            Some(w) => {
+                let columns: Vec<String> = template
+                    .fields
+                    .iter()
+                    .map(|f| f.destination_field.clone())
+                    .collect();
+                match crate::source::spreadsheet::SpreadsheetReader::open(
+                    desktop.clone(),
+                    &w,
+                    template.destination_id.clone(),
+                    destination_sheet.map(str::to_string),
+                    destination_row,
+                    header_row,
+                    columns,
+                )
+                .await
+                {
+                    Ok(mut r) => r.shape().unwrap_or(crate::source::SourceShape {
+                        columns: vec![],
+                    }),
+                    Err(_) => crate::source::SourceShape { columns: vec![] },
+                }
+            }
+            None => crate::source::SourceShape { columns: vec![] },
+        }
+    };
+
+    // The model runs here, where both header rows are in hand. A failure to
+    // load it is not a failure to preview: §4.3's safety check is the user
+    // seeing the record, and the verdict is advice on top of that.
+    let verdict = match labeling::shared(&model_path(&state)) {
+        Ok(engine) => {
+            run::preview::verdict_for(&engine, &template, &source_shape, &destination_shape)
+                .unwrap_or_else(|e| crate::detect::verify::Verdict::Unsure {
+                    confidence: 0.0,
+                    reason: format!("the model could not be asked: {e}"),
+                })
+        }
+        Err(e) => crate::detect::verify::Verdict::Unsure {
+            confidence: 0.0,
+            reason: format!("the model is unavailable: {e}"),
+        },
+    };
+
+    let upcoming = {
+        let conn = state.db.lock().await;
+        run::preview::next_record(
+            &conn,
+            &playbook_id,
+            &template,
+            reader.as_mut(),
+            destination_row,
+            verdict,
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    match upcoming {
+        run::preview::Upcoming::NothingToDo => Ok(PreviewOutcome::NothingToDo(NothingToPreview {
+            reason: "every record in the source has already been processed".to_string(),
+        })),
+        run::preview::Upcoming::SuspiciousGap {
+            position,
+            rows_with_data_below,
+        } => Ok(PreviewOutcome::NeedsAttention(NothingToPreview {
+            reason: format!(
+                "row {} is blank in the mapped columns but {rows_with_data_below} row(s) below \
+                 it still have data, so this may not be the end of the source",
+                position.row_key
+            ),
+        })),
+        run::preview::Upcoming::Ready(mut preview) => {
+            run::preview::label_fields(&mut preview, &source_shape, &destination_shape);
+
+            let view = PreviewView {
+                playbook_id: playbook_id.clone(),
+                source_row: preview.position().row_key.clone(),
+                destination_row: preview.destination_row(),
+                fields: preview
+                    .fields()
+                    .iter()
+                    .map(|f| PreviewFieldView {
+                        source_field: f.source_field.clone(),
+                        source_label: f.source_label.clone(),
+                        destination_field: f.destination_field.clone(),
+                        destination_label: f.destination_label.clone(),
+                        value: f.value.clone(),
+                    })
+                    .collect(),
+                verdict: describe_verdict(preview.verdict()),
+                verdict_is_reassuring: matches!(
+                    preview.verdict(),
+                    crate::detect::verify::Verdict::Sensible { .. }
+                ),
+            };
+
+            let mut slot = state.pending_preview.lock().map_err(|e| e.to_string())?;
+            *slot = Some(preview);
+            Ok(PreviewOutcome::Ready(view))
+        }
+    }
+}
+
+fn describe_verdict(v: &crate::detect::verify::Verdict) -> String {
+    use crate::detect::verify::Verdict;
+    match v {
+        Verdict::Sensible { confidence } => {
+            format!("the mapping looks sensible (confidence {confidence:.2})")
+        }
+        Verdict::NotSensible { confidence } => format!(
+            "the model does not think this mapping makes sense (confidence {confidence:.2}) -- \
+             check the record below carefully before continuing"
+        ),
+        Verdict::Unsure { reason, .. } => format!("no clear read on the mapping: {reason}"),
+    }
+}
+
+/// The user declined the preview. §4.10: "cancels cleanly. Nothing activates."
+///
+/// The stored playbook is untouched -- it was already an ordinary playbook with
+/// a template attached, and declining a run does not change what it is. What
+/// declining prevents is the run, which is the whole of what §4.3 gates.
+#[tauri::command]
+pub async fn cancel_workflow_preview(state: State<'_, AppState>) -> Result<(), String> {
+    let mut slot = state.pending_preview.lock().map_err(|e| e.to_string())?;
+    if let Some(preview) = slot.take() {
+        preview.decline();
+    }
+    Ok(())
+}
+
+/// Start the run the user just confirmed (§4.3, §4.10).
+///
+/// Takes no playbook id. That is deliberate: the run is defined by the preview
+/// that was confirmed, so there is no parameter a caller could use to start
+/// something other than what they were shown.
+#[tauri::command]
+pub async fn start_workflow_run(
+    state: State<'_, AppState>,
+    source_row: Option<u64>,
+    header_row: Option<u64>,
+    destination_row: Option<u64>,
+) -> Result<RunStatusView, String> {
+    {
+        let active = state.active_run.lock().map_err(|e| e.to_string())?;
+        if active.as_ref().is_some_and(|r| !r.is_finished()) {
+            return Err("a workflow run is already in progress".to_string());
+        }
+    }
+
+    // Taken, not borrowed: one confirmation starts one run.
+    let preview = {
+        let mut slot = state.pending_preview.lock().map_err(|e| e.to_string())?;
+        slot.take().ok_or_else(|| {
+            "no confirmed first-record preview; preview the next record before running".to_string()
+        })?
+    };
+    let playbook_id = preview.playbook_id().to_string();
+    let authorization = preview.accept();
+
+    let template = {
+        let conn = state.db.lock().await;
+        store::load_template(&conn, &playbook_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "that playbook is not a templated workflow".to_string())?
+    };
+
+    let (db_path, key_path) = crate::db::paths_in(
+        state
+            .db_path
+            .parent()
+            .ok_or_else(|| "the database path has no parent directory".to_string())?,
+    );
+
+    let control = run::RunControl::new();
+    let active = run::background::spawn(
+        db_path,
+        key_path,
+        playbook_id.clone(),
+        template.clone(),
+        control,
+        authorization,
+        run::surfaces::factory_for(
+            template,
+            source_row.unwrap_or(2),
+            header_row.unwrap_or(1),
+            destination_row.unwrap_or(2),
+        ),
+    )?;
+
+    {
+        let conn = state.db.lock().await;
+        run::set_run_state(&conn, &playbook_id, run::RunState::Running)
+            .map_err(|e| e.to_string())?;
+    }
+
+    let finished = active.is_finished();
+    let mut slot = state.active_run.lock().map_err(|e| e.to_string())?;
+    *slot = Some(active);
+
+    Ok(RunStatusView {
+        playbook_id: Some(playbook_id),
+        state: run::RunState::Running.as_str().to_string(),
+        finished,
+    })
 }
 
 // ------------------------------------------------------ run controls ----
