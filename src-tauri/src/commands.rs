@@ -305,7 +305,8 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
     // §4.1 runs detection when the recording stops. It is pure and takes no
     // model, so it costs nothing on a session that turns out to have no
     // pattern -- which is most of them.
-    let (template, no_template_reason) = propose_template(&report.source_links);
+    let (template, no_template_reason) =
+        propose_template(&report.source_links, report.pastes_observed);
 
     let policy = RedactionPolicy::placeholder();
     let summary = CaptureSummary {
@@ -338,10 +339,30 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
 /// still source is inconclusive rather than a confirmed constant.
 fn propose_template(
     links: &[crate::capture::grid::SourceLink],
+    pastes_observed: usize,
 ) -> (Option<TemplateProposal>, Option<String>) {
     let Some((source, destination)) = detect::link::dominant_surfaces(links) else {
-        // Not an anomaly. Nothing was copied between grids, so this is an
-        // ordinary recording and there was never a pattern to look for.
+        // No usable source positions. Whether that is worth saying depends
+        // entirely on whether the user copied anything at all, and those two
+        // cases were previously indistinguishable -- both returned silence.
+        //
+        // A real recording hit the wrong half of that: six pastes from a
+        // Google Doc into a Sheet produced no cell positions, so detection
+        // said nothing and the review screen showed nothing, leaving the user
+        // to guess why the pattern prompt never appeared.
+        if pastes_observed > 0 {
+            return (
+                None,
+                Some(format!(
+                    "{pastes_observed} paste{} seen, but none of them could be traced to a \r
+                     source cell. A repeating workflow has to copy FROM a spreadsheet -- \r
+                     a document, a web page or a PDF has no cells to read a position from.",
+                    if pastes_observed == 1 { "" } else { "s" }
+                )),
+            );
+        }
+        // Genuinely ordinary: nothing was copied, so there was never a
+        // pattern to look for and silence is right.
         return (None, None);
     };
     let observations = detect::link::observations(links);
@@ -1787,11 +1808,10 @@ mod tests {
 
     #[test]
     fn three_aligned_copies_are_offered_as_a_template() {
-        let (proposal, reason) = propose_template(&[
-            link(1, "C2", "B2"),
-            link(2, "C3", "B3"),
-            link(3, "C4", "B4"),
-        ]);
+        let (proposal, reason) = propose_template(
+            &[link(1, "C2", "B2"), link(2, "C3", "B3"), link(3, "C4", "B4")],
+            3,
+        );
         assert_eq!(reason, None);
         let p = proposal.expect("a pattern should have been detected");
         assert_eq!(p.source, "Orders");
@@ -1807,7 +1827,7 @@ mod tests {
     #[test]
     fn two_copies_are_not_a_pattern_and_the_reason_says_what_to_do() {
         // §2's Rule of 3. The message has to be actionable, not a diagnosis.
-        let (proposal, reason) = propose_template(&[link(1, "C2", "B2"), link(2, "C3", "B3")]);
+        let (proposal, reason) = propose_template(&[link(1, "C2", "B2"), link(2, "C3", "B3")], 2);
         assert!(proposal.is_none());
         let reason = reason.expect("a refusal must explain itself");
         assert!(reason.contains("three are needed"), "unhelpful: {reason}");
@@ -1817,20 +1837,42 @@ mod tests {
     fn an_ordinary_recording_proposes_nothing_and_reports_no_problem() {
         // Nothing was copied between grids, so there was never a pattern to
         // look for. That is not a failed detection and must not read as one.
-        let (proposal, reason) = propose_template(&[]);
+        let (proposal, reason) = propose_template(&[], 0);
         assert!(proposal.is_none());
         assert_eq!(reason, None, "an ordinary recording is not a refusal");
+    }
+
+    #[test]
+    fn pastes_that_could_not_be_traced_to_a_cell_say_so_rather_than_going_quiet() {
+        // The real failure this came from: six pastes out of a Google Doc into
+        // a Sheet. No cell positions can be read from a document, so no source
+        // links form -- and the review screen previously showed NOTHING, so the
+        // user was left guessing why the pattern prompt never appeared.
+        let (proposal, reason) = propose_template(&[], 6);
+        assert!(proposal.is_none());
+        let reason = reason.expect("six pastes and no links must be explained");
+        assert!(reason.contains("6 pastes"), "should count them: {reason}");
+        assert!(
+            reason.contains("spreadsheet"),
+            "should say what a source has to be: {reason}"
+        );
+    }
+
+    #[test]
+    fn one_untraceable_paste_reads_as_singular() {
+        let (_, reason) = propose_template(&[], 1);
+        let reason = reason.expect("explained");
+        assert!(reason.contains("1 paste seen"), "{reason}");
     }
 
     #[test]
     fn a_still_source_is_reported_as_inconclusive_not_as_a_constant() {
         // §2 is explicit: a source that did not move is inconclusive, "not as
         // confirmation of a fixed, unchanging value".
-        let (proposal, reason) = propose_template(&[
-            link(1, "C2", "B2"),
-            link(2, "C2", "B3"),
-            link(3, "C2", "B4"),
-        ]);
+        let (proposal, reason) = propose_template(
+            &[link(1, "C2", "B2"), link(2, "C2", "B3"), link(3, "C2", "B4")],
+            3,
+        );
         assert!(proposal.is_none());
         let reason = reason.expect("a refusal must explain itself");
         assert!(
@@ -1860,7 +1902,7 @@ mod tests {
                 destination_cell: format!("E{row}"),
             });
         }
-        let (proposal, _) = propose_template(&links);
+        let (proposal, _) = propose_template(&links, links.len());
         let p = proposal.expect("a two-field pattern should be detected");
         let pairs: Vec<(String, String)> = p
             .fields

@@ -63,7 +63,7 @@ async fn main() -> ExitCode {
             || n.contains("Check")
             || n.contains("Preview")
             || n.contains("Run")
-            || n.contains("Save")
+            || n.contains("Save") || n.contains("playbook") || n.contains("step") || n.contains("Type into")
         {
             println!("  d{depth:<2} {role:<16} {n:?}");
         }
