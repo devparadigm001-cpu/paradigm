@@ -11874,6 +11874,16 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "sheetsreplaytab") {
         return sheetsreplaytab_mode().await;
     }
+    if std::env::args().any(|a| a == "exportcsv") {
+        let doc = std::env::args().nth(2).unwrap_or_default();
+        let gid = std::env::args().nth(3).unwrap_or_else(|| "0".to_string());
+        match download_csv("msedge", &doc, &gid).await {
+            Some(csv) => println!("---- {doc} gid={gid} ----
+{}", csv.trim()),
+            None => println!("could not download {doc}"),
+        }
+        return ExitCode::SUCCESS;
+    }
     if std::env::args().any(|a| a == "clickname") {
         let name = std::env::args().nth(2).unwrap_or_default();
         let desktop = Desktop::new(false, false).expect("desktop");

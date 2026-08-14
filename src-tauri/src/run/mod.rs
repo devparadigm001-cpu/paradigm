@@ -192,6 +192,13 @@ pub enum RunStop {
     /// which they are looking at before they re-run.
     WriteFailed {
         position: SourcePosition,
+        /// The destination cell that was being written when it failed.
+        ///
+        /// A failed write has ALREADY typed into this cell -- the attempt is
+        /// what fails verification, not the typing -- so this names what may
+        /// have been altered. Reporting a failure without it invites the
+        /// reading that nothing happened, which is the opposite of true.
+        cell: String,
         wrote: Vec<String>,
         reason: String,
     },
@@ -757,14 +764,22 @@ pub fn run_with_control(
             match writer.write(&mapping.destination_field, value) {
                 Ok(()) => wrote.push(mapping.destination_field.clone()),
                 Err(e) => {
-                    write_failure = Some(e.to_string());
+                    // The cell is captured HERE, where it is known. A failed
+                    // write has still typed into the destination, and the
+                    // summary has to be able to name what may have changed --
+                    // it previously could not, because only the free-text
+                    // reason mentioned the cell and nothing could read it back
+                    // out of a sentence.
+                    write_failure =
+                        Some((format!("{}{}", mapping.destination_field, destination), e.to_string()));
                     break;
                 }
             }
         }
-        if let Some(reason) = write_failure {
+        if let Some((cell, reason)) = write_failure {
             break RunStop::WriteFailed {
                 position,
+                cell,
                 wrote,
                 reason,
             };
@@ -853,6 +868,7 @@ fn advance_both(
     if let Err(e) = writer.advance(template.destination_step) {
         return Some(RunStop::WriteFailed {
             position: position.clone(),
+            cell: String::new(),
             wrote: Vec::new(),
             reason: e.to_string(),
         });

@@ -1594,12 +1594,23 @@ fn summarise(playbook_id: &str, outcome: &run::background::RunOutcome) -> RunSum
             "incomplete",
             Some(format!("Could not read row {}: {reason}", position.row_key)),
         ),
-        run::RunStop::WriteFailed { position, wrote, reason } => (
+        run::RunStop::WriteFailed { position, cell, wrote, reason } => (
             "incomplete",
             Some(format!(
-                "Row {} was only part-written ({}) before this failed: {reason}",
+                "Row {} stopped part-way. {}
+
+The destination cell {} MAY HAVE BEEN \r
+                 ALTERED: a write that fails verification has still typed into the cell, \r
+                 so check it before re-running.
+
+What failed: {reason}",
                 position.row_key,
-                if wrote.is_empty() { "nothing".to_string() } else { wrote.join(", ") }
+                if wrote.is_empty() {
+                    "No cell finished writing successfully.".to_string()
+                } else {
+                    format!("Finished writing: {}.", wrote.join(", "))
+                },
+                if cell.is_empty() { "for this record".to_string() } else { cell.clone() },
             )),
         ),
         run::RunStop::MarkFailed { position, reason } => (
@@ -1623,6 +1634,13 @@ fn summarise(playbook_id: &str, outcome: &run::background::RunOutcome) -> RunSum
     let headline = match &processed_range {
         Some(range) if written == 1 => format!("Processed row {range}."),
         Some(range) => format!("Processed rows {range} — {written} records."),
+        // A failed write has ALREADY typed into the destination -- what fails
+        // is the verification, not the typing. "Nothing was written" would be
+        // false in exactly the moment the user most needs it to be true, and it
+        // was: a run that mangled a cell reported that nothing had happened.
+        None if matches!(report.stop, run::RunStop::WriteFailed { .. }) => {
+            "No record completed — but the destination may have been changed.".to_string()
+        }
         None if report.skipped() > 0 => {
             "Nothing new to do — every record was already processed.".to_string()
         }
@@ -2005,6 +2023,46 @@ mod tests {
     // Not hypothetical: `CaptureSummary` had already drifted three fields out
     // of date on the TypeScript side before Section 6 started, and nothing
     // noticed because the frontend never read them.
+
+    #[test]
+    fn a_failed_write_never_reports_that_nothing_happened() {
+        // The defect this pins, seen for real: a run typed into A2, failed
+        // verification, and the summary said "Nothing was written." while the
+        // cell had visibly changed. A user reads that and believes the sheet is
+        // untouched, at the one moment that belief is most expensive.
+        let report = run::RunReport {
+            playbook_id: "pb".into(),
+            stop: run::RunStop::WriteFailed {
+                position: crate::source::SourcePosition {
+                    source_id: "src".into(),
+                    row_key: "2".into(),
+                },
+                cell: "A2".into(),
+                wrote: Vec::new(),
+                reason: "wrote \"X\" but the cell reads \"Y\"".into(),
+            },
+            records: Vec::new(),
+            corrected: Vec::new(),
+        };
+        let v = summarise("pb", &run::background::RunOutcome::Finished(report));
+
+        assert!(
+            !v.headline.contains("Nothing was written"),
+            "headline must not claim nothing happened: {}",
+            v.headline
+        );
+        assert!(
+            v.headline.contains("may have been changed"),
+            "headline must warn the destination changed: {}",
+            v.headline
+        );
+        let reason = v.stop_reason.expect("a failed write must explain itself");
+        assert!(
+            reason.contains("A2"),
+            "must name the cell that may have been altered: {reason}"
+        );
+        assert!(v.needs_attention);
+    }
 
     #[test]
     fn preview_outcome_serialises_as_a_kind_tagged_union() {
