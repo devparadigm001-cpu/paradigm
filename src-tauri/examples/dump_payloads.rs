@@ -62,5 +62,15 @@ fn main() -> ExitCode {
         )
         .unwrap_or(-1);
     println!("workflow_templates rows = {n}");
+    if let Ok(t) = paradigm_lib::compile::store::load_template(&conn, &id) {
+        if let Some(t) = t {
+            println!("  source      = {}", t.source_id);
+            println!("  destination = {}", t.destination_id);
+            println!("  steps       = source +{} / destination +{}", t.source_step, t.destination_step);
+            for f in &t.fields {
+                println!("  map         {} -> {}", f.source_field, f.destination_field);
+            }
+        }
+    }
     ExitCode::SUCCESS
 }

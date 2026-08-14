@@ -178,9 +178,27 @@ function StoredPlaybooksSection({
                   variant="outline"
                   size="sm"
                   disabled={actionsBusy}
+                  // On a templated row this sits next to "Check for new", and
+                  // the two do completely different things: this re-runs the
+                  // captured steps literally, writing the recorded values back
+                  // into the recorded cells, while "Check for new" uses the
+                  // mapping and the ledger. A row offering both, each labelled
+                  // "Replay", invites reaching for the wrong one -- and the
+                  // literal path is also the one exposed to Phase 1's
+                  // containment-based selector matching.
+                  title={
+                    playbook.is_templated
+                      ? "Re-runs the original captured steps exactly as recorded. To process new records, use Check for new."
+                      : undefined
+                  }
+                  // Same reasoning as Delete below: without this, every row's
+                  // button shares one accessible name.
+                  aria-label={`${
+                    playbook.is_templated ? "Replay original recording" : "Replay"
+                  } ${playbook.name}, ${index + 1} of ${data.length}`}
                   onClick={() => onReplay(playbook)}
                 >
-                  Replay
+                  {playbook.is_templated ? "Replay original recording" : "Replay"}
                 </Button>
                 <Button
                   variant="destructive"

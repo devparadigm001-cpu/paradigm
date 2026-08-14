@@ -11874,6 +11874,18 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "sheetsreplaytab") {
         return sheetsreplaytab_mode().await;
     }
+    if std::env::args().any(|a| a == "clickname") {
+        let name = std::env::args().nth(2).unwrap_or_default();
+        let desktop = Desktop::new(false, false).expect("desktop");
+        match click_app_button(&desktop, &name).await {
+            Ok(()) => println!("clicked {name:?}"),
+            Err(e) => println!("could not click {name:?}: {e}"),
+        }
+        return ExitCode::SUCCESS;
+    }
+    if std::env::args().any(|a| a == "checknewonly") {
+        return checknewonly_mode().await;
+    }
     if std::env::args().any(|a| a == "uicorrection") {
         return uicorrection_mode().await;
     }
@@ -15686,4 +15698,71 @@ async fn uicorrection_mode() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Drive ONLY the non-destructive half of the templated path: scan, preview,
+/// then cancel. Verifies surface resolution, the ledger scan and the
+/// first-record read without writing anything to a real destination.
+async fn checknewonly_mode() -> ExitCode {
+    println!("== Check for new -> Preview -> Cancel (no writes) ==\n");
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = app_window(&desktop).await else {
+        eprintln!("the Paradigm window is not reachable");
+        return ExitCode::FAILURE;
+    };
+    let buttons = desktop
+        .locator("role:Button")
+        .within(window)
+        .all(Some(Duration::from_secs(6)), None)
+        .await
+        .unwrap_or_default();
+    let Some(check) = buttons
+        .iter()
+        .find(|b| b.name().unwrap_or_default().starts_with("Check for new records"))
+        .map(|b| b.name().unwrap_or_default())
+    else {
+        eprintln!("no 'Check for new' button found");
+        return ExitCode::FAILURE;
+    };
+    println!("clicking {check:?}");
+
+    match click_and_wait(&desktop, &check, "Run the workflow on these", 180, 3).await {
+        Ok(t) => println!("\n  SCAN: {t:?}"),
+        Err(e) => {
+            // A refusal is still a result worth reading.
+            println!("\n  no batch prompt. On screen instead:");
+            for line in app_text(&desktop).await {
+                if line.contains("window")
+                    || line.contains("source")
+                    || line.contains("No new")
+                    || line.contains("could not")
+                {
+                    println!("    {line}");
+                }
+            }
+            eprintln!("  {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    match click_and_wait(&desktop, "Preview first record", "About to write", 120, 3).await {
+        Ok(t) => println!("  PREVIEW: {t:?}"),
+        Err(e) => {
+            eprintln!("  preview did not appear: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let screen = app_text(&desktop).await.join(" | ");
+    println!("  panel: {}", screen.chars().take(400).collect::<String>());
+
+    // §4.10: cancelling activates nothing. Nothing has been written.
+    println!("\n  cancelling (nothing is written)");
+    let _ = click_app_button(&desktop, "Cancel").await;
+    ExitCode::SUCCESS
 }

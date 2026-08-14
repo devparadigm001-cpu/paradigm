@@ -57,7 +57,7 @@ async fn main() -> ExitCode {
         if n.is_empty() {
             continue;
         }
-        if n.contains("record")
+        if true || n.contains("record")
             || n.contains("Record")
             || n.contains("Refresh")
             || n.contains("Check")
