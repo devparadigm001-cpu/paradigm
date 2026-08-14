@@ -14198,6 +14198,18 @@ async fn templatedbatch_mode() -> ExitCode {
 // Usage: uiflow <data-dir>     (the same PARADIGM_DATA_DIR the app was given)
 // ---------------------------------------------------------------------------
 
+/// The Paradigm main window, if it is up.
+async fn app_window(desktop: &Desktop) -> Option<UIElement> {
+    desktop
+        .locator("role:Window")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .ok()?
+        .into_iter()
+        .find(|w| w.name().unwrap_or_default().trim() == "Paradigm")
+}
+
 /// Find a button in the Paradigm window by exact accessible name.
 async fn app_button(desktop: &Desktop, name: &str) -> Option<UIElement> {
     let windows = desktop
@@ -14220,7 +14232,31 @@ async fn app_button(desktop: &Desktop, name: &str) -> Option<UIElement> {
         .find(|b| b.name().unwrap_or_default().trim() == name)
 }
 
-/// Every piece of text currently on screen in the app window.
+/// Every name on screen, from a full tree walk rather than a role sweep.
+///
+/// The role sweep missed the preview VALUES: a table cell is not `role:Text`,
+/// so "Acme" was on screen and invisible to a check that only looked at Text
+/// and Button. Walking every descendant asks the question the check actually
+/// means -- "is this string anywhere in the window" -- instead of guessing
+/// which roles it might wear.
+fn collect_names(el: &UIElement, depth: usize, budget: &mut usize, out: &mut Vec<String>) {
+    if *budget == 0 || depth > 30 {
+        return;
+    }
+    *budget -= 1;
+    if let Some(n) = el.name() {
+        let n = n.trim().to_string();
+        if !n.is_empty() {
+            out.push(n);
+        }
+    }
+    if let Ok(children) = el.children() {
+        for c in children {
+            collect_names(&c, depth + 1, budget, out);
+        }
+    }
+}
+
 async fn app_text(desktop: &Desktop) -> Vec<String> {
     let Ok(windows) = desktop
         .locator("role:Window")
@@ -14237,21 +14273,8 @@ async fn app_text(desktop: &Desktop) -> Vec<String> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for role in ["role:Text", "role:Button"] {
-        if let Ok(found) = desktop
-            .locator(role)
-            .within(window.clone())
-            .all(Some(Duration::from_secs(5)), None)
-            .await
-        {
-            for el in found {
-                let n = el.name().unwrap_or_default().trim().to_string();
-                if !n.is_empty() {
-                    out.push(n);
-                }
-            }
-        }
-    }
+    let mut budget = 6000usize;
+    collect_names(&window, 0, &mut budget, &mut out);
     out
 }
 
@@ -14263,6 +14286,43 @@ async fn click_app_button(desktop: &Desktop, name: &str) -> Result<(), String> {
     el.click()
         .map_err(|e| format!("clicking {name:?} failed: {e}"))?;
     Ok(())
+}
+
+/// Click a button and confirm the page actually reacted, retrying if not.
+///
+/// `click()` returning Ok means the click was DELIVERED, not that the page saw
+/// it -- this repo has already recorded that exact gap for Google Sheets tabs,
+/// where a tab click was accepted and never acted on. A webview button is no
+/// different, and it cost a run here before this helper existed. So the check
+/// is the effect, not the return value.
+async fn click_and_wait(
+    desktop: &Desktop,
+    button: &str,
+    needle: &str,
+    secs: u64,
+    attempts: usize,
+) -> Result<String, String> {
+    let mut last = String::new();
+    for attempt in 1..=attempts {
+        if let Some(w) = app_window(desktop).await {
+            let _ = w.activate_window();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        if let Err(e) = click_app_button(desktop, button).await {
+            last = e;
+            continue;
+        }
+        match wait_for_text(desktop, needle, secs).await {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                last = e;
+                if attempt < attempts {
+                    println!("    (no reaction to {button:?}, retrying)");
+                }
+            }
+        }
+    }
+    Err(last)
 }
 
 /// Wait until some text appears on screen, or give up and say what WAS there.
@@ -14512,16 +14572,13 @@ async fn uiflow_mode() -> ExitCode {
             }
         }
     };
-    if let Err(e) = click_app_button(&desktop, &check_label).await {
-        eprintln!("{e}");
-        return ExitCode::FAILURE;
-    }
+    // via click_and_wait below
 
     // "Run the workflow on these" and NOT "new record": the loading text is
     // "Looking for new records…", which contains the shorter needle, so the
     // first version of this matched the spinner and clicked on before the scan
     // had finished. Each peek is a real navigation, so the scan takes seconds.
-    let batch_line = match wait_for_text(&desktop, "Run the workflow on these", 120).await {
+    let batch_line = match click_and_wait(&desktop, &check_label, "Run the workflow on these", 90, 3).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("  the batch prompt never appeared.\n{e}");
@@ -14532,11 +14589,7 @@ async fn uiflow_mode() -> ExitCode {
     let batch_ok = batch_line.contains("3 new") && batch_line.contains("row 2");
 
     println!("\n-- §4.3: clicking 'Preview first record' --");
-    if let Err(e) = click_app_button(&desktop, "Preview first record").await {
-        eprintln!("{e}");
-        return ExitCode::FAILURE;
-    }
-    let preview_line = match wait_for_text(&desktop, "About to write", 120).await {
+    let preview_line = match click_and_wait(&desktop, "Preview first record", "About to write", 90, 3).await {
         Ok(t) => t,
         Err(e) => {
             eprintln!("  the preview never appeared.\n{e}");
@@ -14577,25 +14630,176 @@ async fn uiflow_mode() -> ExitCode {
     println!("  summary: {summary_line:?}");
     let summary_ok = summary_line.contains("2") && summary_line.contains("4");
 
-    // ---- ground truth -------------------------------------------------------
-    println!("\n-- CSV ground truth --");
-    let Some(csv) = download_csv(browser, &doc_id, &gid2).await else {
-        eprintln!("could not download Sheet2");
-        return ExitCode::FAILURE;
-    };
-    println!("{}", csv.trim());
+
+    // Ground truth for batch one, checked HERE and not at the end: by the end
+    // a second, deliberately-stopped run has been over the same sheet, and a
+    // check that late cannot say which run put a value where.
+    println!("\n-- CSV ground truth, batch one --");
     let mut written_ok = true;
-    for (i, (name, amount)) in rows.iter().enumerate() {
-        let row = i + 2;
-        let a = csv_at(&csv, 1, row).unwrap_or_default();
-        let b = csv_at(&csv, 2, row).unwrap_or_default();
-        let good = a.trim() == *name && b.trim() == *amount;
-        println!(
-            "  A{row}={a:?} B{row}={b:?} expected {name:?}/{amount:?}  {}",
-            if good { "OK" } else { "WRONG" }
-        );
-        written_ok &= good;
+    match download_csv(browser, &doc_id, &gid2).await {
+        Some(csv) => {
+            println!("{}", csv.trim());
+            for (i, (name, amount)) in rows.iter().enumerate() {
+                let row = i + 2;
+                let a = csv_at(&csv, 1, row).unwrap_or_default();
+                let b = csv_at(&csv, 2, row).unwrap_or_default();
+                let good = a.trim() == *name && b.trim() == *amount;
+                println!(
+                    "  A{row}={a:?} B{row}={b:?} expected {name:?}/{amount:?}  {}",
+                    if good { "OK" } else { "WRONG" }
+                );
+                written_ok &= good;
+            }
+        }
+        None => {
+            eprintln!("  could not download the Sheet2 export");
+            written_ok = false;
+        }
     }
+
+    // ---- §4.6: pause, resume, stop, through the real buttons ---------------
+    //
+    // A second batch, deliberately larger than the first: each record is
+    // several seconds of real spreadsheet navigation, and three records did
+    // not leave a window wide enough to catch the run mid-flight. Six do.
+    println!("\n-- closing the summary --");
+    if let Err(e) = click_app_button(&desktop, "Close").await {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    println!("-- adding 6 more source rows --");
+    let more = [
+        ("Umbrella", "400"),
+        ("Tyrell", "500"),
+        ("Soylent", "600"),
+        ("Massive", "700"),
+        ("Vandelay", "800"),
+        ("Wonka", "900"),
+    ];
+    {
+        let Some((window, _)) = sheets_window(&desktop).await else {
+            eprintln!("lost the spreadsheet window");
+            return ExitCode::FAILURE;
+        };
+        let Ok(mut src) = SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet1"),
+            Some("Sheet1".into()),
+            5,
+        )
+        .await
+        else {
+            eprintln!("Sheet1 writer failed");
+            return ExitCode::FAILURE;
+        };
+        for (n, a) in more {
+            if let Err(e) = src.write("C", n).and_then(|_| src.write("D", a)) {
+                eprintln!("adding rows: {e}");
+                return ExitCode::FAILURE;
+            }
+            let _ = src.advance(1);
+        }
+    }
+    println!("  rows 5-10 added\n");
+
+    println!("-- §4.8 again --");
+    let second_prompt = match click_and_wait(&desktop, &check_label, "Run the workflow on these", 120, 3).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  prompt: {second_prompt:?}");
+    // The ledger is what makes this 6 and not 9.
+    let second_batch_ok = second_prompt.contains("6 new") && second_prompt.contains("row 5");
+    println!("  exactly the 6 new ones, starting at row 5: {second_batch_ok}");
+
+    if let Err(e) = click_and_wait(&desktop, "Preview first record", "About to write", 90, 3).await {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+    let names = app_text(&desktop).await;
+    let confirm2 = names
+        .iter()
+        .find(|t| t.starts_with("Looks right"))
+        .cloned()
+        .unwrap_or_else(|| "Looks right — run the rest".to_string());
+    if let Err(e) = click_app_button(&desktop, &confirm2).await {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("  confirmed; run started");
+
+    if let Err(e) = wait_for_text(&desktop, "Running", 30).await {
+        eprintln!("  never saw Running: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    println!("\n-- §4.6: Pause --");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    if let Err(e) = click_app_button(&desktop, "Pause").await {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+    let paused = wait_for_text(&desktop, "Paused", 60).await;
+    match &paused {
+        Ok(t) => println!("  overlay: {t:?}"),
+        Err(e) => {
+            eprintln!("  never reached Paused: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    // §4.6 promises the in-progress record is redone from the start; the
+    // overlay is supposed to say so while paused.
+    let says_redo = app_text(&desktop)
+        .await
+        .iter()
+        .any(|t| t.contains("redone from the start"));
+    println!("  explains the redo: {says_redo}");
+
+    println!("\n-- §4.6: Resume --");
+    if let Err(e) = click_app_button(&desktop, "Resume").await {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+    let resumed = wait_for_text(&desktop, "Running", 60).await;
+    match &resumed {
+        Ok(t) => println!("  overlay: {t:?}"),
+        Err(e) => {
+            eprintln!("  never went back to Running: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    println!("\n-- §4.6: Stop --");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    if let Err(e) = click_app_button(&desktop, "Stop").await {
+        eprintln!("  {e}");
+        return ExitCode::FAILURE;
+    }
+    // "You stopped it" -- the summary text, not the overlay heading. Waiting on
+    // "Run finished" matched the overlay before the report arrived.
+    let stop_summary = match wait_for_text(&desktop, "You stopped it", 240).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  no summary after Stop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("  {stop_summary:?}");
+    let after_stop = app_text(&desktop).await;
+    let explains_stop = after_stop.iter().any(|t| t.contains("You stopped it"));
+    println!("  summary explains the stop: {explains_stop}");
+    for line in after_stop.iter().filter(|t| t.starts_with("Processed")) {
+        println!("  {line:?}");
+    }
+
+    let controls_ok =
+        paused.is_ok() && resumed.is_ok() && says_redo && explains_stop && second_batch_ok;
 
     println!("\n== VERDICT ==");
     println!("  templated badge in the list        : true");
@@ -14603,10 +14807,11 @@ async fn uiflow_mode() -> ExitCode {
     println!("  §4.3 preview: row 2, real value    : {preview_ok}");
     println!("  §4.6 overlay appeared              : {}", running.is_ok());
     println!("  §4.9 summary: processed 2-4        : {summary_ok}");
+    println!("  4.6 pause -> resume -> stop        : {controls_ok}");
     println!("  destination matches source (CSV)   : {written_ok}");
     println!("\n  doc id for cleanup: {doc_id}");
 
-    let pass = batch_ok && preview_ok && summary_ok && written_ok;
+    let pass = batch_ok && preview_ok && summary_ok && written_ok && controls_ok;
     println!(
         "\n{}",
         if pass {

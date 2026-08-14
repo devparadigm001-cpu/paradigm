@@ -202,15 +202,18 @@ export function useWorkflowRun() {
   const stop = useCallback(async () => {
     try {
       const status = await invoke<RunStatusView>("stop_workflow_run");
-      stopPolling();
-      // Stop is permanent, so the next thing to show is the summary --
-      // but the run thread may still be finishing the record it was on, so
-      // the report is fetched rather than assumed to exist yet.
-      await showSummary({ ...status, finished: true });
+      setStage({ name: "running", status });
+      // Keep polling. §4.6 lets the in-progress record finish cleanly, so the
+      // thread is usually still working when Stop returns and the report does
+      // not exist yet. An earlier version stopped polling here and fetched the
+      // summary immediately: it got nothing, fell back to the running view,
+      // and then never looked again — so a stopped run showed "Run finished"
+      // and no summary, permanently.
+      pollStatus();
     } catch (e) {
       setStage({ name: "error", message: describeError(e) });
     }
-  }, [stopPolling, showSummary]);
+  }, [pollStatus]);
 
   return {
     stage,

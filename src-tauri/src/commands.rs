@@ -1126,27 +1126,37 @@ pub async fn resume_workflow_run(state: State<'_, AppState>) -> Result<RunStatus
 /// Stop the run for good (§4.6). The record in progress finishes cleanly, or --
 /// if the run was paused mid-record -- is discarded.
 ///
-/// The handle is taken out of app state, because a stopped run is over and
-/// leaving it there would let a later Resume find something to talk to. The
-/// thread is not joined here: joining would block the caller until the current
-/// record finished, which is the opposite of what §4.10 asks for.
+/// The handle STAYS in app state. An earlier version took it out, on the
+/// reasoning that a stopped run is over and leaving it would give a later
+/// Resume something to talk to — but `RunControl::stop` is already permanent,
+/// so Resume refuses on its own, and removing the handle broke something that
+/// matters more: `get_workflow_run_report` reads the outcome through this
+/// slot, so a stopped run had no reachable summary at all. The user pressed
+/// Stop and got "Run finished" with nothing about what it had done.
+///
+/// Caught by driving the real UI; every unit test passed throughout, because
+/// each command was correct on its own and only the pair was wrong.
+///
+/// The thread is not joined here: joining would block the caller until the
+/// current record finished, which is the opposite of what §4.10 asks for.
 #[tauri::command]
 pub async fn stop_workflow_run(state: State<'_, AppState>) -> Result<RunStatusView, String> {
-    let active = {
-        let mut slot = state.active_run.lock().map_err(|e| e.to_string())?;
-        slot.take()
-            .ok_or_else(|| "no workflow run is in progress".to_string())?
+    let playbook_id = {
+        let slot = state.active_run.lock().map_err(|e| e.to_string())?;
+        let active = slot
+            .as_ref()
+            .ok_or_else(|| "no workflow run is in progress".to_string())?;
+        active.control.stop();
+        active.playbook_id.clone()
     };
-    active.control.stop();
 
     let conn = state.db.lock().await;
-    run::set_run_state(&conn, &active.playbook_id, run::RunState::Idle)
-        .map_err(|e| e.to_string())?;
+    run::set_run_state(&conn, &playbook_id, run::RunState::Idle).map_err(|e| e.to_string())?;
 
     Ok(RunStatusView {
-        playbook_id: Some(active.playbook_id.clone()),
+        playbook_id: Some(playbook_id),
         state: run::RunState::Idle.as_str().to_string(),
-        finished: active.is_finished(),
+        finished: false,
     })
 }
 
