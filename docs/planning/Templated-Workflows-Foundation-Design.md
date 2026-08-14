@@ -227,6 +227,35 @@ whether this should become a **permanent** part of the workflow going
 forward, or was just a one-off fix for this particular record. Distinguishes
 "this one order was weird" from "the format actually changed."
 
+> #### The one-off scope has no trigger, and that is a gap in 4.5 itself
+>
+> Both correction scopes are built and both are callable
+> (`apply_permanent_correction`, `apply_one_off_correction`), and the one-off
+> path is proven live: a correction applied to row 3 changed row 3 and left
+> rows 2 and 4 reading the column the template names.
+>
+> **But nothing in the product can currently open the panel with a record in
+> hand.** The only trigger wired is format drift, and drift is checked *before*
+> a run starts — at the preview, and again on the run thread before the first
+> write. At that moment there is no run and no record, so a one-off has nothing
+> to attach to. The panel disables the option and says why; it is not reachable.
+>
+> That is not a wiring omission. 4.5 presents the two scopes as answers to one
+> question, but the trigger it describes — a surface that "no longer looks like
+> it did" — can only ever produce the permanent case. "This one order was weird"
+> needs a *different* trigger: something that happens mid-run, with a specific
+> record in hand.
+>
+> `RunStop::RecordDoesNotFit` is the obvious candidate — it already names the
+> position — but it currently **ends** the run rather than pausing it for a
+> correction. Making the one-off scope reachable therefore means deciding
+> whether a run can halt, be corrected, and resume mid-batch, which is a change
+> to the run loop's contract and not a UI task.
+>
+> Until that is decided, 4.5's correction interaction is half-reachable: the
+> panel, the click-to-point, the confirm step and the permanent path all work;
+> the one-off branch is dead UI with a live backend behind it.
+>
 > #### Build status: detection is done, correction is not
 >
 > As of backend item 11, the **detection** half of 4.5 is built and proven
