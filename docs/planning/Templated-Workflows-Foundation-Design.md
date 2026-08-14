@@ -512,22 +512,34 @@ as an extension of what already exists there, not a separate flow.
    one-off correction, which presupposes one has been applied — and per-record
    overrides do not exist in the run loop at all.
 7. Clean, simple summary display, expanding only when something needs
-   attention (4.9). **Blocked on backend item 13.** A run produces a full
-   `RunReport` — per-record outcomes, skips, incomplete records, why it
-   stopped — and no command returns it. `get_workflow_run_status` reports only
-   idle/running/paused and whether the thread has ended.
+   attention (4.9). **Built** on backend item 13, and verified live: a clean
+   run shows one line, and a stopped one explains what happened to the record
+   it was working on.
 
-> **What Section 6 can rely on today.** Items 1–4 have working, registered
-> backends: detection and the mapping proposal (`stop_record_session`), the
-> first-record preview and its gate (`preview_workflow_run` /
-> `start_workflow_run` / `cancel_workflow_preview`), new-batch detection
-> (`check_for_new_records`), and the run controls (`pause_` / `resume_` /
-> `stop_workflow_run`, `get_workflow_run_status`).
+> **Status.** Items 1–4 and 7 are **built and verified live** — driven through
+> the app's own accessibility tree against a real Google Sheet, with the
+> destination confirmed by CSV export:
 >
-> Items 5, 6 and 7 do not. Building any of them against an assumed backend
-> would produce UI that looks finished and has nowhere to send its answer —
-> a correction panel that collects a column and discards it, or a summary
-> screen with nothing to summarise.
+> ```
+> badge       "↻ repeating"
+> §4.8        "Found 3 new records starting at row 2. Run the workflow on these?"
+> §4.3        "About to write source row 2 → destination row 2", value "Acme"
+> §4.6        Running → Pause → "Paused" (explains the redo) → Resume → Stop
+> §4.9        "Processed rows 2–4 — 3 records."
+> §4.8 again  "Found 6 new records starting at row 5"   ← the ledger, live
+> Stop        "You stopped it. The record it was working on finished first."
+> CSV         A2..B4 match the source exactly
+> ```
+>
+> Reproduce with `text_capture_probe -- uiflow <data-dir>` against a running
+> `npm run tauri dev`. **The app must have OPENED its database rather than
+> created it** — see
+> [cross-connection-writes-invisible-when-app-created-the-db.md](../known-issues/cross-connection-writes-invisible-when-app-created-the-db.md),
+> which is an open question in its own right.
+>
+> **Items 5 and 6 remain blocked on backend item 12.** Building either against
+> an assumed backend would produce a correction panel that collects a column
+> and discards it — UI that looks finished with nowhere to send its answer.
 
 ## 7. Explicitly out of scope for this version, and why
 
