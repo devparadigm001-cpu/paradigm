@@ -227,6 +227,53 @@ whether this should become a **permanent** part of the workflow going
 forward, or was just a one-off fix for this particular record. Distinguishes
 "this one order was weird" from "the format actually changed."
 
+> #### `RecordDoesNotFit` cannot be that trigger, and 4.4 conflicts with 4.5
+>
+> The obvious fix — pause on `RecordDoesNotFit` and open the panel — was
+> attempted and **stopped before implementation**, because the code says it
+> would not work. Two measured facts:
+>
+> **1. `RecordDoesNotFit` almost never fires.** It means *every* mapped source
+> field is blank. But `peek` classifies the same columns by the same blank rule
+> before the read, so if `peek` returned `Record`, at least one mapped column
+> held data and `classify_fit` cannot then find them all blank. The only way to
+> reach it is the sheet changing between the peek and the read — pinned by
+> `a_record_emptied_between_the_peek_and_the_read_stops_the_run`. That is "the
+> data moved under us", not "this one order was weird", and offering a column
+> correction for it would be answering a question nobody asked.
+>
+> **2. The case that IS "this one order was weird" produces `MissingFields`.** A
+> record whose customer name happens to sit in column E instead of C has *some*
+> mapped fields blank, not all — so `classify_fit` returns `MissingFields`.
+>
+> And 4.4 says, explicitly, what to do with that: **continue**, because "a blank
+> cell isn't damaging", and log it for the summary.
+>
+> So the trigger 4.5 needs is the exact case 4.4 instructs the loop to carry on
+> past. **These two sections disagree**, and it is not a disagreement code can
+> resolve quietly: pausing on `MissingFields` would silently overturn a rule 4.4
+> states in as many words, and the run loop has a test asserting the documented
+> behaviour.
+>
+> Three ways out, none of them free:
+>
+> * **(a) Opt-in supervision.** A per-run "stop and ask on incomplete records"
+>   flag, default off. 4.4's documented behaviour is preserved exactly; the
+>   correction flow becomes available to a user who has asked to supervise.
+>   Costs a run option the design does not mention.
+> * **(b) Correct after the fact.** 4.9 already flags incomplete records in the
+>   summary. Let the user correct one from there, which re-processes just that
+>   row. Needs a way to un-mark a processed row — which 4.7's ledger is
+>   deliberately built to prevent.
+> * **(c) Amend 4.4.** Decide that a missing field in a MAPPED column is worth
+>   stopping for after all, and that 4.4's "continue" was written before 4.5's
+>   correction flow existed.
+>
+> **(a) is the smallest change that contradicts nothing**, and is the
+> recommendation. It is not implemented, because choosing between these is a
+> product decision about when a run is allowed to interrupt someone, not an
+> implementation detail.
+>
 > #### The one-off scope has no trigger, and that is a gap in 4.5 itself
 >
 > Both correction scopes are built and both are callable
