@@ -227,6 +227,37 @@ whether this should become a **permanent** part of the workflow going
 forward, or was just a one-off fix for this particular record. Distinguishes
 "this one order was weird" from "the format actually changed."
 
+> #### Build status: detection is done, correction is not
+>
+> As of backend item 11, the **detection** half of 4.5 is built and proven
+> live: both surfaces' shapes are recorded at confirmation, compared before a
+> run, and a mapped column that was renamed, moved or removed halts the run
+> before a single cell is written. `Drift::Moved` carries the best guess the
+> panel needs ("Looks like column D now?").
+>
+> The **correction** half is not, and the two scopes are in different states:
+>
+> * **Permanent** — `run::drift::apply_permanent_correction` exists and is
+>   tested: it repoints the mapped field and re-records the shape, so the next
+>   run compares against what the user confirmed. **It has no caller.** No
+>   command exposes it, so it is not reachable from a frontend today.
+> * **One-off** — *not built at all*, and not merely unexposed. A one-off
+>   correction means "use column D instead of C **for this record only**, then
+>   go back to normal", and the run loop has no concept that could carry that.
+>   Its mapping comes from `CompiledTemplate` and is fixed for the whole run;
+>   there is nowhere for a per-record override to live, and nothing that would
+>   expire one after the record it applies to. That is a change to how the loop
+>   resolves a field, not a new function beside the existing one.
+>
+> **Section 6 must not assume either path exists.** Frontend item 5 (the
+> click-to-point panel) has a backend that can tell it *what* drifted and
+> *where it probably went*, but nothing to send the answer to. Frontend item 6
+> ("make this permanent?") is the harder case: it presupposes a one-off
+> correction has already been applied and is asking whether to keep it — so it
+> presupposes exactly the concept that does not exist.
+>
+> Tracked as backend item 12.
+
 ### 4.6 Run controls — Stop and Pause are genuinely different
 
 - **Stop**: hard, permanent. Whatever record was actively being written when
@@ -416,9 +447,38 @@ is keyed by workflow identity, not source identity alone.
 11. **Format-drift detection**: the before/during-run check in 4.5, for both
     source and destination.
 
+12. **Correction application (4.5), both scopes** — *not built*. Item 11 built
+    the detection half; this is the half that acts on it.
+
+    * **Permanent**: `run::drift::apply_permanent_correction` already does the
+      work and is tested, but nothing calls it. Needs a command, and needs to
+      be reachable from a halted run rather than only from a fresh preview.
+    * **One-off**: genuinely unbuilt. "Use column D instead of C for this
+      record only" needs a per-record override the run loop has no concept of
+      — its mapping comes from `CompiledTemplate` and is fixed for the whole
+      run, so there is nowhere for an override to live and nothing to expire
+      it afterwards. This is a change to how the loop resolves a field, not a
+      function added beside the existing one.
+
+    Frontend items 5 and 6 both depend on this, and item 6 depends on the
+    one-off concept specifically. See the build-status note under 4.5.
+
+13. **Run summary over IPC (4.9)** — *not built*. A finished run holds a full
+    `RunReport`: every record's outcome, which were skipped as already
+    processed, which were written with a field missing, and why the run
+    stopped. `ActiveRun::outcome()` returns it and nothing calls that from the
+    command layer, so none of it is reachable from a frontend.
+    `get_workflow_run_status` answers idle/running/paused and finished-or-not,
+    which is what an overlay needs while a run is going and not what a summary
+    needs once it has ended. Frontend item 7 depends on this.
+
 > **Note on numbering.** Items 8 and 9 were inserted during the build; what
-> this list originally called items 8 and 9 are now 10 and 11. Both insertions
-> were gaps found by building, not scope added — see
+> this list originally called items 8 and 9 are now 10 and 11. Items 12 and 13
+> were added after item 11 shipped — 12 on finding that 4.5's detection and
+> correction halves had been treated as one item when only detection was
+> built, and 13 on checking, rather than assuming, that the run summary was
+> reachable from a frontend. It was not. None of these were scope added —
+> they were gaps found by building; see
 > [Templated-Workflows-Build-Order-Gaps.md](Templated-Workflows-Build-Order-Gaps.md)
 > for how each was found. Commit messages referring to "item N" use the
 > numbering current at the time.
@@ -444,10 +504,30 @@ as an extension of what already exists there, not a separate flow.
 3. New-batch confirmation prompt (4.8).
 4. Running-state overlay with real Stop and Pause controls (4.6).
 5. The non-blocking click-to-point correction panel, including the
-   confirm-what-you-selected step (4.5).
+   confirm-what-you-selected step (4.5). **Blocked on backend item 12.** The
+   backend can say what drifted and where it probably went, but there is no
+   command to send the user's answer to.
 6. The "make this permanent?" follow-up after a one-off correction (4.5).
+   **Blocked on backend item 12, harder half.** This asks whether to keep a
+   one-off correction, which presupposes one has been applied — and per-record
+   overrides do not exist in the run loop at all.
 7. Clean, simple summary display, expanding only when something needs
-   attention (4.9).
+   attention (4.9). **Blocked on backend item 13.** A run produces a full
+   `RunReport` — per-record outcomes, skips, incomplete records, why it
+   stopped — and no command returns it. `get_workflow_run_status` reports only
+   idle/running/paused and whether the thread has ended.
+
+> **What Section 6 can rely on today.** Items 1–4 have working, registered
+> backends: detection and the mapping proposal (`stop_record_session`), the
+> first-record preview and its gate (`preview_workflow_run` /
+> `start_workflow_run` / `cancel_workflow_preview`), new-batch detection
+> (`check_for_new_records`), and the run controls (`pause_` / `resume_` /
+> `stop_workflow_run`, `get_workflow_run_status`).
+>
+> Items 5, 6 and 7 do not. Building any of them against an assumed backend
+> would produce UI that looks finished and has nowhere to send its answer —
+> a correction panel that collects a column and discards it, or a summary
+> screen with nothing to summarise.
 
 ## 7. Explicitly out of scope for this version, and why
 
