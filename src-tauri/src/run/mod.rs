@@ -33,6 +33,7 @@
 pub mod background;
 pub mod batch;
 pub mod control;
+pub mod correction;
 pub mod drift;
 pub mod preview;
 pub mod spreadsheet;
@@ -240,6 +241,8 @@ pub struct RunReport {
     pub playbook_id: String,
     pub stop: RunStop,
     pub records: Vec<RecordReport>,
+    /// Source rows that used a one-off correction (§4.5).
+    pub corrected: Vec<String>,
 }
 
 impl RunReport {
@@ -496,6 +499,7 @@ pub fn run(
         reader,
         writer,
         &RunControl::new(),
+        &correction::RunCorrections::new(),
     )
 }
 
@@ -539,6 +543,7 @@ pub fn run_with_control(
     reader: &mut dyn SourceReader,
     writer: &mut dyn DestinationWriter,
     control: &RunControl,
+    corrections_handle: &correction::RunCorrections,
 ) -> Result<RunReport, RunError> {
     if template.fields.is_empty() {
         return Err(RunError::NoFields);
@@ -549,6 +554,11 @@ pub fn run_with_control(
 
     let fields = source_fields(template);
     let mut records = Vec::new();
+    // Which records used a one-off correction, for the summary. §4.5 wants the
+    // distinction between a one-time exception and a permanent change to be
+    // visible, and a correction that left no trace in the report would make a
+    // corrected record indistinguishable from an ordinary one.
+    let mut corrected: Vec<String> = Vec::new();
 
     let stop = loop {
         if records.len() >= MAX_RECORDS {
@@ -620,8 +630,31 @@ pub fn run_with_control(
             Err(e) => return Err(e.into()),
         }
 
+        // 2b. §4.5's one-off corrections, resolved for THIS record.
+        //
+        // The sequence is unchanged; only "which columns does this record
+        // use" stops being a constant read off the template. A correction can
+        // move a locator and nothing else -- not the order, not the fit check,
+        // not the obligation to mark before advancing.
+        //
+        // Asked for by row key, so a correction for another record simply is
+        // not returned. Not consumed here: the record is not done yet.
+        let corrections = corrections_handle.for_record(&position.row_key);
+        let effective = if corrections.is_empty() {
+            template.fields.clone()
+        } else {
+            correction::apply(&template.fields, &corrections)
+        };
+        let read_fields: Vec<FieldRef> = effective
+            .iter()
+            .map(|m| FieldRef {
+                name: m.source_field.clone(),
+                locator: m.source_field.clone(),
+            })
+            .collect();
+
         // 3. Read. Transient from here to the write, then dropped.
-        let record = match reader.read(&fields) {
+        let record = match reader.read(&read_fields) {
             Ok(r) => r,
             Err(e) => {
                 break RunStop::SourceFailed {
@@ -631,8 +664,11 @@ pub fn run_with_control(
             }
         };
 
-        // 4. Check the fit -- before writing, per the note above.
-        let fit = classify_fit(&record, &fields);
+        // 4. Check the fit -- before writing, per the note above. Against the
+        //    EFFECTIVE fields: a corrected record must be judged by the columns
+        //    it will actually read, or a correction that fixed a record would
+        //    still be refused for not fitting the mapping it no longer uses.
+        let fit = classify_fit(&record, &read_fields);
         if fit == RecordFit::DoesNotFit {
             break RunStop::RecordDoesNotFit { position };
         }
@@ -645,7 +681,7 @@ pub fn run_with_control(
         let mut wrote = Vec::new();
         let mut write_failure = None;
         let mut interrupted = None;
-        for mapping in &template.fields {
+        for mapping in &effective {
             // The mid-record safe point. Asked cheaply and non-blockingly,
             // because on almost every field the answer is no.
             //
@@ -708,6 +744,14 @@ pub fn run_with_control(
             };
         }
 
+        // §4.5: the correction expires HERE, with the record it named, and not
+        // a moment earlier. `mark_processed` succeeding is the same instant
+        // §4.7 considers the record finished, so the two agree by construction.
+        let expired = corrections_handle.expire(&position.row_key);
+        if expired > 0 {
+            corrected.push(position.row_key.clone());
+        }
+
         records.push(RecordReport {
             position: position.clone(),
             destination,
@@ -724,6 +768,7 @@ pub fn run_with_control(
         playbook_id: playbook_id.to_string(),
         stop,
         records,
+        corrected,
     })
 }
 
@@ -1610,6 +1655,184 @@ mod tests {
         assert!(writer.writes.is_empty(), "nothing may have happened");
     }
 
+    // ---------------- §4.5 one-off corrections, in the loop ----------------
+
+    fn one_off(row: &str, old: &str, new: &str) -> correction::OneOffCorrection {
+        correction::OneOffCorrection {
+            row_key: row.to_string(),
+            side: drift::Side::Source,
+            old_locator: old.to_string(),
+            new_locator: new.to_string(),
+        }
+    }
+
+    /// Rows carrying BOTH the mapped column and an alternative, so a correction
+    /// has somewhere real to point.
+    fn rows_with_an_alternative() -> Vec<Vec<(&'static str, &'static str)>> {
+        vec![
+            vec![("C", "Acme"), ("E", "ACME CORP")],
+            vec![("C", "Globex"), ("E", "GLOBEX LTD")],
+            vec![("C", "Initech"), ("E", "INITECH INC")],
+        ]
+    }
+
+    #[test]
+    fn a_one_off_correction_applies_to_exactly_one_record_and_no_other() {
+        // The whole of §4.5's distinction, in one assertion: record 2 reads
+        // from the corrected column, records 1 and 3 read from the mapping as
+        // recorded. If a correction leaked forward, record 3 would say
+        // "INITECH INC".
+        let (_dir, conn, id) = db_with_playbook();
+        let corrections = correction::RunCorrections::new();
+        corrections.add(one_off("2", "C", "E"));
+
+        let mut reader = FakeReader::new(rows_with_an_alternative());
+        let mut writer = FakeWriter::new();
+        let report = run_with_control(
+            &conn,
+            &id,
+            &template(&[("C", "A")], 1, 1),
+            &mut reader,
+            &mut writer,
+            &RunControl::new(),
+            &corrections,
+        )
+        .expect("run");
+
+        assert_eq!(report.stop, RunStop::Exhausted);
+        let values: Vec<&str> = writer.writes.iter().map(|w| w.2.as_str()).collect();
+        assert_eq!(
+            values,
+            vec!["Acme", "GLOBEX LTD", "Initech"],
+            "only record 2 should have used the corrected column"
+        );
+
+        // It is reported, so a corrected record is distinguishable from an
+        // ordinary one in the summary.
+        assert_eq!(report.corrected, vec!["2".to_string()]);
+    }
+
+    #[test]
+    fn a_correction_expires_with_the_record_it_named() {
+        let (_dir, conn, id) = db_with_playbook();
+        let corrections = correction::RunCorrections::new();
+        corrections.add(one_off("2", "C", "E"));
+        assert_eq!(corrections.pending(), 1);
+
+        let mut reader = FakeReader::new(rows_with_an_alternative());
+        let mut writer = FakeWriter::new();
+        run_with_control(
+            &conn,
+            &id,
+            &template(&[("C", "A")], 1, 1),
+            &mut reader,
+            &mut writer,
+            &RunControl::new(),
+            &corrections,
+        )
+        .expect("run");
+
+        assert_eq!(
+            corrections.pending(),
+            0,
+            "the correction must not survive the record it applied to"
+        );
+    }
+
+    #[test]
+    fn a_correction_for_a_record_the_run_never_reached_does_not_expire() {
+        // Expiry is tied to the record being MARKED, not to the run ending. A
+        // run stopped before record 3 leaves record 3's correction intact, so
+        // the user does not have to enter it again.
+        let (_dir, conn, id) = db_with_playbook();
+        let corrections = correction::RunCorrections::new();
+        corrections.add(one_off("3", "C", "E"));
+
+        let control = RunControl::new();
+        let mut reader = FakeReader::new(rows_with_an_alternative());
+        // Stop during record 2, so record 3 is never processed.
+        let mut writer = FakeWriter::new().triggering(2, Trigger::Stop, &control);
+        let report = run_with_control(
+            &conn,
+            &id,
+            &template(&[("C", "A")], 1, 1),
+            &mut reader,
+            &mut writer,
+            &control,
+            &corrections,
+        )
+        .expect("run");
+
+        assert!(matches!(report.stop, RunStop::Stopped { .. }));
+        assert_eq!(
+            corrections.pending(),
+            1,
+            "record 3 was never processed, so its correction still applies"
+        );
+        assert!(report.corrected.is_empty());
+    }
+
+    #[test]
+    fn a_correction_does_not_apply_to_a_record_already_processed() {
+        // A skipped record is not re-read, so its correction is not consumed
+        // either -- it would be wrong to silently discard a correction for a
+        // record this run never touched.
+        let (_dir, conn, id) = db_with_playbook();
+        mark_processed(
+            &conn,
+            &id,
+            &SourcePosition {
+                source_id: "sheet-A".into(),
+                row_key: "2".into(),
+            },
+        )
+        .expect("pre-mark");
+
+        let corrections = correction::RunCorrections::new();
+        corrections.add(one_off("2", "C", "E"));
+
+        let mut reader = FakeReader::new(rows_with_an_alternative());
+        let mut writer = FakeWriter::new();
+        let report = run_with_control(
+            &conn,
+            &id,
+            &template(&[("C", "A")], 1, 1),
+            &mut reader,
+            &mut writer,
+            &RunControl::new(),
+            &corrections,
+        )
+        .expect("run");
+
+        let values: Vec<&str> = writer.writes.iter().map(|w| w.2.as_str()).collect();
+        assert_eq!(values, vec!["Acme", "Initech"]);
+        assert_eq!(corrections.pending(), 1, "never reached, so never consumed");
+        assert!(report.corrected.is_empty());
+    }
+
+    #[test]
+    fn an_uncorrected_run_is_completely_unaffected() {
+        // The regression that matters: this touches the loop every record goes
+        // through. With no corrections the behaviour must be byte-for-byte what
+        // it was.
+        let (_dir, conn, id) = db_with_playbook();
+        let mut reader = FakeReader::new(rows_with_an_alternative());
+        let mut writer = FakeWriter::new();
+        let report = run(
+            &conn,
+            &id,
+            &template(&[("C", "A")], 1, 1),
+            &mut reader,
+            &mut writer,
+        )
+        .expect("run");
+
+        assert_eq!(report.stop, RunStop::Exhausted);
+        let values: Vec<&str> = writer.writes.iter().map(|w| w.2.as_str()).collect();
+        assert_eq!(values, vec!["Acme", "Globex", "Initech"]);
+        assert!(report.corrected.is_empty());
+    }
+
     #[test]
     fn a_template_with_no_fields_is_refused() {
         let (_dir, conn, id) = db_with_playbook();
@@ -1650,6 +1873,7 @@ mod tests {
             &mut reader,
             &mut writer,
             &control,
+            &correction::RunCorrections::new(),
         )
         .expect("run");
 
@@ -1710,6 +1934,7 @@ mod tests {
             &mut reader,
             &mut writer,
             &control,
+            &correction::RunCorrections::new(),
         )
         .expect("run");
         stopper.join().expect("join");
@@ -1777,6 +2002,7 @@ mod tests {
             &mut reader,
             &mut writer,
             &control,
+            &correction::RunCorrections::new(),
         )
         .expect("run");
         resumer.join().expect("join");
@@ -1832,6 +2058,7 @@ mod tests {
             &mut reader,
             &mut writer,
             &control,
+            &correction::RunCorrections::new(),
         )
         .expect("run");
         resumer.join().expect("join");
@@ -1856,6 +2083,7 @@ mod tests {
             &mut reader,
             &mut writer,
             &RunControl::stopped(),
+            &correction::RunCorrections::new(),
         )
         .expect("run");
 
@@ -1881,6 +2109,7 @@ mod tests {
             &mut FakeReader::new(two_field_rows()),
             &mut w1,
             &control,
+            &correction::RunCorrections::new(),
         )
         .expect("first run");
         assert!(matches!(first.stop, RunStop::Stopped { .. }));
@@ -1894,6 +2123,7 @@ mod tests {
             &mut FakeReader::new(two_field_rows()),
             &mut w2,
             &RunControl::new(),
+            &correction::RunCorrections::new(),
         )
         .expect("second run");
 

@@ -78,6 +78,11 @@ pub enum RunOutcome {
 pub struct ActiveRun {
     pub playbook_id: String,
     pub control: RunControl,
+    /// §4.5 one-off corrections for records this run has not reached yet.
+    ///
+    /// Beside the control rather than inside it: pausing and correcting are
+    /// different intentions, and a run can be corrected without being paused.
+    pub corrections: crate::run::correction::RunCorrections,
     outcome: Arc<Mutex<Option<RunOutcome>>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -184,10 +189,12 @@ fn spawn_authorized(
 ) -> ActiveRun {
     let outcome: Arc<Mutex<Option<RunOutcome>>> = Arc::new(Mutex::new(None));
 
+    let corrections = crate::run::correction::RunCorrections::new();
     let handle = {
         let outcome = Arc::clone(&outcome);
         let control = control.clone();
         let playbook_id = playbook_id.clone();
+        let corrections = corrections.clone();
         std::thread::spawn(move || {
             let result = execute(
                 &db_path,
@@ -196,6 +203,7 @@ fn spawn_authorized(
                 &template,
                 header_row,
                 &control,
+                &corrections,
                 &authorization,
                 make_surfaces,
             );
@@ -206,6 +214,7 @@ fn spawn_authorized(
     ActiveRun {
         playbook_id,
         control,
+        corrections,
         outcome,
         handle: Some(handle),
     }
@@ -219,6 +228,7 @@ fn execute(
     template: &CompiledTemplate,
     header_row: u64,
     control: &RunControl,
+    corrections: &crate::run::correction::RunCorrections,
     authorization: &RunAuthorization,
     make_surfaces: SurfaceFactory,
 ) -> RunOutcome {
@@ -326,6 +336,7 @@ fn execute(
         reader.as_mut(),
         writer.as_mut(),
         control,
+        corrections,
     );
 
     // Idle on every path, including a stop and including an error. A run that

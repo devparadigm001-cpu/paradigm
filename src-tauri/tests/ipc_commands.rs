@@ -151,6 +151,17 @@ const REGISTERED_COMMANDS: &[(&str, &str)] = &[
     ("replay_playbook", r#"{"playbookId":"does-not-exist"}"#),
     ("get_run_history", r#"{"playbookId":"does-not-exist"}"#),
     ("get_orphaned_run_history", "{}"),
+    // §4.5's two correction scopes. The permanent one reaches a real UPDATE
+    // against a playbook that does not exist; the one-off errors with "no
+    // workflow run is in progress", which is the command working.
+    (
+        "apply_permanent_correction",
+        r#"{"playbookId":"x","side":"source","oldLocator":"C","newLocator":"D","newLabel":"L"}"#,
+    ),
+    (
+        "apply_one_off_correction",
+        r#"{"sourceRow":"2","side":"source","oldLocator":"C","newLocator":"D"}"#,
+    ),
     // §4.8's batch scan. Reaches the "not a templated workflow" error, which
     // is the command working -- reachability is what this list checks.
     (

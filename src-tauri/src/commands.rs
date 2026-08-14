@@ -574,6 +574,74 @@ fn confirmed_template(state: &State<'_, AppState>) -> Result<CompiledTemplate, S
     }
 }
 
+// ------------------------------------------- §4.5 correction scope ----
+
+fn parse_side(raw: &str) -> Result<run::drift::Side, String> {
+    run::drift::Side::parse(raw)
+        .ok_or_else(|| format!("side must be \"source\" or \"destination\", not {raw:?}"))
+}
+
+/// Repoint a mapped column permanently (§4.5's "the format actually changed").
+///
+/// Updates the stored mapping AND re-records the shape, so the next drift
+/// check compares against what the user just confirmed rather than against the
+/// shape that drifted. Doing only the first would leave the workflow blocked by
+/// a drift it had already been told about.
+///
+/// The label is required because the shape is a locator-plus-label pair: a
+/// correction that moved the column without saying what it is now would leave a
+/// recorded shape that no longer describes the sheet.
+#[tauri::command]
+pub async fn apply_permanent_correction(
+    state: State<'_, AppState>,
+    playbook_id: String,
+    side: String,
+    old_locator: String,
+    new_locator: String,
+    new_label: String,
+) -> Result<(), String> {
+    let side = parse_side(&side)?;
+    let conn = state.db.lock().await;
+    run::drift::apply_permanent_correction(
+        &conn,
+        &playbook_id,
+        side,
+        &old_locator,
+        &new_locator,
+        &new_label,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Repoint a mapped column for ONE record only (§4.5's "this one order was
+/// weird").
+///
+/// Applies to the run in progress and to exactly the source record named. It is
+/// never written to the database and cannot outlive the record it addresses --
+/// see `run::correction`.
+#[tauri::command]
+pub async fn apply_one_off_correction(
+    state: State<'_, AppState>,
+    source_row: String,
+    side: String,
+    old_locator: String,
+    new_locator: String,
+) -> Result<(), String> {
+    let side = parse_side(&side)?;
+    let slot = state.active_run.lock().map_err(|e| e.to_string())?;
+    let active = slot.as_ref().ok_or_else(|| {
+        "no workflow run is in progress; a one-off correction applies to a record in a run"
+            .to_string()
+    })?;
+    active.corrections.add(run::correction::OneOffCorrection {
+        row_key: source_row,
+        side,
+        old_locator,
+        new_locator,
+    });
+    Ok(())
+}
+
 // ------------------------------------------- §4.8 new-batch detection ----
 
 /// The answer to "is there anything new to do?".
@@ -1186,6 +1254,10 @@ pub struct RunSummaryView {
     /// rather than rendering "0 flagged for review", which would be exactly
     /// the noise the quiet-by-default rule exists to avoid.
     pub flagged: usize,
+    /// Source rows that used a one-off correction (§4.5). Shown only when
+    /// non-empty, for the same reason as `flagged`: a clean run should not
+    /// carry a line saying nothing was corrected.
+    pub corrected: Vec<String>,
     /// Whether the report should expand at all.
     pub needs_attention: bool,
     /// Empty on a clean run.
@@ -1227,6 +1299,7 @@ fn summarise(playbook_id: &str, outcome: &run::background::RunOutcome) -> RunSum
         written: 0,
         skipped: 0,
         flagged: 0,
+        corrected: Vec::new(),
         needs_attention: true,
         flagged_records: Vec::new(),
         stop_reason,
@@ -1341,6 +1414,7 @@ fn summarise(playbook_id: &str, outcome: &run::background::RunOutcome) -> RunSum
         written,
         skipped: report.skipped(),
         flagged: flagged_records.len(),
+        corrected: report.corrected.clone(),
         needs_attention,
         flagged_records,
         stop_reason,

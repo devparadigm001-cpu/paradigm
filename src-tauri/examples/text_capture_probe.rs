@@ -12679,6 +12679,7 @@ async fn templatedrun_mode() -> ExitCode {
         &mut reader,
         &mut writer,
         &control,
+        &paradigm_lib::run::correction::RunCorrections::new(),
     ) {
         Ok(r) => r,
         Err(e) => {
