@@ -1,7 +1,52 @@
-# Paradigm's own UI is not exposed to the accessibility tree
+# Paradigm's own UI was not exposed to the accessibility tree
 
-**Status:** open, measured 2026-08-13.
+**Status:** FIXED 2026-08-13. Cause confirmed by measurement, not inferred.
 **Probe:** `src-tauri/examples/app_ui_accessibility_probe.rs`
+**Fix:** `--force-renderer-accessibility` in `tauri.conf.json`'s
+`additionalBrowserArgs`.
+
+## The fix, and the measurement that confirmed it
+
+The hypothesis below — Chromium builds the renderer accessibility tree lazily
+— was correct. Two runs of the same probe against the same app:
+
+| | before | after |
+|---|---|---|
+| nodes in a full `children()` walk | 24 | **47** |
+| `Button` | 3 (window chrome only) | **10** |
+| `Document` | 0 | 1 |
+| `Text` | 0 | 13 |
+| named page controls | none | `"Start recording"`, `"Refresh"`, `"Demo: start recording"` |
+
+Confirmed twice, in the right order:
+
+1. Launched with `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--force-renderer-accessibility`
+   as an environment variable — 47 nodes, 10 buttons. That establishes the flag
+   is what does it.
+2. Removed the environment variable, put the flag in `tauri.conf.json`
+   instead, relaunched — **47 nodes, 10 buttons again**. That establishes the
+   committed configuration is what does it, rather than a leftover env var in
+   one shell.
+
+The second run is the one that matters. A fix proven only under the
+environment variable that was used to discover it would not be a fix.
+
+### Note on the argument string
+
+`additionalBrowserArgs` **replaces** Tauri's default rather than appending to
+it, so the default is written out explicitly alongside the new flag:
+
+```
+--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force-renderer-accessibility
+```
+
+Dropping the first half would silently turn Microsoft's out-of-process UI
+features back on as a side effect of an accessibility fix.
+
+---
+
+*Everything below is the original report, kept because the measurement is the
+point and a fixed issue with its evidence deleted is just an assertion.*
 
 ## What was measured
 

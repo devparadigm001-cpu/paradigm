@@ -15,7 +15,8 @@
         "label": "main",
         "title": "Paradigm",
         "width": 800,
-        "height": 900
+        "height": 900,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --force-renderer-accessibility"
       }
     ],
     "security": {
