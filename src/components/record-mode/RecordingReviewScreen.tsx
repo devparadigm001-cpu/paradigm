@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { describeError } from "@/lib/errors";
+import { TemplateProposalSection } from "@/components/templated-workflow";
 import type { CapturedActionView, CaptureSummary, StoredPlaybookInfo } from "./types";
 
 type ReviewItem = {
@@ -41,6 +42,11 @@ export function RecordingReviewScreen({
   const [isSaving, setIsSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedInfo, setSavedInfo] = useState<StoredPlaybookInfo | null>(null);
+  // §4.2's answer. Starts false: a template makes a recording something that
+  // writes repeatedly, and §4.10 is explicit that not confirming leaves "an
+  // ordinary one-shot playbook, unaffected" — which is what doing nothing here
+  // produces.
+  const [confirmTemplate, setConfirmTemplate] = useState(false);
   const queryClient = useQueryClient();
 
   function moveUp(index: number) {
@@ -80,6 +86,11 @@ export function RecordingReviewScreen({
         {
           nameHint: trimmedHint.length > 0 ? trimmedHint : null,
           stepIndices,
+          // Only ever true when a pattern was actually proposed. Sending true
+          // for a recording with no template would make the backend re-run
+          // detection and refuse, which is a confusing way to say "there was
+          // nothing to confirm".
+          confirmTemplate: summary.template ? confirmTemplate : false,
         },
       );
       setSavedInfo(info);
@@ -130,6 +141,16 @@ export function RecordingReviewScreen({
           {summary.unmapped_events} unmapped raw events.
         </p>
       </div>
+
+      {/* §4.12: the detected mapping is a new section at the TOP of the review
+          screen, alongside the captured steps — not a separate flow. */}
+      <TemplateProposalSection
+        proposal={summary.template}
+        noTemplateReason={summary.no_template_reason}
+        confirmed={confirmTemplate}
+        onConfirmedChange={setConfirmTemplate}
+        disabled={isSaving}
+      />
 
       <div className="w-full max-w-2xl flex-1 overflow-y-auto rounded-md border">
         {items.length === 0 ? (

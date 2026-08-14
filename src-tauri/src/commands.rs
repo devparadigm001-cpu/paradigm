@@ -121,6 +121,10 @@ pub struct PlaybookSummaryView {
     /// How many of those steps are irreversible, so the list can warn before
     /// the user replays one. Purely additive: existing fields are untouched.
     pub irreversible_count: i64,
+    /// Whether this is a confirmed repeating workflow, so the list can mark it
+    /// and offer the batch check. Section 6 reuses this list rather than
+    /// adding a parallel screen, so it has to be able to tell them apart.
+    pub is_templated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1187,6 +1191,7 @@ pub async fn list_playbooks(
             updated_at: p.updated_at,
             step_count: p.step_count,
             irreversible_count: p.irreversible_count,
+            is_templated: p.is_templated,
         })
         .collect())
 }
@@ -1466,4 +1471,135 @@ mod tests {
         );
     }
 
+    // ---------------- the shapes the frontend is typed against ----------------
+    //
+    // `src/components/templated-workflow/types.ts` and
+    // `src/components/record-mode/types.ts` hand-mirror these structs. Nothing
+    // generates one from the other, so the only thing keeping them in step is a
+    // test that fails when a field is renamed or a tag changes.
+    //
+    // Not hypothetical: `CaptureSummary` had already drifted three fields out
+    // of date on the TypeScript side before Section 6 started, and nothing
+    // noticed because the frontend never read them.
+
+    #[test]
+    fn preview_outcome_serialises_as_a_kind_tagged_union() {
+        // The riskiest shape in the contract: an internally-tagged enum whose
+        // variant names are camelCased and whose payload is FLATTENED alongside
+        // the tag rather than nested under it.
+        let ready = PreviewOutcome::Ready(PreviewView {
+            playbook_id: "pb".into(),
+            source_row: "2".into(),
+            destination_row: 2,
+            fields: vec![PreviewFieldView {
+                source_field: "C".into(),
+                source_label: Some("Customer".into()),
+                destination_field: "A".into(),
+                destination_label: None,
+                value: "Acme".into(),
+            }],
+            verdict: "looks sensible".into(),
+            verdict_is_reassuring: true,
+        });
+        let v = serde_json::to_value(&ready).expect("serialise");
+        assert_eq!(v["kind"], "ready");
+        // Flattened, NOT nested: a `v["Ready"]` here would mean the TypeScript
+        // intersection type is wrong.
+        assert_eq!(v["playbook_id"], "pb");
+        assert_eq!(v["source_row"], "2");
+        assert_eq!(v["destination_row"], 2);
+        assert_eq!(v["fields"][0]["source_field"], "C");
+        assert_eq!(v["fields"][0]["source_label"], "Customer");
+        assert!(v["fields"][0]["destination_label"].is_null());
+        assert_eq!(v["verdict_is_reassuring"], true);
+
+        let nothing = PreviewOutcome::NothingToDo(NothingToPreview {
+            reason: "all done".into(),
+        });
+        assert_eq!(
+            serde_json::to_value(&nothing).expect("serialise")["kind"],
+            "nothingToDo",
+            "the TypeScript union matches on this exact string"
+        );
+
+        let attention = PreviewOutcome::NeedsAttention(NothingToPreview {
+            reason: "a column moved".into(),
+        });
+        assert_eq!(
+            serde_json::to_value(&attention).expect("serialise")["kind"],
+            "needsAttention"
+        );
+    }
+
+    #[test]
+    fn the_run_status_and_batch_views_keep_their_field_names() {
+        let status = RunStatusView {
+            playbook_id: Some("pb".into()),
+            state: "running".into(),
+            finished: false,
+        };
+        let v = serde_json::to_value(&status).expect("serialise");
+        assert_eq!(v["playbook_id"], "pb");
+        assert_eq!(v["state"], "running");
+        assert_eq!(v["finished"], false);
+
+        let batch = NewBatchView {
+            playbook_id: "pb".into(),
+            has_work: true,
+            count: 12,
+            first_row: Some("45".into()),
+            capped: false,
+            message: "Found 12 new records starting at row 45. Run the workflow on these?".into(),
+        };
+        let v = serde_json::to_value(&batch).expect("serialise");
+        assert_eq!(v["has_work"], true);
+        assert_eq!(v["count"], 12);
+        assert_eq!(v["first_row"], "45");
+        assert_eq!(v["capped"], false);
+        assert!(
+            v["message"].as_str().unwrap().contains("starting at row 45"),
+            "the batch message is rendered verbatim by the frontend"
+        );
+    }
+
+    #[test]
+    fn a_template_proposal_reaches_the_frontend_with_from_and_to() {
+        // `MappedField` renames the pair to from/to for display. A frontend
+        // typed against source_field/destination_field would render undefined
+        // with no error anywhere.
+        let proposal = TemplateProposal {
+            source: "doc!Sheet1".into(),
+            destination: "doc!Sheet2".into(),
+            fields: vec![MappedField {
+                from: "C".into(),
+                to: "A".into(),
+            }],
+            source_step: 1,
+            destination_step: 1,
+            examples: 3,
+        };
+        let v = serde_json::to_value(&proposal).expect("serialise");
+        assert_eq!(v["fields"][0]["from"], "C");
+        assert_eq!(v["fields"][0]["to"], "A");
+        assert_eq!(v["examples"], 3);
+    }
+
+    #[test]
+    fn a_playbook_summary_says_whether_it_is_templated() {
+        // Section 6 reuses one list for both kinds, so this is the field the
+        // templated behaviour hangs off. It did not exist until Section 6
+        // needed it.
+        let view = PlaybookSummaryView {
+            id: "pb".into(),
+            name: "Invoices".into(),
+            source: "record_mode".into(),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            step_count: 3,
+            irreversible_count: 0,
+            is_templated: true,
+        };
+        let v = serde_json::to_value(&view).expect("serialise");
+        assert_eq!(v["is_templated"], true);
+    }
 }

@@ -196,6 +196,16 @@ pub struct PlaybookSummary {
     /// "irreversible". Record Mode always assigns the column, so a NULL here
     /// would mean a step arrived by some other route.
     pub irreversible_count: i64,
+    /// Whether this is a confirmed repeating workflow (§4.11).
+    ///
+    /// Section 6 reuses the existing playbook list rather than adding a
+    /// parallel screen, so the list has to be able to tell the two apart --
+    /// otherwise the templated behaviour has nothing to attach to. Derived
+    /// from `template_state` rather than exposing the raw enum: 'proposed' is
+    /// unreachable (see migration 20260813000004), so the only distinction a
+    /// caller can act on is confirmed-or-not, and a tri-state would invite
+    /// handling a case that cannot occur.
+    pub is_templated: bool,
 }
 
 /// Every stored playbook, newest first. No pagination in Phase 1.
@@ -204,11 +214,13 @@ pub fn list(conn: &Connection) -> Result<Vec<PlaybookSummary>, DbError> {
         "SELECT p.id, p.name, p.source, p.created_at, p.updated_at,
                 (SELECT COUNT(*) FROM playbook_steps s WHERE s.playbook_id = p.id),
                 (SELECT COUNT(*) FROM playbook_steps s
-                  WHERE s.playbook_id = p.id AND s.reversible = 0)
+                  WHERE s.playbook_id = p.id AND s.reversible = 0),
+                p.template_state
            FROM playbooks p
           ORDER BY p.created_at DESC, p.id",
     )?;
     let rows = stmt.query_map([], |r| {
+        let state: String = r.get(7)?;
         Ok(PlaybookSummary {
             id: r.get(0)?,
             name: r.get(1)?,
@@ -217,6 +229,7 @@ pub fn list(conn: &Connection) -> Result<Vec<PlaybookSummary>, DbError> {
             updated_at: r.get(4)?,
             step_count: r.get(5)?,
             irreversible_count: r.get(6)?,
+            is_templated: state == "confirmed",
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)

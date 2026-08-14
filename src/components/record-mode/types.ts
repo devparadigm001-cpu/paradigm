@@ -5,6 +5,8 @@
  * rename_all attribute; only *command arguments* are camelCased by Tauri,
  * return values are not.
  */
+import type { TemplateProposal } from "@/components/templated-workflow/types";
+
 export type CapturedActionView = {
   step_order: number;
   action_type: string;
@@ -22,7 +24,24 @@ export type CaptureSummary = {
   action_count: number;
   excluded_count: number;
   unmapped_events: number;
+  /**
+   * Pastes seen. Non-zero means the recording may be missing data movement
+   * that no action records.
+   */
+  pastes_observed: number;
   actions: CapturedActionView[];
+  /**
+   * The repeating pattern detection found on stop, if any (§4.1/§4.12).
+   * Null for an ordinary recording, which is most of them.
+   */
+  template: TemplateProposal | null;
+  /**
+   * Why no pattern was offered, when none was — worded as the next thing to
+   * do. Null both when a pattern WAS found and when the recording never
+   * copied anything between grids, which is not a failure and must not read
+   * as one.
+   */
+  no_template_reason: string | null;
 };
 
 export type StoredPlaybookInfo = {
@@ -42,6 +61,12 @@ export type PlaybookSummaryView = {
   updated_at: string;
   step_count: number;
   irreversible_count: number;
+  /**
+   * A confirmed repeating workflow (§4.11). Section 6 reuses this one list
+   * rather than adding a parallel screen, so this is what the templated
+   * behaviour attaches to.
+   */
+  is_templated: boolean;
 };
 
 export type StepOutcomeView = {

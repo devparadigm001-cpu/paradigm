@@ -18,6 +18,7 @@ import {
   type ReplayReportView,
 } from "@/components/record-mode";
 import { ReplayProgressScreen, ReplayResultScreen } from "@/components/replay";
+import { useWorkflowRun, WorkflowRunFlow } from "@/components/templated-workflow";
 import {
   isProofWindow,
   isRecordingBadgeWindow,
@@ -59,11 +60,16 @@ function playbookToPreviewSummary(
 type StoredPlaybooksSectionProps = {
   onReplay: (playbook: PlaybookSummaryView) => void;
   replayBusyPlaybookId: string | null;
+  /** §4.8: ask whether this workflow's source has anything unprocessed. */
+  onCheckForNewRecords: (playbook: PlaybookSummaryView) => void;
+  workflowBusy: boolean;
 };
 
 function StoredPlaybooksSection({
   onReplay,
   replayBusyPlaybookId,
+  onCheckForNewRecords,
+  workflowBusy,
 }: StoredPlaybooksSectionProps) {
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deletingPlaybookId, setDeletingPlaybookId] = useState<string | null>(
@@ -128,7 +134,19 @@ function StoredPlaybooksSection({
               className="flex items-center justify-between gap-2 text-sm"
             >
               <div className="min-w-0 flex-1">
-                <p className="truncate">{playbook.name}</p>
+                <p className="flex items-center gap-1.5 truncate">
+                  {playbook.name}
+                  {/* Section 6: templated workflows live in this same list,
+                      marked rather than moved to a screen of their own. */}
+                  {playbook.is_templated ? (
+                    <span
+                      className="rounded bg-secondary px-1.5 py-0.5 text-[10px] font-medium"
+                      title="Repeating workflow — can run over new source records"
+                    >
+                      ↻ repeating
+                    </span>
+                  ) : null}
+                </p>
                 <p className="text-muted-foreground text-xs">
                   {playbook.step_count} step{playbook.step_count === 1 ? "" : "s"}{" "}
                   · {playbook.source}
@@ -138,6 +156,19 @@ function StoredPlaybooksSection({
                 </p>
               </div>
               <div className="flex shrink-0 gap-2">
+                {playbook.is_templated ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={actionsBusy || workflowBusy}
+                    // Same reasoning as Delete below: every row's button would
+                    // otherwise share one accessible name.
+                    aria-label={`Check for new records for ${playbook.name}, ${index + 1} of ${data.length}`}
+                    onClick={() => onCheckForNewRecords(playbook)}
+                  >
+                    Check for new
+                  </Button>
+                ) : null}
                 <Button
                   variant="outline"
                   size="sm"
@@ -280,6 +311,7 @@ function MainWindowView() {
     }
   }
 
+  const workflowRun = useWorkflowRun();
   const recordMode = useRecordMode();
 
   if (recordMode.captureSummary) {
@@ -369,6 +401,28 @@ function MainWindowView() {
       <StoredPlaybooksSection
         onReplay={runStoredPlaybookReplay}
         replayBusyPlaybookId={replayBusyPlaybookId}
+        onCheckForNewRecords={(playbook) =>
+          void workflowRun.checkForNewRecords(playbook.id)
+        }
+        workflowBusy={workflowRun.stage.name !== "idle"}
+      />
+
+      {/* Section 6 items 2-4. Rendered here rather than inside the list so a
+          run keeps its controls on screen while the user works elsewhere in
+          the window -- §4.10's "does not lock the window". */}
+      <WorkflowRunFlow
+        stage={workflowRun.stage}
+        onConfirmBatch={() => {
+          if (workflowRun.playbookId) {
+            void workflowRun.openPreview(workflowRun.playbookId);
+          }
+        }}
+        onConfirmPreview={() => void workflowRun.confirmPreview()}
+        onCancelPreview={() => void workflowRun.cancelPreview()}
+        onPause={() => void workflowRun.pause()}
+        onResume={() => void workflowRun.resume()}
+        onStop={() => void workflowRun.stop()}
+        onDismiss={workflowRun.reset}
       />
 
       <div className="mt-4 flex w-full max-w-md flex-col items-center gap-2 rounded-md border border-dashed p-4">
