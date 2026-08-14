@@ -83,6 +83,8 @@ pub struct ActiveRun {
     /// Beside the control rather than inside it: pausing and correcting are
     /// different intentions, and a run can be corrected without being paused.
     pub corrections: crate::run::correction::RunCorrections,
+    /// §4.5 opt-in supervision, and the record it is stopped on.
+    pub supervision: crate::run::supervision::RunSupervision,
     outcome: Arc<Mutex<Option<RunOutcome>>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -153,6 +155,7 @@ pub fn spawn(
     template: CompiledTemplate,
     header_row: u64,
     control: RunControl,
+    supervision: crate::run::supervision::RunSupervision,
     authorization: RunAuthorization,
     make_surfaces: SurfaceFactory,
 ) -> Result<ActiveRun, String> {
@@ -172,6 +175,7 @@ pub fn spawn(
         template,
         header_row,
         control,
+        supervision,
         authorization,
         make_surfaces,
     ))
@@ -184,17 +188,20 @@ fn spawn_authorized(
     template: CompiledTemplate,
     header_row: u64,
     control: RunControl,
+    supervision: crate::run::supervision::RunSupervision,
     authorization: RunAuthorization,
     make_surfaces: SurfaceFactory,
 ) -> ActiveRun {
     let outcome: Arc<Mutex<Option<RunOutcome>>> = Arc::new(Mutex::new(None));
 
     let corrections = crate::run::correction::RunCorrections::new();
+    let supervision_for_thread = supervision.clone();
     let handle = {
         let outcome = Arc::clone(&outcome);
         let control = control.clone();
         let playbook_id = playbook_id.clone();
         let corrections = corrections.clone();
+        let supervision = supervision_for_thread.clone();
         std::thread::spawn(move || {
             let result = execute(
                 &db_path,
@@ -204,6 +211,7 @@ fn spawn_authorized(
                 header_row,
                 &control,
                 &corrections,
+                &supervision,
                 &authorization,
                 make_surfaces,
             );
@@ -215,6 +223,7 @@ fn spawn_authorized(
         playbook_id,
         control,
         corrections,
+        supervision,
         outcome,
         handle: Some(handle),
     }
@@ -229,6 +238,7 @@ fn execute(
     header_row: u64,
     control: &RunControl,
     corrections: &crate::run::correction::RunCorrections,
+    supervision: &crate::run::supervision::RunSupervision,
     authorization: &RunAuthorization,
     make_surfaces: SurfaceFactory,
 ) -> RunOutcome {
@@ -337,6 +347,7 @@ fn execute(
         writer.as_mut(),
         control,
         corrections,
+        supervision,
     );
 
     // Idle on every path, including a stop and including an error. A run that
@@ -579,6 +590,7 @@ mod tests {
             template(),
             1,
             RunControl::new(),
+            crate::run::supervision::RunSupervision::off(),
             authorize(&db_path, &key_path, &id, &template(), 3),
             surfaces(3, Arc::clone(&written)),
         )
@@ -624,6 +636,7 @@ mod tests {
             template(),
             1,
             control.clone(),
+            crate::run::supervision::RunSupervision::off(),
             authorize(&db_path, &key_path, &id, &template(), 3),
             surfaces(3, Arc::clone(&written)),
         )
@@ -660,6 +673,7 @@ mod tests {
             template(),
             1,
             control,
+            crate::run::supervision::RunSupervision::off(),
             authorize(&db_path, &key_path, &id, &template(), 3),
             surfaces(3, Arc::clone(&written)),
         )
@@ -695,6 +709,7 @@ mod tests {
             template(),
             1,
             RunControl::new(),
+            crate::run::supervision::RunSupervision::off(),
             authorize(&db_path, &key_path, &id, &template(), 3),
             Box::new(|| Err("the source document is not open".to_string())),
         )
@@ -758,6 +773,7 @@ mod tests {
             template(),
             1,
             RunControl::new(),
+            crate::run::supervision::RunSupervision::off(),
             authorize(&db_path, &key_path, &id, &template(), 3),
             surfaces_with_headers(
                 3,
@@ -834,6 +850,7 @@ mod tests {
             template(),
             1,
             RunControl::new(),
+            crate::run::supervision::RunSupervision::off(),
             authorize(&db_path, &key_path, &id, &template(), 3),
             surfaces_with_headers(
                 3,

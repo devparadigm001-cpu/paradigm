@@ -37,6 +37,7 @@ pub mod correction;
 pub mod drift;
 pub mod preview;
 pub mod spreadsheet;
+pub mod supervision;
 pub mod surfaces;
 
 use rusqlite::{Connection, OptionalExtension};
@@ -500,6 +501,7 @@ pub fn run(
         writer,
         &RunControl::new(),
         &correction::RunCorrections::new(),
+        &supervision::RunSupervision::off(),
     )
 }
 
@@ -544,6 +546,7 @@ pub fn run_with_control(
     writer: &mut dyn DestinationWriter,
     control: &RunControl,
     corrections_handle: &correction::RunCorrections,
+    supervision: &supervision::RunSupervision,
 ) -> Result<RunReport, RunError> {
     if template.fields.is_empty() {
         return Err(RunError::NoFields);
@@ -671,6 +674,51 @@ pub fn run_with_control(
         let fit = classify_fit(&record, &read_fields);
         if fit == RecordFit::DoesNotFit {
             break RunStop::RecordDoesNotFit { position };
+        }
+
+        // 4b. §4.5's mid-run correction point, only when the user asked for it.
+        //
+        // With supervision off -- the default -- none of this runs and §4.4's
+        // "continue, but log it" is untouched. With it on, an incomplete record
+        // pauses instead of being written blank, so the correction panel has a
+        // record in hand to attach a one-off to.
+        //
+        // The pause is item 7's, not new machinery: `control.pause()` sets the
+        // same state the Pause button sets, and resuming goes through the same
+        // `wait_while_paused`. The redo is item 7's guarantee too -- `continue`
+        // re-reads the record from the start, which is exactly how a correction
+        // applied while paused takes effect.
+        if let RecordFit::MissingFields { fields: missing } = &fit {
+            if supervision.should_ask(&position.row_key) {
+                // Pause FIRST, then announce what we are waiting on.
+                //
+                // The other order deadlocks, and did: anything watching for
+                // `awaiting` can act the instant it is set, and a resume that
+                // arrives before the pause exists is a no-op -- the loop then
+                // pauses into a wait nobody will release. Establishing the
+                // pause first makes the announcement the last thing that
+                // happens, so any responder is acting on a state that is
+                // already true.
+                control.pause();
+                supervision.begin(crate::run::supervision::AwaitingRecord {
+                    row_key: position.row_key.clone(),
+                    missing_fields: missing.clone(),
+                });
+                let carry_on = control.wait_while_paused();
+                supervision.finish();
+                if !carry_on {
+                    break RunStop::Stopped {
+                        position,
+                        mid_record: true,
+                    };
+                }
+                // Redo from the top. A correction entered while paused is
+                // picked up on the re-read; if none was, the record is now
+                // marked asked and will be written as it is, which is §4.4's
+                // behaviour reached by the user's decision rather than by
+                // default.
+                continue;
+            }
         }
 
         // 5. Write. A field the record does not carry is written blank rather
@@ -1696,6 +1744,7 @@ mod tests {
             &mut writer,
             &RunControl::new(),
             &corrections,
+            &supervision::RunSupervision::off(),
         )
         .expect("run");
 
@@ -1729,6 +1778,7 @@ mod tests {
             &mut writer,
             &RunControl::new(),
             &corrections,
+            &supervision::RunSupervision::off(),
         )
         .expect("run");
 
@@ -1755,11 +1805,12 @@ mod tests {
         let report = run_with_control(
             &conn,
             &id,
-            &template(&[("C", "A")], 1, 1),
+            &template(&[("C", "A"), ("D", "B")], 1, 1),
             &mut reader,
             &mut writer,
             &control,
             &corrections,
+            &supervision::RunSupervision::off(),
         )
         .expect("run");
 
@@ -1801,6 +1852,7 @@ mod tests {
             &mut writer,
             &RunControl::new(),
             &corrections,
+            &supervision::RunSupervision::off(),
         )
         .expect("run");
 
@@ -1831,6 +1883,158 @@ mod tests {
         let values: Vec<&str> = writer.writes.iter().map(|w| w.2.as_str()).collect();
         assert_eq!(values, vec!["Acme", "Globex", "Initech"]);
         assert!(report.corrected.is_empty());
+    }
+
+    // ---------------- §4.5 opt-in supervision ----------------
+
+    /// Row 2 is complete, row 3 is missing the mapped column but has the value
+    /// in E, row 4 is complete again. The row-4 shape, once more: it is what
+    /// distinguishes "corrected one record" from "changed the mapping".
+    fn rows_with_one_odd_record() -> Vec<Vec<(&'static str, &'static str)>> {
+        // TWO mapped columns, and that is load-bearing. With one, "missing"
+        // and "blank" are the same thing: `peek` sees the only mapped column
+        // empty and reports a SuspiciousGap, so the run stops before the
+        // record is ever read and MissingFields is unreachable. Supervision
+        // is only meaningful for a multi-field mapping.
+        vec![
+            vec![("C", "Acme"), ("D", "100"), ("E", "ACME CORP")],
+            // C missing, D present -- peek sees data, the fit sees a gap.
+            vec![("D", "200"), ("E", "GLOBEX LTD")],
+            vec![("C", "Initech"), ("D", "300"), ("E", "INITECH INC")],
+        ]
+    }
+
+    #[test]
+    fn with_supervision_off_an_incomplete_record_is_written_blank_exactly_as_before() {
+        // THE REGRESSION THAT MATTERS. §4.4: continue, write the gap blank, log
+        // it. This is the default and every existing caller gets it.
+        let (_dir, conn, id) = db_with_playbook();
+        let mut reader = FakeReader::new(rows_with_one_odd_record());
+        let mut writer = FakeWriter::new();
+        let report = run(
+            &conn,
+            &id,
+            &template(&[("C", "A"), ("D", "B")], 1, 1),
+            &mut reader,
+            &mut writer,
+        )
+        .expect("run");
+
+        assert_eq!(report.stop, RunStop::Exhausted);
+        assert_eq!(report.written(), 3, "the incomplete record is still written");
+        let values: Vec<&str> = writer.writes.iter().map(|w| w.2.as_str()).collect();
+        assert_eq!(
+            values,
+            vec!["Acme", "100", "", "200", "Initech", "300"],
+            "the gap is written blank and the run carried on -- §4.4 exactly"
+        );
+        assert_eq!(report.incomplete().len(), 1, "and it is flagged");
+    }
+
+    #[test]
+    fn with_supervision_on_an_incomplete_record_pauses_the_run() {
+        // The pause is item 7's: the loop ends up in exactly the state the
+        // Pause button produces, and the run is left waiting rather than ended.
+        let (_dir, conn, id) = db_with_playbook();
+        let control = RunControl::new();
+        let supervision = supervision::RunSupervision::on();
+
+        // Released from another thread once it is actually waiting, so the
+        // test does not depend on timing.
+        let releaser = {
+            let c = control.clone();
+            let s = supervision.clone();
+            std::thread::spawn(move || {
+                while s.awaiting().is_none() {
+                    std::thread::yield_now();
+                }
+                // What the panel would read to open on this record.
+                let waiting = s.awaiting().expect("awaiting");
+                assert_eq!(waiting.row_key, "2");
+                assert_eq!(waiting.missing_fields, vec!["C".to_string()]);
+                c.resume();
+            })
+        };
+
+        let mut reader = FakeReader::new(rows_with_one_odd_record());
+        let mut writer = FakeWriter::new();
+        let report = run_with_control(
+            &conn,
+            &id,
+            &template(&[("C", "A"), ("D", "B")], 1, 1),
+            &mut reader,
+            &mut writer,
+            &control,
+            &correction::RunCorrections::new(),
+            &supervision,
+        )
+        .expect("run");
+        releaser.join().expect("join");
+
+        // Resumed without correcting, so the record is written as it is --
+        // §4.4's outcome, reached by the user's decision.
+        assert_eq!(report.stop, RunStop::Exhausted);
+        assert_eq!(report.written(), 3);
+        assert_eq!(supervision.awaiting(), None, "nothing left waiting");
+    }
+
+    #[test]
+    fn a_correction_entered_while_supervised_fixes_that_record_and_no_other() {
+        // The whole point, and the row-4 proof: correct row 2 while the run is
+        // paused on it, resume, and row 3 must still read the mapped column.
+        let (_dir, conn, id) = db_with_playbook();
+        let control = RunControl::new();
+        let supervision = supervision::RunSupervision::on();
+        let corrections = correction::RunCorrections::new();
+
+        let fixer = {
+            let c = control.clone();
+            let s = supervision.clone();
+            let k = corrections.clone();
+            std::thread::spawn(move || {
+                while s.awaiting().is_none() {
+                    std::thread::yield_now();
+                }
+                let waiting = s.awaiting().expect("awaiting");
+                // Exactly what the panel does: a one-off for the record the
+                // run stopped on.
+                k.add(correction::OneOffCorrection {
+                    row_key: waiting.row_key,
+                    side: drift::Side::Source,
+                    old_locator: "C".into(),
+                    new_locator: "E".into(),
+                });
+                c.resume();
+            })
+        };
+
+        let mut reader = FakeReader::new(rows_with_one_odd_record());
+        let mut writer = FakeWriter::new();
+        let report = run_with_control(
+            &conn,
+            &id,
+            &template(&[("C", "A"), ("D", "B")], 1, 1),
+            &mut reader,
+            &mut writer,
+            &control,
+            &corrections,
+            &supervision,
+        )
+        .expect("run");
+        fixer.join().expect("join");
+
+        assert_eq!(report.stop, RunStop::Exhausted);
+        let values: Vec<&str> = writer.writes.iter().map(|w| w.2.as_str()).collect();
+        assert_eq!(
+            values,
+            vec!["Acme", "100", "GLOBEX LTD", "200", "Initech", "300"],
+            "row 2 used the corrected column; ROW 3 STILL USED THE ORIGINAL"
+        );
+        assert_eq!(report.corrected, vec!["2".to_string()]);
+        assert!(
+            report.incomplete().is_empty(),
+            "the corrected record is no longer incomplete"
+        );
     }
 
     #[test]
@@ -1874,6 +2078,7 @@ mod tests {
             &mut writer,
             &control,
             &correction::RunCorrections::new(),
+            &supervision::RunSupervision::off(),
         )
         .expect("run");
 
@@ -1935,6 +2140,7 @@ mod tests {
             &mut writer,
             &control,
             &correction::RunCorrections::new(),
+            &supervision::RunSupervision::off(),
         )
         .expect("run");
         stopper.join().expect("join");
@@ -2003,6 +2209,7 @@ mod tests {
             &mut writer,
             &control,
             &correction::RunCorrections::new(),
+            &supervision::RunSupervision::off(),
         )
         .expect("run");
         resumer.join().expect("join");
@@ -2059,6 +2266,7 @@ mod tests {
             &mut writer,
             &control,
             &correction::RunCorrections::new(),
+            &supervision::RunSupervision::off(),
         )
         .expect("run");
         resumer.join().expect("join");
@@ -2084,6 +2292,7 @@ mod tests {
             &mut writer,
             &RunControl::stopped(),
             &correction::RunCorrections::new(),
+            &supervision::RunSupervision::off(),
         )
         .expect("run");
 
@@ -2110,6 +2319,7 @@ mod tests {
             &mut w1,
             &control,
             &correction::RunCorrections::new(),
+            &supervision::RunSupervision::off(),
         )
         .expect("first run");
         assert!(matches!(first.stop, RunStop::Stopped { .. }));
@@ -2124,6 +2334,7 @@ mod tests {
             &mut w2,
             &RunControl::new(),
             &correction::RunCorrections::new(),
+            &supervision::RunSupervision::off(),
         )
         .expect("second run");
 

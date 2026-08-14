@@ -12683,6 +12683,7 @@ async fn templatedrun_mode() -> ExitCode {
         &mut writer,
         &control,
         &paradigm_lib::run::correction::RunCorrections::new(),
+        &paradigm_lib::run::supervision::RunSupervision::off(),
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -13253,6 +13254,7 @@ async fn templatedpreview_mode() -> ExitCode {
         template.clone(),
         1,
         RunControl::new(),
+        paradigm_lib::run::supervision::RunSupervision::off(),
         authorization,
         paradigm_lib::run::surfaces::factory_for(template.clone(), 2, 1, 2),
     ) {
@@ -13618,6 +13620,7 @@ async fn templateddrift_mode() -> ExitCode {
         template.clone(),
         1,
         RunControl::new(),
+        paradigm_lib::run::supervision::RunSupervision::off(),
         authorization,
         paradigm_lib::run::surfaces::factory_for(template.clone(), 2, 1, 2),
     ) {
@@ -13718,6 +13721,7 @@ async fn templateddrift_mode() -> ExitCode {
         template.clone(),
         1,
         RunControl::new(),
+        paradigm_lib::run::supervision::RunSupervision::off(),
         auth2,
         paradigm_lib::run::surfaces::factory_for(template.clone(), 2, 1, 2),
     ) {
@@ -14025,6 +14029,7 @@ async fn templatedbatch_mode() -> ExitCode {
         template.clone(),
         1,
         RunControl::new(),
+        paradigm_lib::run::supervision::RunSupervision::off(),
         auth1,
         paradigm_lib::run::surfaces::factory_for(template.clone(), 2, 1, 2),
     ) {
@@ -14127,6 +14132,7 @@ async fn templatedbatch_mode() -> ExitCode {
         template.clone(),
         1,
         RunControl::new(),
+        paradigm_lib::run::supervision::RunSupervision::off(),
         auth2,
         paradigm_lib::run::surfaces::factory_for(template.clone(), 2, 1, resume),
     ) {
@@ -15061,6 +15067,7 @@ async fn templatedcorrection_mode() -> ExitCode {
         template.clone(),
         1,
         control.clone(),
+        paradigm_lib::run::supervision::RunSupervision::off(),
         authorization,
         paradigm_lib::run::surfaces::factory_for(template.clone(), 2, 1, 2),
     ) {

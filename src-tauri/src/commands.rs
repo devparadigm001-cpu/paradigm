@@ -1133,6 +1133,10 @@ pub async fn start_workflow_run(
     source_row: Option<u64>,
     header_row: Option<u64>,
     destination_row: Option<u64>,
+    // §4.5: stop and ask on a record missing a mapped field, so a one-off
+    // correction has a record to attach to. Off by default, which is exactly
+    // §4.4's documented behaviour.
+    supervise: Option<bool>,
 ) -> Result<RunStatusView, String> {
     {
         let active = state.active_run.lock().map_err(|e| e.to_string())?;
@@ -1191,6 +1195,13 @@ pub async fn start_workflow_run(
         template.clone(),
         header_row.unwrap_or(1),
         control,
+        // §4.5's opt-in supervision. Off unless the caller asks, which keeps
+        // §4.4's "continue past an incomplete record" as the default.
+        if supervise.unwrap_or(false) {
+            run::supervision::RunSupervision::on()
+        } else {
+            run::supervision::RunSupervision::off()
+        },
         authorization,
         run::surfaces::factory_for(
             template,
@@ -1214,6 +1225,7 @@ pub async fn start_workflow_run(
         playbook_id: Some(playbook_id),
         state: run::RunState::Running.as_str().to_string(),
         finished,
+        ..Default::default()
     })
 }
 
@@ -1230,13 +1242,20 @@ pub async fn start_workflow_run(
 // ignores the button until the loop catches up.
 
 /// What the frontend needs to render the running-state overlay.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct RunStatusView {
     pub playbook_id: Option<String>,
     /// `idle`, `running` or `paused`.
     pub state: String,
     /// True once the thread has ended, whatever the reason.
     pub finished: bool,
+    /// §4.5: the record a supervised run has stopped on, when it has stopped on
+    /// one. This is what gives the correction panel a record to attach a
+    /// one-off to — without it the panel can only ever offer the permanent
+    /// scope.
+    pub awaiting_row: Option<String>,
+    /// The mapped columns that were empty on that record.
+    pub awaiting_missing_fields: Vec<String>,
 }
 
 /// The controls act on the run in progress, so they need one.
@@ -1266,6 +1285,7 @@ pub async fn pause_workflow_run(state: State<'_, AppState>) -> Result<RunStatusV
         playbook_id: Some(playbook_id),
         state: run::RunState::Paused.as_str().to_string(),
         finished: false,
+        ..Default::default()
     })
 }
 
@@ -1291,6 +1311,7 @@ pub async fn resume_workflow_run(state: State<'_, AppState>) -> Result<RunStatus
         playbook_id: Some(playbook_id),
         state: run::RunState::Running.as_str().to_string(),
         finished: false,
+        ..Default::default()
     })
 }
 
@@ -1328,6 +1349,7 @@ pub async fn stop_workflow_run(state: State<'_, AppState>) -> Result<RunStatusVi
         playbook_id: Some(playbook_id),
         state: run::RunState::Idle.as_str().to_string(),
         finished: false,
+        ..Default::default()
     })
 }
 
@@ -1534,6 +1556,7 @@ pub async fn get_workflow_run_status(state: State<'_, AppState>) -> Result<RunSt
             playbook_id: None,
             state: run::RunState::Idle.as_str().to_string(),
             finished: true,
+        ..Default::default()
         });
     };
     let state_str = match active.control.state() {
@@ -1541,10 +1564,18 @@ pub async fn get_workflow_run_status(state: State<'_, AppState>) -> Result<RunSt
         run::ControlState::Stopped => run::RunState::Idle,
         run::ControlState::Running => run::RunState::Running,
     };
+    // §4.5: what a supervised run has stopped on. `None` on an ordinary run,
+    // which is what keeps the correction panel's one-off branch unavailable
+    // unless there is genuinely a record to attach it to.
+    let awaiting = active.supervision.awaiting();
     Ok(RunStatusView {
         playbook_id: Some(active.playbook_id.clone()),
         state: state_str.as_str().to_string(),
         finished: active.is_finished(),
+        awaiting_row: awaiting.as_ref().map(|a| a.row_key.clone()),
+        awaiting_missing_fields: awaiting
+            .map(|a| a.missing_fields)
+            .unwrap_or_default(),
     })
 }
 
@@ -1919,6 +1950,7 @@ mod tests {
             playbook_id: Some("pb".into()),
             state: "running".into(),
             finished: false,
+        ..Default::default()
         };
         let v = serde_json::to_value(&status).expect("serialise");
         assert_eq!(v["playbook_id"], "pb");
