@@ -11877,6 +11877,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "uiflow") {
         return uiflow_mode().await;
     }
+    if std::env::args().any(|a| a == "templatedcorrection") {
+        return templatedcorrection_mode().await;
+    }
     if std::env::args().any(|a| a == "templatedbatch") {
         return templatedbatch_mode().await;
     }
@@ -14815,6 +14818,329 @@ async fn uiflow_mode() -> ExitCode {
         "\n{}",
         if pass {
             "PASS -- Section 6 driven end to end through the app's real UI"
+        } else {
+            "FAIL -- see above"
+        }
+    );
+    if pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+// ---------------------------------------------------------------------------
+// templatedcorrection -- §4.5's one-off correction against a real spreadsheet.
+//
+// The claim is narrow and worth stating exactly: a correction applied to ONE
+// record changes that record's source column and leaves every other record
+// reading the column the template names.
+//
+// So the source carries BOTH columns. C holds the ordinary customer name and
+// E holds a differently-worded one, on every row. If a correction leaked
+// forward, row 4 would come out as "INITECH INC" instead of "Initech" -- and
+// the CSV would say so.
+//
+// The correction is applied while the run is PAUSED, which is also the real
+// shape of the interaction: the run stops, the user corrects, the run resumes.
+// ---------------------------------------------------------------------------
+
+async fn templatedcorrection_mode() -> ExitCode {
+    use paradigm_lib::compile::CompiledTemplate;
+    use paradigm_lib::detect::FieldMapping;
+    use paradigm_lib::run::correction::{OneOffCorrection, RunCorrections};
+    use paradigm_lib::run::drift::Side;
+    use paradigm_lib::run::preview::{next_record, Upcoming};
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::{background::RunOutcome, DestinationWriter, RunControl};
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+
+    println!("== templatedcorrection: §4.5 one-off, against a real spreadsheet ==\n");
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let browser = "msedge";
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 30s for Sheets...");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    let Some((_w, doc_id)) = sheets_window(&desktop).await else {
+        eprintln!("no spreadsheet window");
+        return ExitCode::FAILURE;
+    };
+    println!("doc id: {doc_id}");
+    if !ensure_second_sheet(&desktop).await {
+        eprintln!("could not add Sheet2");
+        return ExitCode::FAILURE;
+    }
+    let gid2 = match goto_sheet_via_namebox(&desktop, "Sheet2!A1").await {
+        Some(g) => g,
+        None => {
+            eprintln!("could not reach Sheet2");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // C is what the template maps. E is the alternative a correction points at.
+    let rows = [
+        ("Acme", "100", "ACME CORP"),
+        ("Globex", "200", "GLOBEX LTD"),
+        ("Initech", "300", "INITECH INC"),
+    ];
+    println!("\n-- seeding: C=name, D=amount, E=alternative name --");
+    {
+        let Some((window, _)) = sheets_window(&desktop).await else {
+            eprintln!("lost the window");
+            return ExitCode::FAILURE;
+        };
+        let Ok(mut src) = SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet1"),
+            Some("Sheet1".into()),
+            1,
+        )
+        .await
+        else {
+            eprintln!("Sheet1 writer failed");
+            return ExitCode::FAILURE;
+        };
+        for (c, v) in [("C", "Customer"), ("D", "Amount"), ("E", "Customer Alt")] {
+            if let Err(e) = src.write(c, v) {
+                eprintln!("header {c}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        let _ = src.advance(1);
+        for (n, a, alt) in rows {
+            if let Err(e) = src
+                .write("C", n)
+                .and_then(|_| src.write("D", a))
+                .and_then(|_| src.write("E", alt))
+            {
+                eprintln!("seeding: {e}");
+                return ExitCode::FAILURE;
+            }
+            let _ = src.advance(1);
+        }
+        let Ok(mut dst) = SpreadsheetWriter::open(
+            desktop.clone(),
+            &window,
+            format!("{doc_id}!Sheet2"),
+            Some("Sheet2".into()),
+            1,
+        )
+        .await
+        else {
+            eprintln!("Sheet2 writer failed");
+            return ExitCode::FAILURE;
+        };
+        for (c, v) in [("A", "Client"), ("B", "Total")] {
+            if let Err(e) = dst.write(c, v) {
+                eprintln!("destination header {c}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    println!("   seeded\n");
+
+    // ---- a stored templated workflow ---------------------------------------
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("temp dir: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(dir.path());
+    let mut conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("db: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stream = paradigm_lib::capture::CapturedStream::new(
+        paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
+    );
+    stream.admit(paradigm_lib::capture::ActionCandidate {
+        kind: paradigm_lib::capture::ActionKind::Click,
+        identifiers: vec!["msedge.exe".into()],
+        process_name: None,
+        element_role: Some("Button".into()),
+        element_name: Some("Next".into()),
+        payload: None,
+        detail: None,
+        timestamp_ms: 0,
+    });
+    let template = CompiledTemplate {
+        source_id: format!("{doc_id}!Sheet1"),
+        destination_id: format!("{doc_id}!Sheet2"),
+        source_step: 1,
+        destination_step: 1,
+        examples: 3,
+        fields: vec![
+            FieldMapping {
+                source_field: "C".into(),
+                destination_field: "A".into(),
+            },
+            FieldMapping {
+                source_field: "D".into(),
+                destination_field: "B".into(),
+            },
+        ],
+    };
+    let playbook = paradigm_lib::compile::compile(
+        stream.actions(),
+        "Correction probe",
+        &paradigm_lib::compile::ReversibilityPolicy::placeholder(),
+        &paradigm_lib::labeling::RedactionPolicy::placeholder(),
+    )
+    .with_template(template.clone());
+    if let Err(e) = paradigm_lib::compile::store::store(&mut conn, &playbook) {
+        eprintln!("store: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- through the §4.3 gate, as every run must ---------------------------
+    let Some((window, _)) = sheets_window(&desktop).await else {
+        eprintln!("lost the window");
+        return ExitCode::FAILURE;
+    };
+    let mut reader = match SpreadsheetReader::open(
+        desktop.clone(),
+        &window,
+        format!("{doc_id}!Sheet1"),
+        Some("Sheet1".into()),
+        2,
+        1,
+        vec!["C".into(), "D".into()],
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("reader: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let unsure = paradigm_lib::detect::verify::Verdict::Unsure {
+        confidence: 0.0,
+        reason: "not the subject of this probe".into(),
+    };
+    let Ok(Upcoming::Ready(preview)) =
+        next_record(&conn, &playbook.id, &template, &mut reader, 2, unsure)
+    else {
+        eprintln!("could not preview");
+        return ExitCode::FAILURE;
+    };
+    let authorization = preview.accept();
+
+    // ---- start paused, correct row 3, resume --------------------------------
+    //
+    // Pausing first makes this deterministic: the correction is in place before
+    // the loop can reach the record it names. It is also the real shape of the
+    // interaction -- the run stops, the user corrects, the run resumes.
+    let control = RunControl::new();
+    control.pause();
+
+    let active = match paradigm_lib::run::background::spawn(
+        db_path.clone(),
+        key_path.clone(),
+        playbook.id.clone(),
+        template.clone(),
+        1,
+        control.clone(),
+        authorization,
+        paradigm_lib::run::surfaces::factory_for(template.clone(), 2, 1, 2),
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("spawn refused: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("-- run started paused; applying a one-off correction to row 3 --");
+    active.corrections.add(OneOffCorrection {
+        row_key: "3".into(),
+        side: Side::Source,
+        old_locator: "C".into(),
+        new_locator: "E".into(),
+    });
+    println!("   row 3: source column C -> E, for that record only");
+    println!("   corrections pending: {}", active.corrections.pending());
+
+    control.resume();
+    println!("   resumed");
+
+    let outcome = active.join();
+    let (ran_clean, corrected_rows) = match &outcome {
+        Some(RunOutcome::Finished(r)) => (
+            r.stop == paradigm_lib::run::RunStop::Exhausted && r.written() == 3,
+            r.corrected.clone(),
+        ),
+        other => {
+            println!("  outcome: {other:?}");
+            (false, Vec::new())
+        }
+    };
+    println!("\n  ran cleanly      : {ran_clean}");
+    println!("  reported corrected: {corrected_rows:?}");
+
+    // ---- ground truth -------------------------------------------------------
+    println!("\n-- CSV ground truth --");
+    let Some(csv) = download_csv(browser, &doc_id, &gid2).await else {
+        eprintln!("could not download Sheet2");
+        return ExitCode::FAILURE;
+    };
+    println!("{}", csv.trim());
+
+    // Row 3 is the corrected one, so it should carry E's wording. Rows 2 and 4
+    // must carry C's -- that is the half that proves the correction did not
+    // leak.
+    let expected: [(usize, &str, &str); 3] = [
+        (2, "Acme", "100"),
+        (3, "GLOBEX LTD", "200"),
+        (4, "Initech", "300"),
+    ];
+    let mut all_ok = true;
+    for (row, name, amount) in expected {
+        let a = csv_at(&csv, 1, row).unwrap_or_default();
+        let b = csv_at(&csv, 2, row).unwrap_or_default();
+        let good = a.trim() == name && b.trim() == amount;
+        let note = if row == 3 { "corrected" } else { "untouched" };
+        println!(
+            "  A{row}={a:?} B{row}={b:?}  expected {name:?}/{amount:?} ({note})  {}",
+            if good { "OK" } else { "WRONG" }
+        );
+        all_ok &= good;
+    }
+
+    let only_row_three = corrected_rows == vec!["3".to_string()];
+
+    println!("\n== VERDICT ==");
+    println!("  run completed                       : {ran_clean}");
+    println!("  exactly one record reported corrected: {only_row_three}");
+    println!("  row 3 used the corrected column      : {}", all_ok);
+    println!("  rows 2 and 4 used the original       : {}", all_ok);
+    println!("\n  doc id for cleanup: {doc_id}");
+
+    let pass = ran_clean && only_row_three && all_ok;
+    println!(
+        "\n{}",
+        if pass {
+            "PASS -- the correction applied to exactly one record and no other"
         } else {
             "FAIL -- see above"
         }
