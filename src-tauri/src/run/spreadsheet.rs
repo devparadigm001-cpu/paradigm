@@ -54,6 +54,8 @@ const NAVIGATE_SETTLE: Duration = Duration::from_millis(1200);
 const TYPE_SETTLE: Duration = Duration::from_millis(400);
 /// After committing, before anything reads the cell back.
 const COMMIT_SETTLE: Duration = Duration::from_millis(600);
+/// After dismissing a cell editor, before navigating away from it.
+const DISMISS_SETTLE: Duration = Duration::from_millis(250);
 
 /// Writes records into a spreadsheet, one field at a time.
 pub struct SpreadsheetWriter {
@@ -212,6 +214,38 @@ impl SpreadsheetWriter {
         Ok(())
     }
 
+    /// Cancel any cell edit that happens to be open.
+    ///
+    /// Measured, not precautionary. `examples/text_capture_probe.rs editmode`
+    /// drove three writes into a cell whose editor was already open and every
+    /// one of them merged instead of replacing:
+    ///
+    /// ```text
+    ///   cell holds "ORIGINAL", write "NEW-B"  ->  "\nNEW-BORIGINAL"
+    /// ```
+    ///
+    /// -- and in the fourth case the pending edit *followed the navigation*,
+    /// committing A4's uncommitted text into B4. That is a value landing in a
+    /// cell it was never aimed at, which is the one failure this module exists
+    /// to prevent. `type_here`'s assumption that a selected cell is typed
+    /// **over** holds only when no editor is open, and nothing was ensuring
+    /// that.
+    ///
+    /// The editor can be open for reasons the run did not cause: a keystroke
+    /// from the user, or a previous write whose commit did not take. Escape
+    /// discards that pending edit. Discarding it is deliberate -- the run
+    /// cannot know what it was, and merging unknown text into a destination
+    /// cell is strictly worse than losing it.
+    ///
+    /// Failures are ignored on purpose: nothing to dismiss is the normal case,
+    /// and the Name Box check and the read-back both still run afterwards.
+    fn dismiss_editor(&self) {
+        if let Ok(focused) = self.desktop.focused_element() {
+            let _ = focused.press_key("{Escape}");
+            std::thread::sleep(DISMISS_SETTLE);
+        }
+    }
+
     /// Read a cell back through the formula bar.
     fn read_back(&self, column: &str, row: u64) -> Result<String, SourceError> {
         self.goto(column, row)?;
@@ -252,6 +286,10 @@ impl DestinationWriter for SpreadsheetWriter {
     /// ledger is only as trustworthy as the writes it records.
     fn write(&mut self, field: &str, value: &str) -> Result<(), SourceError> {
         let row = self.row;
+        // Before addressing anything: an editor left open by a stray keystroke
+        // or a commit that did not take turns this write into an append, and
+        // can carry its pending text into whichever cell is navigated to next.
+        self.dismiss_editor();
         self.goto(field, row)?;
         self.type_here(field, row, value)?;
 
@@ -280,6 +318,10 @@ impl DestinationWriter for SpreadsheetWriter {
         columns: &[String],
         header_row: u64,
     ) -> Result<crate::source::SourceShape, SourceError> {
+        // Reading navigates too, and a pending edit travels with the cursor --
+        // so a shape read taken with an editor open can commit stray text into
+        // a header cell. Same reason as `write`.
+        self.dismiss_editor();
         let mut out = Vec::new();
         for column in columns {
             let label = self.read_back(column, header_row)?;

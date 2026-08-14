@@ -5986,10 +5986,74 @@ fn parse_cell_ref(s: &str) -> Option<(usize, usize)> {
 }
 
 /// Value at (col, row) of a CSV, 1-based. Naive split: probe values have no commas.
+/// One cell out of an exported CSV. 1-based on both axes.
+///
+/// Parses quoting properly rather than splitting on `,` and `\n`, which is what
+/// this did until a cell containing a newline made it lie. The `editmode` probe
+/// produced cells holding `"\nNEW-BORIGINAL"`; the naive version read the
+/// embedded newline as a row break, shifted every row below it, and reported
+/// "no value landed in the wrong cell" while the raw export showed one plainly.
+///
+/// Commas are the more common case in real use -- "Northwind Traders, Inc." is
+/// an ordinary customer name -- and this is the ground truth every spreadsheet
+/// check in this file is measured against. A verifier that misreads the truth
+/// is worse than none, because it is believed.
 fn csv_at(body: &str, col: usize, row: usize) -> Option<String> {
-    let line = body.lines().nth(row.checked_sub(1)?)?;
-    let field = line.split(',').nth(col.checked_sub(1)?)?;
-    Some(field.trim_matches('"').to_string())
+    let (col, row) = (col.checked_sub(1)?, row.checked_sub(1)?);
+
+    let mut r = 0usize;
+    let mut c = 0usize;
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = body.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if quoted {
+            match ch {
+                // "" inside a quoted field is one literal quote.
+                '"' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    field.push('"');
+                }
+                '"' => quoted = false,
+                _ => field.push(ch),
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            ',' => {
+                if r == row && c == col {
+                    return Some(field);
+                }
+                c += 1;
+                field.clear();
+            }
+            '\r' => {}
+            '\n' => {
+                if r == row && c == col {
+                    return Some(field);
+                }
+                if r == row {
+                    // The row ended before reaching that column: the cell is
+                    // absent, which is not the same as unparseable.
+                    return Some(String::new());
+                }
+                r += 1;
+                c = 0;
+                field.clear();
+            }
+            _ => field.push(ch),
+        }
+    }
+    // The final field of the final row, with no trailing newline after it.
+    if r == row && c == col {
+        return Some(field);
+    }
+    if r == row {
+        return Some(String::new());
+    }
+    None
 }
 
 async fn sheetsclean_mode() -> ExitCode {
@@ -11896,6 +11960,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "checknewonly") {
         return checknewonly_mode().await;
     }
+    if std::env::args().any(|a| a == "editmode") {
+        return editmode_mode().await;
+    }
     if std::env::args().any(|a| a == "uicorrection") {
         return uicorrection_mode().await;
     }
@@ -15775,4 +15842,363 @@ async fn checknewonly_mode() -> ExitCode {
     println!("\n  cancelling (nothing is written)");
     let _ = click_app_button(&desktop, "Cancel").await;
     ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// editmode -- does writing into an ALREADY-OPEN cell editor append rather than
+// replace?
+//
+// From a real corruption: destination A2 was written "Northwind Traders" and
+// afterwards held "Northwind Traders\n\n\n305.75", while B4 -- where 305.75
+// belonged -- was empty. `SpreadsheetWriter` has no operation that moves a
+// cell's contents, so the value did not travel; something typed it there.
+//
+// The suspicion under test: `type_here` types into `focused_element()` on the
+// assumption that a selected cell is typed OVER. That holds for a selected
+// cell. It does not obviously hold for a cell whose editor is already open --
+// there, typing lands at the caret, which is an append.
+//
+// Four cases, each on its own cell so no result can contaminate another:
+//
+//   A) fresh cell holding a value                -> the baseline. Must replace.
+//   B) editor opened (F2) before the write       -> the hypothesis
+//   C) editor opened AND typed into first        -> the hypothesis, with
+//                                                   pending content in the
+//                                                   editor
+//   D) an uncommitted edit left open, then a
+//      write aimed at a DIFFERENT cell           -> the observed shape: does
+//                                                   the second value land in
+//                                                   the first cell?
+//
+// CSV export is the verdict, never the read-back -- the read-back is part of
+// what is under suspicion.
+//
+// Usage: text_capture_probe editmode <scratch-doc-id>
+// Takes an existing scratch document rather than creating one; this writes
+// garbage into whatever it is pointed at.
+// ---------------------------------------------------------------------------
+
+async fn editmode_mode() -> ExitCode {
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::DestinationWriter;
+
+    println!("== editmode: does an open cell editor turn a write into an append? ==");
+
+    let browser = "msedge";
+    let arg = std::env::args().nth(2).unwrap_or_default();
+
+    // "new" creates a throwaway document rather than pointing this at anything
+    // that matters -- every case here deliberately corrupts the cell it writes
+    // to, so the sheet under test must be one nobody minds losing.
+    let url = if arg.len() > 20 {
+        format!("https://docs.google.com/spreadsheets/d/{arg}/edit")
+    } else {
+        println!("no doc id given -- creating a throwaway sheet");
+        "https://sheets.new".to_string()
+    };
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", &url])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting 15s for the document...");
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some((_, doc_id)) = sheets_window(&desktop).await else {
+        eprintln!("no spreadsheet window -- is the doc open?");
+        return ExitCode::FAILURE;
+    };
+    if arg.len() > 20 && doc_id != arg {
+        eprintln!("the window shows {doc_id:?}, not {arg:?} -- refusing to write");
+        return ExitCode::FAILURE;
+    }
+    if doc_id.is_empty() {
+        eprintln!("could not read a document id from the address bar -- refusing to write");
+        return ExitCode::FAILURE;
+    }
+    println!("scratch doc: {doc_id}\n");
+
+    // Prove the sheet is empty before writing a single cell.
+    //
+    // `sheets_window` matches on the window NAME -- "Untitled spreadsheet" --
+    // and every unnamed sheet carries that name, so with no doc id to check
+    // against there is nothing stopping this from resolving one of the user's
+    // real documents and seeding over it. An empty A1:B4 is what distinguishes
+    // a sheet created seconds ago from one with anything in it worth keeping.
+    match download_csv(browser, &doc_id, "0").await {
+        Some(before) => {
+            let occupied: Vec<String> = (1..=4usize)
+                .flat_map(|row| [(1, row), (2, row)])
+                .filter_map(|(col, row)| {
+                    let v = csv_at(&before, col, row).unwrap_or_default();
+                    (!v.trim().is_empty()).then(|| {
+                        format!("{}{row}={v:?}", if col == 1 { "A" } else { "B" })
+                    })
+                })
+                .collect();
+            if !occupied.is_empty() {
+                eprintln!("that sheet is NOT empty: {}", occupied.join(", "));
+                eprintln!("refusing to seed over a document that has something in it");
+                return ExitCode::FAILURE;
+            }
+            println!("   A1:B4 confirmed empty -- safe to seed\n");
+        }
+        None => {
+            eprintln!("could not export the sheet to check it is empty -- refusing to write");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // A writer aimed at one row, built fresh. Cheap enough to rebuild per case
+    // and avoids carrying stale elements across a navigation.
+    async fn writer_at(desktop: &Desktop, doc_id: &str, row: u64) -> Option<SpreadsheetWriter> {
+        let (window, _) = sheets_window(desktop).await?;
+        SpreadsheetWriter::open(desktop.clone(), &window, doc_id.to_string(), None, row)
+            .await
+            .ok()
+    }
+
+    // Seed A1..A4 so every case starts from a cell that already holds something
+    // -- an append is only visible against existing content.
+    println!("-- seeding A1..A4 = \"ORIGINAL\" --");
+    for row in 1..=4u64 {
+        let Some(mut w) = writer_at(&desktop, &doc_id, row).await else {
+            eprintln!("could not build a writer for row {row}");
+            return ExitCode::FAILURE;
+        };
+        if let Err(e) = w.write("A", "ORIGINAL") {
+            eprintln!("seeding A{row} failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    println!("   seeded\n");
+
+    // Put the caret in a cell and optionally open its editor, WITHOUT the
+    // writer -- this is the state the writer is then asked to write into.
+    async fn arm(desktop: &Desktop, cell: &str, type_first: Option<&str>) {
+        goto_sheet_via_namebox(desktop, cell).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        // F2 opens the editor with the caret at the end of the existing text --
+        // exactly the state suspected of turning a write into an append.
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{F2}");
+        }
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        if let Some(extra) = type_first {
+            if let Ok(el) = desktop.focused_element() {
+                let _ = el.type_text(extra, false);
+            }
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+    }
+
+    let mut outcomes: Vec<(&str, String)> = Vec::new();
+
+    // A) baseline -- a fresh cell, no editor open.
+    println!("-- A) fresh cell, no editor (A1) --");
+    match writer_at(&desktop, &doc_id, 1).await {
+        Some(mut w) => match w.write("A", "NEW-A") {
+            Ok(()) => {
+                println!("   write reported SUCCESS");
+                outcomes.push(("A fresh cell", "success".into()));
+            }
+            Err(e) => {
+                println!("   write REFUSED: {e}");
+                outcomes.push(("A fresh cell", format!("refused: {e}")));
+            }
+        },
+        None => outcomes.push(("A fresh cell", "no writer".into())),
+    }
+
+    // B) editor already open on the target cell.
+    println!("\n-- B) editor opened first (A2) --");
+    arm(&desktop, "A2", None).await;
+    println!("   editor opened with F2");
+    match writer_at(&desktop, &doc_id, 2).await {
+        Some(mut w) => match w.write("A", "NEW-B") {
+            Ok(()) => {
+                println!("   write reported SUCCESS");
+                outcomes.push(("B editor open", "success".into()));
+            }
+            Err(e) => {
+                println!("   write REFUSED: {e}");
+                outcomes.push(("B editor open", format!("refused: {e}")));
+            }
+        },
+        None => outcomes.push(("B editor open", "no writer".into())),
+    }
+
+    // C) editor open with pending, uncommitted text in it.
+    println!("\n-- C) editor opened and typed into (A3) --");
+    arm(&desktop, "A3", Some("XYZ")).await;
+    println!("   editor opened, XYZ typed into it, not committed");
+    match writer_at(&desktop, &doc_id, 3).await {
+        Some(mut w) => match w.write("A", "NEW-C") {
+            Ok(()) => {
+                println!("   write reported SUCCESS");
+                outcomes.push(("C editor open + text", "success".into()));
+            }
+            Err(e) => {
+                println!("   write REFUSED: {e}");
+                outcomes.push(("C editor open + text", format!("refused: {e}")));
+            }
+        },
+        None => outcomes.push(("C editor open + text", "no writer".into())),
+    }
+
+    // D) the observed shape: an edit left open on A4, then a write aimed at B4.
+    // If the second value lands in A4 rather than B4, the corruption is
+    // reproduced.
+    println!("\n-- D) edit left open on A4, then a write aimed at B4 --");
+    arm(&desktop, "A4", Some("PENDING")).await;
+    println!("   A4 editor open holding uncommitted text");
+    match writer_at(&desktop, &doc_id, 4).await {
+        Some(mut w) => match w.write("B", "NEW-D") {
+            Ok(()) => {
+                println!("   write reported SUCCESS");
+                outcomes.push(("D open edit, other cell", "success".into()));
+            }
+            Err(e) => {
+                println!("   write REFUSED: {e}");
+                outcomes.push(("D open edit, other cell", format!("refused: {e}")));
+            }
+        },
+        None => outcomes.push(("D open edit, other cell", "no writer".into())),
+    }
+
+    // Ground truth. Press Escape first so nothing is left half-typed -- an open
+    // editor is not part of the saved document and would not export.
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{Escape}");
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    println!("\n-- CSV ground truth --");
+    let Some(csv) = download_csv(browser, &doc_id, "0").await else {
+        eprintln!("could not export the scratch sheet -- no verdict");
+        return ExitCode::FAILURE;
+    };
+    println!("{}\n", csv.trim());
+    for row in 1..=4usize {
+        println!(
+            "  A{row} = {:?}   B{row} = {:?}",
+            csv_at(&csv, 1, row).unwrap_or_default(),
+            csv_at(&csv, 2, row).unwrap_or_default()
+        );
+    }
+
+    println!("\n== VERDICT ==");
+    for (case, outcome) in &outcomes {
+        println!("  {case:<24} {outcome}");
+    }
+    let appended = (1..=4usize).any(|row| {
+        let v = csv_at(&csv, 1, row).unwrap_or_default();
+        v.contains("ORIGINAL") && v.contains("NEW")
+    });
+    let travelled = csv_at(&csv, 1, 4).unwrap_or_default().contains("NEW-D");
+    println!(
+        "\n  a cell holding BOTH the old and the new text : {}",
+        if appended {
+            "YES -- append reproduced"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "  a value landing in the wrong cell            : {}",
+        if travelled { "YES -- reproduced" } else { "no" }
+    );
+    // Both readings of a clean result are stated, because this probe cannot
+    // tell them apart on its own. It said "hypothesis refuted" once while the
+    // only thing that had changed was that the defect had been fixed.
+    if !appended && !travelled {
+        println!("\n  Neither pattern reproduced. Either the writer dismisses an open");
+        println!("  editor before writing -- which is the fix, and is what a clean run");
+        println!("  looks like -- or the hypothesis is wrong. Check whether");
+        println!("  SpreadsheetWriter::dismiss_editor is being called before deciding.");
+    } else {
+        println!("\n  The writer under test is vulnerable: an editor left open by a");
+        println!("  stray keystroke or an uncommitted edit corrupts the destination.");
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod csv_tests {
+    use super::csv_at;
+
+    /// The exact body exported by the `editmode` run that found the append
+    /// defect. Kept verbatim because the bug it exposes is precisely that
+    /// cells here contain newlines.
+    const EDITMODE_EXPORT: &str = "NEW-A,\n\"\nNEW-BORIGINAL\",\n\"\nNEW-CORIGINALXYZ\",\nORIGINAL,\"\nNEW-DORIGINALPENDING\"";
+
+    #[test]
+    fn a_newline_inside_a_cell_is_not_a_row_break() {
+        // The old parser read the newline inside A2 as the end of row 2, so
+        // every row below it shifted up and A4 came back empty -- which is what
+        // made the probe report "no value landed in the wrong cell" while the
+        // export showed one.
+        assert_eq!(csv_at(EDITMODE_EXPORT, 1, 1).unwrap(), "NEW-A");
+        assert_eq!(csv_at(EDITMODE_EXPORT, 1, 2).unwrap(), "\nNEW-BORIGINAL");
+        assert_eq!(csv_at(EDITMODE_EXPORT, 1, 3).unwrap(), "\nNEW-CORIGINALXYZ");
+        assert_eq!(csv_at(EDITMODE_EXPORT, 1, 4).unwrap(), "ORIGINAL");
+    }
+
+    #[test]
+    fn the_value_that_landed_in_the_wrong_cell_is_visible() {
+        // Case D: A4's uncommitted editor content followed the navigation into
+        // B4 and was committed there alongside the value actually aimed at B4.
+        // This is the whole finding, and the old parser could not see it.
+        let b4 = csv_at(EDITMODE_EXPORT, 2, 4).unwrap();
+        assert!(b4.contains("NEW-D"), "B4 should hold what was aimed at it: {b4:?}");
+        assert!(
+            b4.contains("ORIGINAL") && b4.contains("PENDING"),
+            "B4 also holds A4's pending edit -- that is the defect: {b4:?}"
+        );
+    }
+
+    #[test]
+    fn a_comma_inside_a_cell_is_not_a_column_break() {
+        // Not hypothetical: "Northwind Traders, Inc." is an ordinary customer
+        // name, and this helper is the ground truth every spreadsheet check in
+        // this file is measured against.
+        let body = "Customer,Amount\n\"Northwind Traders, Inc.\",305.75\n";
+        assert_eq!(csv_at(body, 1, 2).unwrap(), "Northwind Traders, Inc.");
+        assert_eq!(csv_at(body, 2, 2).unwrap(), "305.75");
+    }
+
+    #[test]
+    fn a_doubled_quote_is_one_literal_quote() {
+        let body = "a,\"say \"\"hi\"\"\"\n";
+        assert_eq!(csv_at(body, 2, 1).unwrap(), "say \"hi\"");
+    }
+
+    #[test]
+    fn an_empty_trailing_cell_reads_empty_not_missing() {
+        // A row that ends early means the cell is blank, which is a different
+        // thing from the export being unreadable -- callers act on the
+        // difference.
+        let body = "a,b\nc\n";
+        assert_eq!(csv_at(body, 2, 2).unwrap(), "");
+        assert_eq!(csv_at(body, 1, 2).unwrap(), "c");
+    }
+
+    #[test]
+    fn crlf_endings_parse_the_same_as_lf() {
+        let body = "a,b\r\nc,d\r\n";
+        assert_eq!(csv_at(body, 2, 2).unwrap(), "d");
+    }
+
+    #[test]
+    fn a_row_past_the_end_is_none() {
+        assert!(csv_at("a,b\n", 1, 9).is_none());
+    }
 }
