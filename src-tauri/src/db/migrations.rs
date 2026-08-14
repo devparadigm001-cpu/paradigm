@@ -44,6 +44,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "workflow_template",
         sql: include_str!("../../migrations/20260813000005_workflow_template.sql"),
     },
+    Migration {
+        version: "20260813000006",
+        name: "workflow_surface_shape",
+        sql: include_str!("../../migrations/20260813000006_workflow_surface_shape.sql"),
+    },
 ];
 
 /// FNV-1a over the migration text, ignoring `\r` so a git checkout with CRLF

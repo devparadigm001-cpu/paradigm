@@ -32,6 +32,7 @@
 
 pub mod background;
 pub mod control;
+pub mod drift;
 pub mod preview;
 pub mod spreadsheet;
 pub mod surfaces;
@@ -62,6 +63,24 @@ pub trait DestinationWriter {
 
     /// Move on by the template's destination step.
     fn advance(&mut self, step: i64) -> Result<(), SourceError>;
+
+    /// The destination's own header row, for §4.5's drift check.
+    ///
+    /// Deliberately has no default implementation. A default returning "no
+    /// columns" would let a writer opt out of drift detection by saying
+    /// nothing, and the resulting run would look checked when it was not --
+    /// which is worse than a writer that cannot answer, because it is
+    /// indistinguishable from one that did.
+    ///
+    /// `columns` is what to look at and `header_row` is where, rather than
+    /// state held on the writer: the caller knows which columns the mapping
+    /// uses, and a writer that cached them would go stale the moment a
+    /// correction repointed one.
+    fn shape(
+        &mut self,
+        columns: &[String],
+        header_row: u64,
+    ) -> Result<crate::source::SourceShape, SourceError>;
 }
 
 /// How well one source record matched the shape the examples established.
@@ -886,6 +905,19 @@ mod tests {
         fn advance(&mut self, step: i64) -> Result<(), SourceError> {
             self.row += step;
             Ok(())
+        }
+
+        /// No headers. These tests record no shape either, so `drift::check`
+        /// answers `NothingRecorded` and the run proceeds -- which is the
+        /// correct behaviour for a workflow whose surfaces were never
+        /// captured, and is what keeps every test above about the loop rather
+        /// than about drift.
+        fn shape(
+            &mut self,
+            _columns: &[String],
+            _header_row: u64,
+        ) -> Result<crate::source::SourceShape, SourceError> {
+            Ok(crate::source::SourceShape { columns: vec![] })
         }
     }
 

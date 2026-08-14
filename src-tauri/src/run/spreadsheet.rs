@@ -269,6 +269,30 @@ impl DestinationWriter for SpreadsheetWriter {
         Ok(())
     }
 
+    /// Read the destination's header row, the same way the source reader does.
+    ///
+    /// A column whose header is blank is left out rather than recorded as an
+    /// empty label, matching `SpreadsheetReader::shape` -- an unlabelled column
+    /// has no identity to compare against, and recording one would make every
+    /// later check report a spurious change between "" and "".
+    fn shape(
+        &mut self,
+        columns: &[String],
+        header_row: u64,
+    ) -> Result<crate::source::SourceShape, SourceError> {
+        let mut out = Vec::new();
+        for column in columns {
+            let label = self.read_back(column, header_row)?;
+            if !label.trim().is_empty() {
+                out.push(crate::source::ColumnShape {
+                    locator: column.clone(),
+                    label: label.trim().to_string(),
+                });
+            }
+        }
+        Ok(crate::source::SourceShape { columns: out })
+    }
+
     fn advance(&mut self, step: i64) -> Result<(), SourceError> {
         // Guarded rather than wrapped: a negative step past row 1 would wrap a
         // u64 into an enormous row, and the resulting Name Box navigation would

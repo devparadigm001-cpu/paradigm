@@ -65,6 +65,13 @@ pub enum RunOutcome {
     /// not be opened. Distinct from a `RunStop`, which is a loop that ran and
     /// then ended for a reason.
     Failed(String),
+    /// §4.5: a surface no longer looks the way it did, in a way that touches
+    /// the mapping. Nothing was written.
+    ///
+    /// Its own case rather than a `Failed`, because it is not a fault and the
+    /// response is different: §4.5 asks for the correction panel, which needs
+    /// to know this is a "stop and ask" rather than a "something broke".
+    DriftDetected(String),
 }
 
 /// A run in progress, and the controls for it.
@@ -139,6 +146,7 @@ pub fn spawn(
     key_path: PathBuf,
     playbook_id: String,
     template: CompiledTemplate,
+    header_row: u64,
     control: RunControl,
     authorization: RunAuthorization,
     make_surfaces: SurfaceFactory,
@@ -157,6 +165,7 @@ pub fn spawn(
         key_path,
         playbook_id,
         template,
+        header_row,
         control,
         authorization,
         make_surfaces,
@@ -168,6 +177,7 @@ fn spawn_authorized(
     key_path: PathBuf,
     playbook_id: String,
     template: CompiledTemplate,
+    header_row: u64,
     control: RunControl,
     authorization: RunAuthorization,
     make_surfaces: SurfaceFactory,
@@ -184,6 +194,7 @@ fn spawn_authorized(
                 &key_path,
                 &playbook_id,
                 &template,
+                header_row,
                 &control,
                 &authorization,
                 make_surfaces,
@@ -206,6 +217,7 @@ fn execute(
     key_path: &std::path::Path,
     playbook_id: &str,
     template: &CompiledTemplate,
+    header_row: u64,
     control: &RunControl,
     authorization: &RunAuthorization,
     make_surfaces: SurfaceFactory,
@@ -246,6 +258,65 @@ fn execute(
         }
     };
 
+    // §4.5, before a single cell is written.
+    //
+    // Re-read live here rather than trusted from the preview: the preview and
+    // the run are separate moments, and a column moved in between is exactly
+    // the case this catches. Both sides, because §4.5 is "both sides, not just
+    // one" -- though the destination is the dangerous one, since that is where
+    // the run writes.
+    //
+    // A workflow with no recorded shape reports `NothingRecorded` and proceeds.
+    // That is deliberate: it means the baseline was never captured, and
+    // refusing to run every workflow confirmed before §4.5 existed would be a
+    // worse answer than running them the way they always ran.
+    let source_columns: Vec<String> = template
+        .fields
+        .iter()
+        .map(|f| f.source_field.clone())
+        .collect();
+    let destination_columns: Vec<String> = template
+        .fields
+        .iter()
+        .map(|f| f.destination_field.clone())
+        .collect();
+
+    let live_source = reader.shape().unwrap_or(crate::source::SourceShape {
+        columns: vec![],
+    });
+    let live_destination = writer
+        .shape(&destination_columns, header_row)
+        .unwrap_or(crate::source::SourceShape { columns: vec![] });
+    let _ = &source_columns;
+
+    match crate::run::drift::check(
+        &conn,
+        playbook_id,
+        template,
+        &live_source,
+        &live_destination,
+    ) {
+        Ok(check) if !check.may_run() => {
+            let _ = set_run_state(&conn, playbook_id, RunState::Idle);
+            let detail = check
+                .findings()
+                .iter()
+                .filter(|f| f.blocking)
+                .map(|f| match &f.best_guess {
+                    Some(g) => format!("{} -- looks like column {g} now?", f.describe()),
+                    None => f.describe(),
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return RunOutcome::DriftDetected(detail);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let _ = set_run_state(&conn, playbook_id, RunState::Idle);
+            return RunOutcome::Failed(format!("could not check for format drift: {e}"));
+        }
+    }
+
     let _ = set_run_state(&conn, playbook_id, RunState::Running);
 
     let result = run_with_control(
@@ -283,6 +354,7 @@ mod tests {
     struct Rows {
         cursor: usize,
         count: usize,
+        headers: Vec<(String, String)>,
     }
 
     impl SourceReader for Rows {
@@ -312,12 +384,22 @@ mod tests {
             Ok(())
         }
         fn shape(&mut self) -> Result<SourceShape, SourceError> {
-            Ok(SourceShape { columns: vec![] })
+            Ok(SourceShape {
+                columns: self
+                    .headers
+                    .iter()
+                    .map(|(l, n)| crate::source::ColumnShape {
+                        locator: l.clone(),
+                        label: n.clone(),
+                    })
+                    .collect(),
+            })
         }
     }
 
     struct Sink {
         written: Arc<Mutex<Vec<String>>>,
+        headers: Vec<(String, String)>,
     }
 
     impl DestinationWriter for Sink {
@@ -333,6 +415,22 @@ mod tests {
         }
         fn advance(&mut self, _: i64) -> Result<(), SourceError> {
             Ok(())
+        }
+
+        /// No headers -- see the note on `run::tests`'s writer. These fixtures
+        /// record no shape, so the drift check reports `NothingRecorded` and
+        /// these tests stay about the thread rather than about §4.5.
+        fn shape(&mut self, _: &[String], _: u64) -> Result<SourceShape, SourceError> {
+            Ok(SourceShape {
+                columns: self
+                    .headers
+                    .iter()
+                    .map(|(l, n)| crate::source::ColumnShape {
+                        locator: l.clone(),
+                        label: n.clone(),
+                    })
+                    .collect(),
+            })
         }
     }
 
@@ -370,12 +468,18 @@ mod tests {
             detail: None,
             timestamp_ms: 0,
         });
+        // The template is attached and stored, not just passed to `spawn`.
+        // `workflow_surface_shape` references the TEMPLATE -- a recorded shape
+        // without one describes nothing -- so a fixture that stored a bare
+        // playbook could not record a shape at all. The foreign key caught
+        // that, which is the constraint working rather than getting in the way.
         let pb = crate::compile::compile(
             stream.actions(),
             "Background run",
             &crate::compile::ReversibilityPolicy::placeholder(),
             &crate::labeling::RedactionPolicy::placeholder(),
-        );
+        )
+        .with_template(template());
         crate::compile::store::store(&mut conn, &pb).expect("store");
         (dir, db_path, key_path, pb.id)
     }
@@ -395,7 +499,7 @@ mod tests {
         count: usize,
     ) -> RunAuthorization {
         let conn = crate::db::open(db_path, key_path).expect("open");
-        let mut reader = Rows { cursor: 0, count };
+        let mut reader = Rows { cursor: 0, count, headers: vec![] };
         match crate::run::preview::next_record(
             &conn,
             id,
@@ -414,11 +518,40 @@ mod tests {
         }
     }
 
+    /// Surfaces that report headers, so a drift can be staged.
+    fn surfaces_with_headers(
+        count: usize,
+        written: Arc<Mutex<Vec<String>>>,
+        source: Vec<(String, String)>,
+        destination: Vec<(String, String)>,
+    ) -> SurfaceFactory {
+        Box::new(move || {
+            Ok((
+                Box::new(Rows {
+                    cursor: 0,
+                    count,
+                    headers: source,
+                }) as Box<dyn SourceReader + Send>,
+                Box::new(Sink {
+                    written,
+                    headers: destination,
+                }) as Box<dyn DestinationWriter + Send>,
+            ))
+        })
+    }
+
+    fn cols(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
     fn surfaces(count: usize, written: Arc<Mutex<Vec<String>>>) -> SurfaceFactory {
         Box::new(move || {
             Ok((
-                Box::new(Rows { cursor: 0, count }) as Box<dyn SourceReader + Send>,
-                Box::new(Sink { written }) as Box<dyn DestinationWriter + Send>,
+                Box::new(Rows { cursor: 0, count, headers: vec![] }) as Box<dyn SourceReader + Send>,
+                Box::new(Sink { written, headers: vec![] }) as Box<dyn DestinationWriter + Send>,
             ))
         })
     }
@@ -433,6 +566,7 @@ mod tests {
             key_path.clone(),
             id.clone(),
             template(),
+            1,
             RunControl::new(),
             authorize(&db_path, &key_path, &id, &template(), 3),
             surfaces(3, Arc::clone(&written)),
@@ -445,6 +579,7 @@ mod tests {
                 assert_eq!(report.written(), 3);
             }
             RunOutcome::Failed(e) => panic!("run failed: {e}"),
+            RunOutcome::DriftDetected(d) => panic!("unexpected drift: {d}"),
         }
 
         assert_eq!(
@@ -476,6 +611,7 @@ mod tests {
             key_path.clone(),
             id.clone(),
             template(),
+            1,
             control.clone(),
             authorize(&db_path, &key_path, &id, &template(), 3),
             surfaces(3, Arc::clone(&written)),
@@ -494,6 +630,7 @@ mod tests {
         match run.join().expect("an outcome") {
             RunOutcome::Finished(report) => assert_eq!(report.written(), 3),
             RunOutcome::Failed(e) => panic!("run failed: {e}"),
+            RunOutcome::DriftDetected(d) => panic!("unexpected drift: {d}"),
         }
         assert_eq!(*written.lock().unwrap(), vec!["row1", "row2", "row3"]);
     }
@@ -510,6 +647,7 @@ mod tests {
             key_path.clone(),
             id.clone(),
             template(),
+            1,
             control,
             authorize(&db_path, &key_path, &id, &template(), 3),
             surfaces(3, Arc::clone(&written)),
@@ -522,6 +660,7 @@ mod tests {
                 assert_eq!(report.written(), 0);
             }
             RunOutcome::Failed(e) => panic!("run failed: {e}"),
+            RunOutcome::DriftDetected(d) => panic!("unexpected drift: {d}"),
         }
 
         let conn = crate::db::open(&db_path, &key_path).expect("reopen");
@@ -543,6 +682,7 @@ mod tests {
             key_path.clone(),
             id.clone(),
             template(),
+            1,
             RunControl::new(),
             authorize(&db_path, &key_path, &id, &template(), 3),
             Box::new(|| Err("the source document is not open".to_string())),
@@ -552,6 +692,7 @@ mod tests {
         match run.join().expect("an outcome") {
             RunOutcome::Failed(e) => assert!(e.contains("not open"), "unhelpful: {e}"),
             RunOutcome::Finished(r) => panic!("expected a failure, got {:?}", r.stop),
+            RunOutcome::DriftDetected(d) => panic!("expected a failure, got drift: {d}"),
         }
 
         let conn = crate::db::open(&db_path, &key_path).expect("reopen");
@@ -561,4 +702,142 @@ mod tests {
             "a run that never started must not look like it is running"
         );
     }
+
+    #[test]
+    fn a_destination_column_renamed_after_confirmation_stops_the_run_before_any_write() {
+        // §4.5, and the reason it exists. The workflow was confirmed against a
+        // destination whose column A was "Client". By the time it runs, A is
+        // headed "Invoice Date" -- so writing customer names there would put
+        // them under the wrong heading, in a column that means something else.
+        let (_dir, db_path, key_path, id) = fixture();
+        let written = Arc::new(Mutex::new(Vec::new()));
+
+        {
+            let conn = crate::db::open(&db_path, &key_path).expect("open");
+            crate::run::drift::record_shape(
+                &conn,
+                &id,
+                crate::run::drift::Side::Source,
+                &SourceShape {
+                    columns: vec![crate::source::ColumnShape {
+                        locator: "C".into(),
+                        label: "Customer".into(),
+                    }],
+                },
+            )
+            .expect("record source");
+            crate::run::drift::record_shape(
+                &conn,
+                &id,
+                crate::run::drift::Side::Destination,
+                &SourceShape {
+                    columns: vec![crate::source::ColumnShape {
+                        locator: "A".into(),
+                        label: "Client".into(),
+                    }],
+                },
+            )
+            .expect("record destination");
+        }
+
+        let run = spawn(
+            db_path.clone(),
+            key_path.clone(),
+            id.clone(),
+            template(),
+            1,
+            RunControl::new(),
+            authorize(&db_path, &key_path, &id, &template(), 3),
+            surfaces_with_headers(
+                3,
+                Arc::clone(&written),
+                cols(&[("C", "Customer")]),
+                cols(&[("A", "Invoice Date")]),
+            ),
+        )
+        .expect("spawn should be authorized");
+
+        match run.join().expect("an outcome") {
+            RunOutcome::DriftDetected(detail) => {
+                assert!(
+                    detail.contains("Invoice Date"),
+                    "the halt must say what the column is now: {detail}"
+                );
+                assert!(detail.contains("destination"), "and which side: {detail}");
+            }
+            other => panic!("expected DriftDetected, got {other:?}"),
+        }
+
+        // The whole point: nothing was written.
+        assert!(
+            written.lock().unwrap().is_empty(),
+            "a drifted destination must not be written to at all"
+        );
+        let conn = crate::db::open(&db_path, &key_path).expect("reopen");
+        assert_eq!(processed_count(&conn, &id, "src").expect("count"), 0);
+        assert_eq!(
+            get_run_state(&conn, &id).expect("state"),
+            Some(RunState::Idle),
+            "a halted run must not be left looking like it is running"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_pair_of_surfaces_runs_normally() {
+        // The control for the test above: same machinery, nothing moved.
+        let (_dir, db_path, key_path, id) = fixture();
+        let written = Arc::new(Mutex::new(Vec::new()));
+
+        {
+            let conn = crate::db::open(&db_path, &key_path).expect("open");
+            crate::run::drift::record_shape(
+                &conn,
+                &id,
+                crate::run::drift::Side::Source,
+                &SourceShape {
+                    columns: vec![crate::source::ColumnShape {
+                        locator: "C".into(),
+                        label: "Customer".into(),
+                    }],
+                },
+            )
+            .expect("record source");
+            crate::run::drift::record_shape(
+                &conn,
+                &id,
+                crate::run::drift::Side::Destination,
+                &SourceShape {
+                    columns: vec![crate::source::ColumnShape {
+                        locator: "A".into(),
+                        label: "Client".into(),
+                    }],
+                },
+            )
+            .expect("record destination");
+        }
+
+        let run = spawn(
+            db_path.clone(),
+            key_path.clone(),
+            id.clone(),
+            template(),
+            1,
+            RunControl::new(),
+            authorize(&db_path, &key_path, &id, &template(), 3),
+            surfaces_with_headers(
+                3,
+                Arc::clone(&written),
+                cols(&[("C", "Customer")]),
+                cols(&[("A", "Client")]),
+            ),
+        )
+        .expect("spawn should be authorized");
+
+        match run.join().expect("an outcome") {
+            RunOutcome::Finished(report) => assert_eq!(report.written(), 3),
+            other => panic!("expected a clean run, got {other:?}"),
+        }
+        assert_eq!(*written.lock().unwrap(), vec!["row1", "row2", "row3"]);
+    }
 }
+

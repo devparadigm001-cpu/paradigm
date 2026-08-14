@@ -681,6 +681,63 @@ pub async fn preview_workflow_run(
         }
     };
 
+    // §4.5, at the point the user is about to confirm.
+    //
+    // Blocking drift stops here rather than at the run, and stopping here is
+    // stronger: no preview is produced, so no `RunAuthorization` can exist, so
+    // there is nothing to start. The run thread checks again anyway, because
+    // the two moments are different and a column can move in between.
+    //
+    // The baseline is recorded on the first look. §4.5 wants the shape "at
+    // template-confirmation time", and this is the first moment both surfaces
+    // are open and the user is being asked to confirm them. Recording it when
+    // the user declines is harmless -- declining does not change what the
+    // sheets look like, and the alternative is a workflow that can never
+    // detect drift because it never captured a baseline.
+    {
+        let conn = state.db.lock().await;
+        let check = run::drift::check(
+            &conn,
+            &playbook_id,
+            &template,
+            &source_shape,
+            &destination_shape,
+        )
+        .map_err(|e| e.to_string())?;
+
+        if !check.may_run() {
+            return Ok(PreviewOutcome::NeedsAttention(NothingToPreview {
+                reason: check
+                    .findings()
+                    .iter()
+                    .filter(|f| f.blocking)
+                    .map(|f| match &f.best_guess {
+                        Some(g) => format!("{} -- looks like column {g} now?", f.describe()),
+                        None => f.describe(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            }));
+        }
+
+        if matches!(check, run::drift::DriftCheck::NothingRecorded) {
+            run::drift::record_shape(
+                &conn,
+                &playbook_id,
+                run::drift::Side::Source,
+                &source_shape,
+            )
+            .map_err(|e| e.to_string())?;
+            run::drift::record_shape(
+                &conn,
+                &playbook_id,
+                run::drift::Side::Destination,
+                &destination_shape,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
     // The model runs here, where both header rows are in hand. A failure to
     // load it is not a failure to preview: §4.3's safety check is the user
     // seeing the record, and the verdict is advice on top of that.
@@ -834,6 +891,7 @@ pub async fn start_workflow_run(
         key_path,
         playbook_id.clone(),
         template.clone(),
+        header_row.unwrap_or(1),
         control,
         authorization,
         run::surfaces::factory_for(
