@@ -146,6 +146,14 @@ export type CorrectionRequest = {
 /** What the running-state overlay renders (§4.6). */
 export type RunStatusView = {
   playbook_id: string | null;
+  /**
+   * §4.5: the record a supervised run has stopped on. Null on an ordinary
+   * run -- which is what keeps the panel's one-off branch unavailable unless
+   * there is genuinely a record to attach it to.
+   */
+  awaiting_row: string | null;
+  /** The mapped columns that were empty on that record. */
+  awaiting_missing_fields: string[];
   /** "idle" | "running" | "paused" */
   state: string;
   /** True once the run thread has ended, whatever the reason. */

@@ -170,7 +170,12 @@ export function useWorkflowRun() {
   /** §4.3's "confirm". The only way into a run. */
   const confirmPreview = useCallback(async () => {
     try {
-      const status = await invoke<RunStatusView>("start_workflow_run");
+      const status = await invoke<RunStatusView>("start_workflow_run", {
+        // §4.5: stop on an incomplete record so a one-off correction has
+        // something to attach to. Without this the panel can only ever offer
+        // the permanent scope.
+        supervise: true,
+      });
       setStage({ name: "running", status });
       pollStatus();
     } catch (e) {

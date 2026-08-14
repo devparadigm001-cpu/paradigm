@@ -433,9 +433,37 @@ function MainWindowView() {
         onResume={() => void workflowRun.resume()}
         onStop={() => void workflowRun.stop()}
         onCorrect={() => {
-          // Only reachable when the blocked stage actually carries something
-          // repointable -- the button that leads here is not rendered
-          // otherwise.
+          // §4.5's one-off route: a supervised run stopped on a record, so
+          // there IS something to attach a correction to. This is the only
+          // path that supplies a sourceRow, and therefore the only one that
+          // makes the panel's one-off option available.
+          if (
+            workflowRun.stage.name === "running" &&
+            workflowRun.stage.status.awaiting_row &&
+            workflowRun.playbookId
+          ) {
+            const row = workflowRun.stage.status.awaiting_row;
+            const missing = workflowRun.stage.status.awaiting_missing_fields;
+            setCorrection({
+              playbookId: workflowRun.playbookId,
+              // The empty column is a SOURCE column: the record had nothing in
+              // it, and the fix is to read from a different one.
+              side: "source",
+              oldLocator: missing[0] ?? "",
+              oldLabel: null,
+              // Nothing has moved, so there is no plausible guess to offer --
+              // the user points at where the value actually is this time.
+              bestGuess: null,
+              detail: `Row ${row} has nothing in ${
+                missing.join(", ") || "a mapped column"
+              }.`,
+              sourceRow: row,
+            });
+            return;
+          }
+
+          // The drift route. Checked before a run starts, so nothing is in
+          // progress and only the permanent scope applies.
           if (
             workflowRun.stage.name === "blocked" &&
             workflowRun.stage.corrections.length > 0 &&

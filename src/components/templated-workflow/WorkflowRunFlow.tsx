@@ -91,6 +91,7 @@ export function WorkflowRunFlow({
           onPause={onPause}
           onResume={onResume}
           onStop={onStop}
+          onCorrect={onCorrect}
           onDismiss={onDismiss}
         />
       );
@@ -341,16 +342,22 @@ function RunControlOverlay({
   onPause,
   onResume,
   onStop,
+  onCorrect,
   onDismiss,
 }: {
   status: RunStatusView;
   onPause: () => void;
   onResume: () => void;
   onStop: () => void;
+  onCorrect: () => void;
   onDismiss: () => void;
 }) {
   const paused = status.state === "paused";
   const finished = status.finished;
+  // §4.5: a supervised run stopped on a record. The overlay is where the
+  // user already is when it happens, so the way into the panel belongs here
+  // rather than in a notification they have to go and find.
+  const awaiting = status.awaiting_row;
 
   return (
     <Card>
@@ -375,6 +382,22 @@ function RunControlOverlay({
           The record it was part-way through will be redone from the start when
           you resume.
         </p>
+      ) : null}
+
+      {awaiting && !finished ? (
+        <div className="mt-2 rounded border border-amber-500/40 p-2">
+          <p className="text-xs">
+            Row <span className="font-mono">{awaiting}</span> has nothing in{" "}
+            {status.awaiting_missing_fields.join(", ") || "a mapped column"}.
+          </p>
+          <Button
+            size="sm"
+            className="mt-2 w-full"
+            onClick={onCorrect}
+          >
+            Point at the right column
+          </Button>
+        </div>
       ) : null}
 
       <div className="mt-3 flex justify-end gap-2">
