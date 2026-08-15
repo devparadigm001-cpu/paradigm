@@ -262,6 +262,25 @@ fn resolve_selection(total: usize, requested: Option<&[usize]>) -> Result<Vec<us
 
 // ------------------------------------------------------------- commands ----
 
+/// Is a capture session currently open in the backend?
+///
+/// Exists because the two halves can disagree, and only one of them is right.
+/// `state.session` lives in the Rust process; the phase driving Record Mode's
+/// UI lives in React state in a webview. A webview reload -- routine under
+/// `npm run tauri dev`, and possible in production -- resets the phase to
+/// "idle" while the session carries on recording. The UI then shows nothing
+/// happening, and the next Start is refused with "a recording session is
+/// already active".
+///
+/// Without this, the frontend has no way to ask; it can only assume, and its
+/// assumption is wrong exactly when it matters. Reports the fact and nothing
+/// else -- what to do about a disagreement is the caller's decision.
+#[tauri::command]
+pub async fn record_session_active(state: State<'_, AppState>) -> Result<bool, String> {
+    let slot = state.session.lock().map_err(|e| e.to_string())?;
+    Ok(slot.is_some())
+}
+
 /// Begin a Record Mode capture session.
 #[tauri::command]
 pub async fn start_record_session(state: State<'_, AppState>) -> Result<String, String> {

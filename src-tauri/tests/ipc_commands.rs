@@ -30,6 +30,20 @@ use tempfile::TempDir;
 /// must not interleave across the tests in this binary.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Held by any test that calls `start_record_session`.
+///
+/// `CaptureSession` installs REAL system-wide input hooks, and there is one
+/// input system to install them into no matter how many `mock_app()`s exist.
+/// Cargo runs the tests in a binary in parallel, so two recorder tests
+/// overlapped and one of them died with "Failed to receive result from command:
+/// RecvError" -- while each passed alone. Per-test state was already isolated;
+/// the machine underneath it is not.
+///
+/// `ipc_pipeline` solves the same problem by living in its own binary, since
+/// cargo runs binaries sequentially. These tests are fast and deserve to stay
+/// with the fast ones, so they serialise against each other instead.
+static RECORDER_LOCK: Mutex<()> = Mutex::new(());
+
 /// Build the real app configuration on the mock runtime, pointed at a scratch
 /// data directory. The `TempDir` is returned so the caller keeps it alive --
 /// and so it is dropped *after* the app closes the database.
@@ -809,4 +823,109 @@ fn a_declined_pattern_is_stored_differently_from_one_never_offered() {
     assert_eq!(row(&declined_id)["is_templated"], false);
     assert_eq!(row(&declined_id)["template_declined"], true);
     assert_eq!(row(&plain_id)["template_declined"], false);
+}
+
+/// Declining a pattern must leave Record Mode able to start again.
+///
+/// Reported from real use: decline the first proposal, record a second session
+/// successfully, and then Record Mode refuses with "a recording session is
+/// already active" while nothing is recording. This walks the reported
+/// sequence over the real IPC boundary and checks the one thing that error
+/// depends on -- whether `state.session` is still occupied.
+///
+/// Two full record/decline cycles, because the report only reached the stuck
+/// state on the SECOND one; a single cycle would not have caught it.
+#[test]
+fn declining_a_pattern_leaves_record_mode_startable() {
+    let _recorder = RECORDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+
+    for cycle in 1..=2 {
+        // ---- record ---------------------------------------------------------
+        let started = invoke(&webview, "start_record_session", InvokeBody::default())
+            .map(|r| r.deserialize::<serde_json::Value>().expect("name"))
+            .unwrap_or_else(|e| {
+                panic!("cycle {cycle}: start_record_session failed: {e}. If this says \"already \
+                        active\", the previous cycle left a session behind -- which is the bug.")
+            });
+        assert!(
+            started.as_str().unwrap_or_default().starts_with("record-"),
+            "cycle {cycle}: unexpected session name {started}"
+        );
+
+        // ---- stop -----------------------------------------------------------
+        invoke(&webview, "stop_record_session", InvokeBody::default())
+            .unwrap_or_else(|e| panic!("cycle {cycle}: stop_record_session failed: {e}"));
+
+        // ---- decline --------------------------------------------------------
+        // A real stop leaves whatever it captured; this substitutes a known
+        // capture and the links of a session that DID show a proposal, so the
+        // decline branch is the one exercised.
+        seed_pending(&app, &["One", "Two", "Three"]);
+        seed_pending_links(&app);
+        let stored = compile(&webview, &format!("Declined cycle {cycle}"), None)
+            .unwrap_or_else(|e| panic!("cycle {cycle}: compile failed: {e}"));
+        let id = stored["playbook_id"].as_str().expect("playbook_id");
+
+        // The decline was recorded -- otherwise this test would pass while
+        // exercising the ordinary path rather than the one under suspicion.
+        let (_, declined_at) = template_row(&app, id);
+        assert!(
+            declined_at.is_some(),
+            "cycle {cycle}: this test is only meaningful if the DECLINE path ran"
+        );
+    }
+
+    // The reported failure: a third start after two decline cycles.
+    invoke(&webview, "start_record_session", InvokeBody::default()).expect(
+        "after two record-and-decline cycles, Record Mode must still start. \
+         An \"already active\" error here is the reported bug.",
+    );
+    invoke(&webview, "stop_record_session", InvokeBody::default()).expect("clean up");
+}
+
+/// The backend can be asked whether a session is open, and answers truthfully.
+///
+/// This is what lets the frontend recover from the reported symptom. A webview
+/// reload resets Record Mode's phase to "idle" while `state.session` keeps
+/// recording; the UI then shows nothing happening and Start is refused with "a
+/// recording session is already active". Without this query the frontend can
+/// only assume, and its assumption is wrong exactly when it matters.
+///
+/// The middle assertion is the one that matters: it reproduces the orphaned
+/// state -- a live session that no UI is tracking -- and shows it is
+/// detectable rather than invisible.
+#[test]
+fn the_backend_reports_whether_a_session_is_open() {
+    let _recorder = RECORDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+
+    let active = |label: &str| -> bool {
+        invoke(&webview, "record_session_active", InvokeBody::default())
+            .unwrap_or_else(|e| panic!("{label}: record_session_active failed: {e}"))
+            .deserialize::<bool>()
+            .expect("bool")
+    };
+
+    assert!(!active("before starting"), "nothing has started yet");
+
+    invoke(&webview, "start_record_session", InvokeBody::default()).expect("start");
+    assert!(
+        active("while recording"),
+        "a live session must be visible to the frontend -- this is exactly the state a \
+         reloaded webview lands in, believing it is idle"
+    );
+
+    invoke(&webview, "stop_record_session", InvokeBody::default()).expect("stop");
+    assert!(
+        !active("after stopping"),
+        "stop_record_session takes the session out of play, so nothing is left to adopt"
+    );
+
+    // And the slot really is free afterwards, not merely reported as free.
+    invoke(&webview, "start_record_session", InvokeBody::default())
+        .expect("the session must be startable again after a stop");
+    invoke(&webview, "stop_record_session", InvokeBody::default()).expect("clean up");
 }

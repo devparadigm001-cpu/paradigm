@@ -209,6 +209,7 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         .invoke_handler(tauri::generate_handler![
             greet,
             db_health_check,
+            commands::record_session_active,
             commands::start_record_session,
             commands::stop_record_session,
             commands::compile_and_store_playbook,
