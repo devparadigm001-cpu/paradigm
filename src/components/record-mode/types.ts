@@ -67,6 +67,15 @@ export type PlaybookSummaryView = {
    * behaviour attaches to.
    */
   is_templated: boolean;
+  /**
+   * A repeating pattern was offered for this recording and declined. Only ever
+   * true when `is_templated` is false — the schema forbids the pair.
+   *
+   * Exists so the list can tell the two kinds of ordinary playbook apart:
+   * nobody found a pattern, versus the user was shown one and said no. Those
+   * were previously the same row.
+   */
+  template_declined: boolean;
 };
 
 export type StepOutcomeView = {

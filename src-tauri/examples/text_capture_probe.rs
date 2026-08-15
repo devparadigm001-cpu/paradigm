@@ -4495,7 +4495,7 @@ async fn sheets_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -5158,7 +5158,7 @@ async fn sheetsa11y_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -5478,7 +5478,7 @@ async fn sheetsedit_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -5761,7 +5761,7 @@ async fn sheetswatch_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -5998,6 +5998,62 @@ fn parse_cell_ref(s: &str) -> Option<(usize, usize)> {
 /// an ordinary customer name -- and this is the ground truth every spreadsheet
 /// check in this file is measured against. A verifier that misreads the truth
 /// is worse than none, because it is believed.
+/// The URL a probe should open when it wants a spreadsheet to work in.
+///
+/// `PARADIGM_SCRATCH_DOC=<id>` reuses one document instead of creating a new
+/// one. Unset, this is `sheets.new` and behaves exactly as before.
+///
+/// ## Why this exists
+///
+/// Every probe that wanted a sheet called `https://sheets.new`, which creates a
+/// real "Untitled spreadsheet" in the signed-in Drive account. One evening's
+/// work left ten of them, and clearing those turned out to be its own problem:
+/// Google Sheets' menu bar is not in the accessibility tree, so the repo's
+/// `sheetstrash` cleanup cannot reach File > Move to trash at all. See
+/// `docs/known-issues/google-sheets-menu-bar-not-in-accessibility-tree.md`.
+///
+/// Not creating the litter is the fix that does not depend on being able to
+/// delete it.
+///
+/// ## What this does NOT do
+///
+/// It does not make the document blank. Several probes seed a sheet and then
+/// assert over the result, and one of them says so explicitly -- "a fresh
+/// document, so nothing here depends on what a previous run left behind and the
+/// ledger starts genuinely empty". Reusing a document silently would hand those
+/// probes residue from the last run.
+///
+/// So reuse is opt-in per invocation, and the probes that need a blank sheet
+/// check for one themselves and refuse rather than seeding over it (`editmode`
+/// verifies A1:B4 is empty before writing a single cell). Run `clearscratch`
+/// between uses, or leave the variable unset for those.
+fn scratch_url() -> String {
+    match std::env::var("PARADIGM_SCRATCH_DOC") {
+        Ok(id)
+            if id.len() >= 40
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+        {
+            format!("https://docs.google.com/spreadsheets/d/{id}/edit")
+        }
+        Ok(bad) if !bad.trim().is_empty() => {
+            // Loud rather than silently falling back. A typo'd id that quietly
+            // created a new document would reintroduce exactly the litter this
+            // exists to prevent, while looking like it had worked.
+            println!("  !! PARADIGM_SCRATCH_DOC={bad:?} is not a document id -- ignoring it");
+            println!("  !! and creating a throwaway sheet instead.");
+            NEW_SHEET.to_string()
+        }
+        _ => NEW_SHEET.to_string(),
+    }
+}
+
+/// The only place this URL appears. Every other use goes through
+/// [`scratch_url`], so pointing the probes at a reusable document is one
+/// environment variable rather than an audit of thirty call sites.
+const NEW_SHEET: &str = "https://sheets.new";
+
 fn csv_at(body: &str, col: usize, row: usize) -> Option<String> {
     let (col, row) = (col.checked_sub(1)?, row.checked_sub(1)?);
 
@@ -6061,7 +6117,7 @@ async fn sheetsclean_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -6232,7 +6288,7 @@ async fn sheetskeys_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -6375,7 +6431,7 @@ async fn sheetscapture_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -7011,7 +7067,7 @@ async fn sheetsentry_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -7368,7 +7424,7 @@ async fn sheetsmulti_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -7818,7 +7874,7 @@ async fn sheetscopylive_mode() -> ExitCode {
         tokio::time::sleep(Duration::from_secs(30)).await;
     };
 
-    open("https://sheets.new".to_string()).await;
+    open(scratch_url()).await;
     let desktop = match Desktop::new_default() {
         Ok(d) => d,
         Err(e) => {
@@ -7844,7 +7900,7 @@ async fn sheetscopylive_mode() -> ExitCode {
     }
     println!("  seeded C2..C4");
 
-    open("https://sheets.new".to_string()).await;
+    open(scratch_url()).await;
     let dest_id = sheets_window(&desktop)
         .await
         .map(|(_, id)| id)
@@ -7977,9 +8033,11 @@ async fn sheetscopy_mode() -> ExitCode {
     println!("== can the source cell be read at Ctrl+C time? ==\n");
 
     let browser = browser_order()[0];
-    let open = |url: &'static str| async move {
+    // `String`, not `&'static str`: the URL now comes from `scratch_url()` at
+    // call time rather than being a literal baked into the binary.
+    let open = |url: String| async move {
         if let Ok(mut c) = std::process::Command::new("cmd")
-            .args(["/C", "start", "", browser, "--new-window", url])
+            .args(["/C", "start", "", browser, "--new-window", url.as_str()])
             .spawn()
         {
             let _ = c.wait();
@@ -7989,7 +8047,7 @@ async fn sheetscopy_mode() -> ExitCode {
 
     // ---- two documents ------------------------------------------------------
     println!("-- opening the SOURCE document --");
-    open("https://sheets.new").await;
+    open(scratch_url()).await;
     let desktop = match Desktop::new_default() {
         Ok(d) => d,
         Err(e) => {
@@ -8018,7 +8076,7 @@ async fn sheetscopy_mode() -> ExitCode {
     println!("  seeded C2, C3");
 
     println!("\n-- opening the DESTINATION document --");
-    open("https://sheets.new").await;
+    open(scratch_url()).await;
     let dest_id = sheets_window(&desktop)
         .await
         .map(|(_, id)| id)
@@ -8235,7 +8293,7 @@ async fn sourcereader_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -8430,7 +8488,7 @@ async fn sheetsformula_mode() -> ExitCode {
     let browser = browser_order()[0];
     let url = match &doc_arg {
         Some(id) => format!("https://docs.google.com/spreadsheets/d/{id}/edit"),
-        None => "https://sheets.new".to_string(),
+        None => scratch_url(),
     };
     if let Ok(mut c) = std::process::Command::new("cmd")
         .args(["/C", "start", "", browser, "--new-window", &url])
@@ -8583,7 +8641,7 @@ async fn sheetsread_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -8770,7 +8828,7 @@ async fn sheetsqualified_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -9902,7 +9960,7 @@ async fn sheetsreplaytab_mode() -> ExitCode {
     });
     let url = match &doc_arg {
         Some(id) => format!("https://docs.google.com/spreadsheets/d/{id}/edit"),
-        None => "https://sheets.new".to_string(),
+        None => scratch_url(),
     };
     println!("  opening {url}");
     if let Ok(mut c) = std::process::Command::new("cmd")
@@ -10521,7 +10579,7 @@ async fn sheetstabclick_mode() -> ExitCode {
     let browser = browser_order()[0];
     let open_new_sheet = || async {
         if let Ok(mut c) = std::process::Command::new("cmd")
-            .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+            .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
             .spawn()
         {
             let _ = c.wait();
@@ -10878,7 +10936,7 @@ async fn sheetsroundtrip_mode() -> ExitCode {
     let browser = browser_order()[0];
     let open_new_sheet = || async {
         if let Ok(mut c) = std::process::Command::new("cmd")
-            .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+            .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
             .spawn()
         {
             let _ = c.wait();
@@ -11218,7 +11276,7 @@ async fn sheetspaste_mode() -> ExitCode {
 
     let browser = browser_order()[0];
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -12002,6 +12060,12 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "menudump") {
         return menudump_mode().await;
     }
+    if std::env::args().any(|a| a == "clearscratch") {
+        return clearscratch_mode().await;
+    }
+    if std::env::args().any(|a| a == "renamedoc") {
+        return renamedoc_mode().await;
+    }
     if std::env::args().any(|a| a == "uicorrection") {
         return uicorrection_mode().await;
     }
@@ -12596,7 +12660,7 @@ async fn templatedrun_mode() -> ExitCode {
     // behind and the ledger starts genuinely empty.
     let browser = "msedge";
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -12999,7 +13063,7 @@ async fn templatedpreview_mode() -> ExitCode {
 
     let browser = "msedge";
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -13488,7 +13552,7 @@ async fn templateddrift_mode() -> ExitCode {
 
     let browser = "msedge";
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -13941,7 +14005,7 @@ async fn templatedbatch_mode() -> ExitCode {
     };
     let browser = "msedge";
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -14516,7 +14580,7 @@ async fn uiflow_mode() -> ExitCode {
     // ---- a real source and destination -------------------------------------
     let browser = "msedge";
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -15003,7 +15067,7 @@ async fn templatedcorrection_mode() -> ExitCode {
     };
     let browser = "msedge";
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -15343,7 +15407,7 @@ async fn uicorrection_mode() -> ExitCode {
 
     let browser = "msedge";
     if let Ok(mut c) = std::process::Command::new("cmd")
-        .args(["/C", "start", "", browser, "--new-window", "https://sheets.new"])
+        .args(["/C", "start", "", browser, "--new-window", scratch_url().as_str()])
         .spawn()
     {
         let _ = c.wait();
@@ -16054,8 +16118,17 @@ async fn editmode_mode() -> ExitCode {
     let url = if arg.len() > 20 {
         format!("https://docs.google.com/spreadsheets/d/{arg}/edit")
     } else {
-        println!("no doc id given -- creating a throwaway sheet");
-        "https://sheets.new".to_string()
+        // Says what actually happened. This printed "creating a throwaway
+        // sheet" unconditionally, which became untrue the moment `scratch_url`
+        // learned to reuse one -- and a probe that misreports where it is
+        // writing is the last thing this file should ship.
+        let url = scratch_url();
+        if url.contains("/spreadsheets/d/") {
+            println!("no doc id given -- reusing PARADIGM_SCRATCH_DOC");
+        } else {
+            println!("no doc id given -- creating a throwaway sheet");
+        }
+        url
     };
     if let Ok(mut c) = std::process::Command::new("cmd")
         .args(["/C", "start", "", browser, "--new-window", &url])
@@ -16645,4 +16718,275 @@ async fn menudump_mode() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+// --------------------------------------------------- clearscratch mode ----
+// Blank the reusable scratch document so the next probe starts clean.
+//
+// Without this, `PARADIGM_SCRATCH_DOC` is usable exactly once: the probes that
+// seed a sheet and assert over the result need a blank one, and several say so
+// -- "a fresh document, so nothing here depends on what a previous run left
+// behind and the ledger starts genuinely empty".
+//
+// Clears A1 to CLEAR_COLS x CLEAR_ROWS on every sheet tab via the Name Box and the Delete key, then
+// VERIFIES against the CSV export rather than trusting the keystrokes. A clear
+// that silently did not happen would hand the next probe residue while looking
+// like it had worked, which is the failure mode this file keeps finding.
+// ---------------------------------------------------------------------------
+
+/// The block cleared, and therefore the block verified. One pair of constants
+/// so the two can never drift apart -- a check narrower than the action it
+/// checks is how residue survives a "PASS".
+///
+/// Anything outside it is neither cleared nor reported. That is a real limit,
+/// stated rather than papered over: a scratch document with something at AA1
+/// would be called clean. The probes that use this seed columns A-E and a
+/// handful of rows, so the range is generous for its actual purpose.
+const CLEAR_COLS: usize = 26;
+const CLEAR_ROWS: usize = 200;
+
+async fn clearscratch_mode() -> ExitCode {
+    let id = match std::env::var("PARADIGM_SCRATCH_DOC") {
+        Ok(id) if id.len() >= 40 => id,
+        _ => match std::env::args().skip(1).find(|a| {
+            a.len() >= 40
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        }) {
+            Some(id) => id,
+            None => {
+                eprintln!("set PARADIGM_SCRATCH_DOC or pass a document id");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    println!("== blanking the scratch document ==");
+    println!("doc: {id}\n");
+
+    let browser = "msedge";
+    let url = format!("https://docs.google.com/spreadsheets/d/{id}/edit");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", &url])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut window = None;
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if let Some(w) = window_for_doc(&desktop, &id).await {
+            window = Some(w);
+            break;
+        }
+    }
+    let Some(window) = window else {
+        eprintln!("no window showing {id}");
+        return ExitCode::FAILURE;
+    };
+
+    // Refuse anything that is not a throwaway. Same guard as `sheetstrash`,
+    // for the same reason: this destroys data, and a document that someone
+    // named is not one of the blank scratch sheets.
+    let title = window.name().unwrap_or_default();
+    println!("window: {title:?}");
+    if !title.starts_with("Untitled spreadsheet") {
+        eprintln!("that is not an untitled throwaway -- refusing to clear it");
+        return ExitCode::FAILURE;
+    }
+    let _ = window.activate_window();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let tabs = sheet_tab_names(&desktop).await;
+    let tabs = if tabs.is_empty() {
+        vec!["Sheet1".to_string()]
+    } else {
+        tabs
+    };
+    println!("sheets: {tabs:?}\n");
+
+    for tab in &tabs {
+        println!("-- clearing {tab} --");
+        // A qualified range selects the whole block in one move; the Name Box
+        // is the only addressing mechanism in this window that has ever been
+        // reliable (see source::spreadsheet at length).
+        // Derived from the constants, not written out again -- the whole point
+        // of the pair is that the cleared block and the checked block are the
+        // same block.
+        let last_col = (b'A' + (CLEAR_COLS as u8 - 1)) as char;
+        let range = format!("{tab}!A1:{last_col}{CLEAR_ROWS}");
+        if goto_sheet_via_namebox(&desktop, &range)
+            .await
+            .is_none()
+        {
+            eprintln!("   could not select the range on {tab}");
+            return ExitCode::FAILURE;
+        }
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{Delete}");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        println!("   deleted");
+    }
+
+    // The verdict is the export, not the keystrokes.
+    println!("\n-- verifying --");
+    let mut all_clear = true;
+    for tab in &tabs {
+        let gid = goto_sheet_via_namebox(&desktop, &format!("{tab}!A1"))
+            .await
+            .unwrap_or_else(|| "0".to_string());
+        match download_csv(browser, &id, &gid).await {
+            Some(csv) => {
+                // The verification window must cover the range that was
+                // cleared, or it can pass over residue it never looked at.
+                // The first version checked A1:H12 while clearing A1:Z200,
+                // which would have called a sheet with something in J50 clean.
+                //
+                // Cheaper than it looks: `csv_at` walks the body once per
+                // lookup, but an emptied sheet exports almost nothing, so the
+                // scan short-circuits immediately in the case that matters.
+                let leftovers: Vec<String> = (1..=CLEAR_ROWS)
+                    .flat_map(|row| (1..=CLEAR_COLS).map(move |col| (col, row)))
+                    .filter_map(|(col, row)| {
+                        let v = csv_at(&csv, col, row).unwrap_or_default();
+                        (!v.trim().is_empty()).then(|| format!("r{row}c{col}={v:?}"))
+                    })
+                    .take(6)
+                    .collect();
+                if leftovers.is_empty() {
+                    println!("  {tab} (gid {gid}): empty");
+                } else {
+                    println!("  {tab} (gid {gid}): STILL HAS {}", leftovers.join(", "));
+                    all_clear = false;
+                }
+            }
+            None => {
+                println!("  {tab}: could not export -- cannot confirm, treating as not clear");
+                all_clear = false;
+            }
+        }
+    }
+
+    println!();
+    if all_clear {
+        println!("PASS -- the scratch document is blank and safe to reuse");
+        ExitCode::SUCCESS
+    } else {
+        println!("FAIL -- something is still in it; do not reuse it yet");
+        ExitCode::FAILURE
+    }
+}
+
+/// renamedoc -- rename an open spreadsheet, to exercise title-based guards.
+///
+/// Exists for one reason: `clearscratch` and `sheetstrash` both refuse any
+/// document not titled "Untitled spreadsheet", and that refusal cannot be
+/// tested without a document that fails the test. The only safe way to get one
+/// is to rename a throwaway -- pointing a destructive tool at a real document
+/// to watch it decline is not a test, it is a gamble on the guard being right.
+async fn renamedoc_mode() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(id) = args.iter().find(|a| {
+        a.len() >= 40
+            && a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }) else {
+        eprintln!("usage: text_capture_probe renamedoc <doc-id> <new name>");
+        return ExitCode::FAILURE;
+    };
+    let name = args
+        .iter()
+        .skip_while(|a| *a != id)
+        .skip(1)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if name.trim().is_empty() {
+        eprintln!("give a new name after the id");
+        return ExitCode::FAILURE;
+    }
+
+    println!("== rename {id} -> {name:?} ==");
+    let browser = "msedge";
+    let url = format!("https://docs.google.com/spreadsheets/d/{id}/edit");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", &url])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut window = None;
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if let Some(w) = window_for_doc(&desktop, id).await {
+            window = Some(w);
+            break;
+        }
+    }
+    let Some(window) = window else {
+        eprintln!("no window showing {id}");
+        return ExitCode::FAILURE;
+    };
+    let _ = window.activate_window();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // The title is an Edit carrying the current name. Matched on its VALUE
+    // rather than a label, because the label varies with locale.
+    let edits = desktop
+        .locator("role:Edit")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(8)), None)
+        .await
+        .unwrap_or_default();
+    let current = window.name().unwrap_or_default();
+    println!("  window: {current:?}");
+    let title = edits.into_iter().find(|e| {
+        let v = e.text(0).unwrap_or_default();
+        let n = e.name().unwrap_or_default();
+        v.trim() == "Untitled spreadsheet"
+            || n.contains("Rename")
+            || n.contains("Untitled spreadsheet")
+    });
+    let Some(title) = title else {
+        eprintln!("  could not find the title field");
+        return ExitCode::FAILURE;
+    };
+    if let Err(e) = title.set_value(&name) {
+        eprintln!("  set_value failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let _ = title.press_key("{Tab}");
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // The window title is what the guards read, so that is what is checked.
+    let after = window_for_doc(&desktop, id)
+        .await
+        .and_then(|w| w.name())
+        .unwrap_or_default();
+    println!("  window now: {after:?}");
+    if after.starts_with(&name) {
+        println!("  renamed");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("  the window title did not change; the rename did not take");
+        ExitCode::FAILURE
+    }
 }

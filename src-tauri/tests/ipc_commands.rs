@@ -697,3 +697,116 @@ fn cancelling_a_preview_that_was_never_shown_is_not_an_error() {
     invoke(&webview, "cancel_workflow_preview", InvokeBody::default())
         .expect("cancelling with nothing pending should succeed quietly");
 }
+
+/// Seed the source links a real recording would have left behind.
+///
+/// Three rows copied A->A and B->B, one row apart, which is exactly the shape
+/// `detect` needs to offer a pattern -- and the shape a real recording of this
+/// build produced: `Pattern { A->A, B->B, source_step: 1, destination_step: 1,
+/// examples: 3 }`.
+fn seed_pending_links(app: &App<MockRuntime>) {
+    use paradigm_lib::capture::grid::SourceLink;
+
+    const SRC: &str = "1SourceDocumentIdentifierAAAAAAAAAAAAAAAAAAAA";
+    const DST: &str = "1DestinationDocumentIdentifierBBBBBBBBBBBBBBB";
+
+    let mut links = Vec::new();
+    let mut seq = 0;
+    for row in 2..=4 {
+        for col in ["A", "B"] {
+            seq += 1;
+            links.push(SourceLink {
+                seq,
+                source_document: SRC.to_string(),
+                source_cell: format!("{col}{row}"),
+                destination_document: DST.to_string(),
+                destination_cell: format!("{col}{row}"),
+            });
+        }
+    }
+    let state = app.state::<AppState>();
+    let mut pending = state.pending_links.lock().expect("pending_links lock");
+    *pending = Some(links);
+}
+
+/// What the database records about a playbook's template decision.
+fn template_row(app: &App<MockRuntime>, id: &str) -> (String, Option<String>) {
+    let state = app.state::<AppState>();
+    let conn = state.db.blocking_lock();
+    conn.query_row(
+        "SELECT template_state, template_declined_at FROM playbooks WHERE id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .expect("read the template columns back")
+}
+
+/// Declining an offered pattern must not look like never being offered one.
+///
+/// Driven over the real IPC boundary rather than by calling the library,
+/// because the fact under test is produced by `compile_and_store_playbook`
+/// itself: it recomputes whether a proposal existed from the same pending links
+/// the review screen used. A library-level test would assert the storage layer
+/// and skip the only new decision in the chain.
+#[test]
+fn a_declined_pattern_is_stored_differently_from_one_never_offered() {
+    let (app, _dir) = mock_app();
+    let webview = webview(&app);
+
+    // 1. A session that DID produce a proposal, answered with "no".
+    //    `confirmTemplate` is omitted exactly as the frontend omits it when the
+    //    checkbox is left unticked.
+    seed_pending(&app, &["One", "Two", "Three"]);
+    seed_pending_links(&app);
+    let declined = compile(&webview, "Said no to the pattern", None).expect("store declined");
+    let declined_id = declined["playbook_id"].as_str().expect("playbook_id").to_string();
+
+    // 2. A session with no links at all -- nothing was ever detected, so
+    //    nothing was ever offered.
+    {
+        let state = app.state::<AppState>();
+        let mut pending = state.pending_links.lock().expect("pending_links lock");
+        *pending = None;
+    }
+    seed_pending(&app, &["One", "Two", "Three"]);
+    let plain = compile(&webview, "Never offered anything", None).expect("store plain");
+    let plain_id = plain["playbook_id"].as_str().expect("playbook_id").to_string();
+
+    let (declined_state, declined_at) = template_row(&app, &declined_id);
+    let (plain_state, plain_at) = template_row(&app, &plain_id);
+
+    // Both are ordinary playbooks. §4.10: declining leaves "an ordinary
+    // one-shot playbook, unaffected", so nothing about the lifecycle moved.
+    assert_eq!(declined_state, "none", "declining must not change template_state");
+    assert_eq!(plain_state, "none");
+
+    // But they are no longer the same row, which is the entire point.
+    assert!(
+        declined_at.is_some(),
+        "a pattern was offered and refused; that has to be recorded, or \"why isn't \
+         this repeating?\" has no answer"
+    );
+    assert_eq!(
+        plain_at, None,
+        "nothing was offered here, so there is no refusal to record"
+    );
+
+    // And the list -- where a user actually meets this -- carries the
+    // difference through to the frontend.
+    let listed = invoke(&webview, "list_playbooks", InvokeBody::Json(serde_json::json!({})))
+        .expect("list_playbooks")
+        .deserialize::<serde_json::Value>()
+        .expect("deserialize list");
+    let row = |id: &str| -> serde_json::Value {
+        listed
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap_or_else(|| panic!("{id} listed"))
+            .clone()
+    };
+    assert_eq!(row(&declined_id)["is_templated"], false);
+    assert_eq!(row(&declined_id)["template_declined"], true);
+    assert_eq!(row(&plain_id)["template_declined"], false);
+}

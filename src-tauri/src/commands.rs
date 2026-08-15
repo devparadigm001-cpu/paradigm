@@ -125,6 +125,13 @@ pub struct PlaybookSummaryView {
     /// and offer the batch check. Section 6 reuses this list rather than
     /// adding a parallel screen, so it has to be able to tell them apart.
     pub is_templated: bool,
+    /// A repeating pattern was offered for this recording and the user declined
+    /// it. Only ever true when `is_templated` is false.
+    ///
+    /// The list needs it to answer "why isn't this one repeating?", which had no
+    /// answer before: a declined recording and one where detection found
+    /// nothing produced identical rows.
+    pub template_declined: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -487,6 +494,20 @@ pub async fn compile_and_store_playbook(
     let playbook = if confirm_template.unwrap_or(false) {
         let template = confirmed_template(&state)?;
         playbook.with_template(template)
+    } else if was_offered_a_template(&state) {
+        // Said no to something real. Recorded so that a later "why isn't this
+        // repeating?" has the honest answer -- previously this row was
+        // indistinguishable from a recording where detection found nothing, and
+        // `no_template_reason` cannot fill the gap: it is only ever set when
+        // there was no pattern, so it is silent by construction in exactly this
+        // case.
+        //
+        // Recomputed from the same pending links `confirmed_template` uses,
+        // rather than trusting a new flag from the caller. The frontend shows
+        // the proposal if and only if `propose_template` returned one, so this
+        // reproduces what was actually on screen instead of asking the UI to
+        // report on itself.
+        playbook.with_declined_template()
     } else {
         playbook
     };
@@ -572,6 +593,28 @@ pub async fn compile_and_store_playbook(
 /// "C -> B" because that carries no meaning to judge, so it would produce a
 /// guaranteed non-answer wearing the appearance of a check. The verification
 /// belongs where a reader is open on the source -- §4.3's first-record preview.
+/// Was the user actually shown a repeating-pattern proposal for this recording?
+///
+/// Answers the question the way the review screen answered it: `stop_record_session`
+/// offers a proposal exactly when [`propose_template`] returns one, so running
+/// the same function over the same pending links reproduces what was on screen.
+///
+/// Never an error. A missing or unusable session means no proposal was shown,
+/// which is a `false` rather than a failure -- this only ever decides whether to
+/// record an extra fact, and refusing to store a playbook because that fact
+/// could not be determined would be wildly out of proportion.
+fn was_offered_a_template(state: &State<'_, AppState>) -> bool {
+    let Ok(links) = state.pending_links.lock() else {
+        return false;
+    };
+    let Some(links) = links.as_deref() else {
+        return false;
+    };
+    // `pastes_observed` only affects the WORDING of a refusal, never whether a
+    // proposal exists, so 0 is safe here and avoids threading it through state.
+    propose_template(links, 0).0.is_some()
+}
+
 fn confirmed_template(state: &State<'_, AppState>) -> Result<CompiledTemplate, String> {
     let links = state.pending_links.lock().map_err(|e| e.to_string())?;
     let links = links
@@ -1636,6 +1679,7 @@ pub async fn list_playbooks(
             step_count: p.step_count,
             irreversible_count: p.irreversible_count,
             is_templated: p.is_templated,
+            template_declined: p.template_declined,
         })
         .collect())
 }
@@ -2112,8 +2156,52 @@ mod tests {
             step_count: 3,
             irreversible_count: 0,
             is_templated: true,
+            template_declined: false,
         };
         let v = serde_json::to_value(&view).expect("serialise");
         assert_eq!(v["is_templated"], true);
+    }
+
+    #[test]
+    fn a_declined_proposal_is_distinguishable_from_no_proposal() {
+        // The whole point of the field. Both of these are ordinary playbooks --
+        // `is_templated` is false for each -- and before this they were the
+        // same row, so "you were asked and said no" was unanswerable.
+        let declined = PlaybookSummaryView {
+            id: "pb".into(),
+            name: "Invoices".into(),
+            source: "record_mode".into(),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            step_count: 3,
+            irreversible_count: 0,
+            is_templated: false,
+            template_declined: true,
+        };
+        let never_offered = PlaybookSummaryView {
+            template_declined: false,
+            ..PlaybookSummaryView {
+                id: "pb2".into(),
+                name: "Invoices".into(),
+                source: "record_mode".into(),
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                step_count: 3,
+                irreversible_count: 0,
+                is_templated: false,
+                template_declined: true,
+            }
+        };
+
+        let a = serde_json::to_value(&declined).expect("serialise");
+        let b = serde_json::to_value(&never_offered).expect("serialise");
+        assert_eq!(a["is_templated"], false, "a declined playbook is not templated");
+        assert_eq!(b["is_templated"], false);
+        assert_eq!(a["template_declined"], true);
+        assert_eq!(b["template_declined"], false);
+        assert_ne!(
+            a["template_declined"], b["template_declined"],
+            "the two ways of being an ordinary playbook must not look identical"
+        );
     }
 }

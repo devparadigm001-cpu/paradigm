@@ -96,6 +96,16 @@ pub struct CompiledPlaybook {
     /// existing compile path is additive-only and cannot acquire a template by
     /// accident.
     pub template: Option<CompiledTemplate>,
+    /// A repeating pattern was detected and offered, and the user said no.
+    ///
+    /// Distinct from `template: None`, which it accompanies rather than
+    /// replaces. Both mean "not a repeating workflow", and every code path that
+    /// asks that question keeps getting the same answer -- §4.10 wants a
+    /// declined proposal to leave "an ordinary one-shot playbook, unaffected".
+    /// What this adds is the ability to answer a DIFFERENT question later: was
+    /// one ever offered? Without it, "you were asked and said no" and "nothing
+    /// was ever found" are the same row.
+    pub declined_template: bool,
 }
 
 impl CompiledPlaybook {
@@ -104,6 +114,17 @@ impl CompiledPlaybook {
     /// during recording -- additive to the existing schema, not a replacement."
     pub fn with_template(mut self, template: CompiledTemplate) -> Self {
         self.template = Some(template);
+        self
+    }
+
+    /// Record that a pattern was offered and refused.
+    ///
+    /// Deliberately not the inverse of [`with_template`] and not exclusive with
+    /// it at the type level -- the database CHECK is what makes
+    /// confirmed-and-declined unrepresentable, in one place, rather than a rule
+    /// spread across every builder call.
+    pub fn with_declined_template(mut self) -> Self {
+        self.declined_template = true;
         self
     }
 
@@ -143,6 +164,10 @@ pub fn compile(
         // afterwards, so this function behaves exactly as it did before
         // templated workflows existed.
         template: None,
+        // Both defaults say the same thing: `compile` produces an ordinary
+        // playbook and nothing else. Whether a pattern was offered is a fact
+        // about the review that follows, so it is attached afterwards.
+        declined_template: false,
     }
 }
 

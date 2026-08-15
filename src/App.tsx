@@ -151,6 +151,20 @@ function StoredPlaybooksSection({
                       ↻ repeating
                     </span>
                   ) : null}
+                  {/* The other way a playbook ends up ordinary: a pattern WAS
+                      found and offered, and the user said no. Marked quietly
+                      and only here, because it changes nothing about what this
+                      playbook does -- it exists so "why isn't this repeating?"
+                      has an answer, which it did not when a declined recording
+                      and one where detection found nothing were the same row. */}
+                  {!playbook.is_templated && playbook.template_declined ? (
+                    <span
+                      className="text-muted-foreground rounded border px-1.5 py-0.5 text-[10px] font-medium"
+                      title="A repeating pattern was found for this recording and you declined it. Record it again to be asked."
+                    >
+                      pattern declined
+                    </span>
+                  ) : null}
                 </p>
                 <p className="text-muted-foreground text-xs">
                   {playbook.step_count} step{playbook.step_count === 1 ? "" : "s"}{" "}

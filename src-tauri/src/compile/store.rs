@@ -48,10 +48,25 @@ pub fn store(conn: &mut Connection, playbook: &CompiledPlaybook) -> Result<(), S
     } else {
         "none"
     };
+    // A declined proposal is recorded on the same row and in the same clock as
+    // a confirmed one. It does NOT move `template_state`: to every existing
+    // reader this playbook is 'none', which is exactly what §4.10 asks for --
+    // declining leaves "an ordinary one-shot playbook, unaffected". The column
+    // only lets a later reader tell "asked and refused" from "never asked",
+    // which were previously the same row.
+    //
+    // A template that IS attached wins outright: the CHECK forbids the pair,
+    // and a caller that somehow set both has contradicted itself rather than
+    // described a real state.
+    let declined = playbook.declined_template && playbook.template.is_none();
     tx.execute(
-        "INSERT INTO playbooks (id, name, source, template_state, template_confirmed_at)
+        "INSERT INTO playbooks
+             (id, name, source, template_state, template_confirmed_at, template_declined_at)
          VALUES (?1, ?2, ?3, ?4,
                  CASE WHEN ?4 = 'confirmed'
+                      THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                      ELSE NULL END,
+                 CASE WHEN ?5
                       THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                       ELSE NULL END)",
         (
@@ -59,6 +74,7 @@ pub fn store(conn: &mut Connection, playbook: &CompiledPlaybook) -> Result<(), S
             &playbook.name,
             &playbook.source,
             template_state,
+            declined,
         ),
     )?;
 
@@ -206,6 +222,15 @@ pub struct PlaybookSummary {
     /// caller can act on is confirmed-or-not, and a tri-state would invite
     /// handling a case that cannot occur.
     pub is_templated: bool,
+    /// A repeating pattern was offered for this recording and refused.
+    ///
+    /// Only ever true alongside `is_templated == false`; the schema forbids the
+    /// pair. It exists so the list can distinguish the two ways a playbook ends
+    /// up ordinary -- nobody found a pattern, or the user was shown one and
+    /// said no. Those were previously the same row, so the honest answer to
+    /// "why isn't this repeating?" was unavailable in exactly the case where
+    /// there was one.
+    pub template_declined: bool,
 }
 
 /// Every stored playbook, newest first. No pagination in Phase 1.
@@ -215,12 +240,14 @@ pub fn list(conn: &Connection) -> Result<Vec<PlaybookSummary>, DbError> {
                 (SELECT COUNT(*) FROM playbook_steps s WHERE s.playbook_id = p.id),
                 (SELECT COUNT(*) FROM playbook_steps s
                   WHERE s.playbook_id = p.id AND s.reversible = 0),
-                p.template_state
+                p.template_state,
+                p.template_declined_at
            FROM playbooks p
           ORDER BY p.created_at DESC, p.id",
     )?;
     let rows = stmt.query_map([], |r| {
         let state: String = r.get(7)?;
+        let declined_at: Option<String> = r.get(8)?;
         Ok(PlaybookSummary {
             id: r.get(0)?,
             name: r.get(1)?,
@@ -230,6 +257,7 @@ pub fn list(conn: &Connection) -> Result<Vec<PlaybookSummary>, DbError> {
             step_count: r.get(5)?,
             irreversible_count: r.get(6)?,
             is_templated: state == "confirmed",
+            template_declined: declined_at.is_some(),
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -594,6 +622,96 @@ mod tests {
             assert!(payload["target"]["selector"].is_string());
             assert_eq!(payload["target"]["raw_role"].as_str(), Some("Button"));
         }
+    }
+
+    /// The two ways of being an ordinary playbook must not look the same.
+    ///
+    /// Before this, declining an offered pattern and never being offered one
+    /// produced byte-identical rows, so the answer to "why isn't this
+    /// repeating?" did not exist in the one case where there was one.
+    #[test]
+    fn a_declined_proposal_is_stored_distinguishably_from_never_offered() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut conn = scratch_db(&dir);
+
+        let declined = compile(
+            &clicks(&["One", "Two"]),
+            "Said no",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        )
+        .with_declined_template();
+        let never_asked = compile(
+            &clicks(&["One", "Two"]),
+            "Never asked",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        );
+        store(&mut conn, &declined).expect("store declined");
+        store(&mut conn, &never_asked).expect("store plain");
+
+        let read = |id: &str| -> (String, Option<String>) {
+            conn.query_row(
+                "SELECT template_state, template_declined_at FROM playbooks WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("read back")
+        };
+
+        // Both are ordinary. §4.10: declining leaves "an ordinary one-shot
+        // playbook, unaffected" -- so every existing reader must still see
+        // 'none', and the new fact must not have leaked into the lifecycle.
+        let (d_state, d_at) = read(&declined.id);
+        let (n_state, n_at) = read(&never_asked.id);
+        assert_eq!(d_state, "none", "declining must not change template_state");
+        assert_eq!(n_state, "none");
+
+        // But they are no longer the same row.
+        assert!(d_at.is_some(), "a declined proposal must be recorded");
+        assert_eq!(n_at, None, "a recording nobody was asked about records nothing");
+
+        // And the list surfaces the difference, which is where a user meets it.
+        let listed = list(&conn).expect("list");
+        let of = |name: &str| {
+            listed
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} listed"))
+        };
+        assert!(!of("Said no").is_templated);
+        assert!(of("Said no").template_declined);
+        assert!(!of("Never asked").template_declined);
+    }
+
+    /// Confirmed and declined are mutually exclusive, structurally.
+    #[test]
+    fn a_confirmed_template_is_never_also_recorded_as_declined() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut conn = scratch_db(&dir);
+
+        // A caller that sets both has contradicted itself. The template wins
+        // and the decline is dropped, rather than the row being rejected --
+        // and the CHECK would have refused it outright had it been written.
+        let both = compile(
+            &clicks(&["One"]),
+            "Contradictory",
+            &ReversibilityPolicy::placeholder(),
+            &RedactionPolicy::placeholder(),
+        )
+        .with_template(template())
+        .with_declined_template();
+        store(&mut conn, &both).expect("store must not reject a contradictory caller");
+
+        let (state, declined_at): (String, Option<String>) = conn
+            .query_row(
+                "SELECT template_state, template_declined_at FROM playbooks WHERE id = ?1",
+                [&both.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("read back");
+        assert_eq!(state, "confirmed");
+        assert_eq!(declined_at, None, "a confirmed workflow was not declined");
     }
 
     #[test]
