@@ -282,6 +282,28 @@ impl SpreadsheetReader {
                 reason: format!("could not address the Name Box: {e}"),
             }
         })?;
+        // `press_key` is NOT just a keystroke. Its default is
+        // `press_key(key, try_focus_before = true, try_click_before = true)`,
+        // so every call performs a real mouse CLICK on the element first.
+        // Nothing at the call site says so, and it is why a user watching a
+        // scan sees the app clicking once per cell read.
+        //
+        // Dropping that click was tried and REVERTED, because it is measurably
+        // worse. The only public way to control the flag is
+        // `press_key_with_state_and_focus`, whose state tracking costs more
+        // than the click saves -- measured on the same sheet, same 12 rows:
+        //
+        //     press_key (clicks)                    23.45s   0.977s/cell
+        //     press_key_with_state_and_focus        28.46s   1.186s/cell
+        //
+        // The click is also not where the time goes. `NAVIGATE_SETTLE` below is
+        // 900ms of the 977ms, so the sleep is ~92% of a cell read and no
+        // change to the keypress can matter much beside it. Anything aimed at
+        // scan speed belongs there -- but that constant is a correctness
+        // control, not a comfort margin: it is how long navigation is given to
+        // land before the formula bar is believed, and shortening it risks
+        // reading the PREVIOUS cell's value, which is the failure this module
+        // exists to prevent.
         self.name_box
             .press_key("{Enter}")
             .map_err(|e| SourceError::Unreadable {

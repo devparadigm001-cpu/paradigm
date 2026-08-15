@@ -12063,6 +12063,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "clearscratch") {
         return clearscratch_mode().await;
     }
+    if std::env::args().any(|a| a == "scantime") {
+        return scantime_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -16989,4 +16992,182 @@ async fn renamedoc_mode() -> ExitCode {
         eprintln!("  the window title did not change; the rename did not take");
         ExitCode::FAILURE
     }
+}
+
+// ------------------------------------------------------- scantime mode ----
+// How long does a scan actually take, and where does the time go?
+//
+// Times the scan's real inner loop -- `peek` then `advance`, the same two calls
+// `run::batch::scan_with_limit` makes -- against a live sheet, so a performance
+// claim about scanning is measured rather than asserted.
+//
+// Reports per-cell as well as per-row, because the cost is per CELL: `read_row`
+// calls `read_cell` once per mapped field and each of those is a full Name Box
+// navigation.
+//
+// Usage: text_capture_probe scantime [rows]      (default 12)
+//   Needs PARADIGM_SCRATCH_DOC, and seeds the sheet if it is empty.
+// ---------------------------------------------------------------------------
+
+async fn scantime_mode() -> ExitCode {
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::DestinationWriter;
+    use paradigm_lib::source::{Advance, FieldRef, SourceReader};
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+
+    let rows: u64 = std::env::args()
+        .skip(1)
+        .find_map(|a| a.parse::<u64>().ok())
+        .unwrap_or(12);
+
+    println!("== scantime: the real cost of one scan ==");
+    println!("rows to walk: {rows}\n");
+
+    let url = scratch_url();
+    if !url.contains("/spreadsheets/d/") {
+        eprintln!("set PARADIGM_SCRATCH_DOC -- this must run twice on the SAME sheet");
+        eprintln!("for a before/after comparison to mean anything.");
+        return ExitCode::FAILURE;
+    }
+    let browser = "msedge";
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", url.as_str()])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut found = None;
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if let Some(w) = sheets_window(&desktop).await {
+            found = Some(w);
+            break;
+        }
+    }
+    let Some((_, doc_id)) = found else {
+        eprintln!("no spreadsheet window");
+        return ExitCode::FAILURE;
+    };
+    println!("doc: {doc_id}\n");
+
+    // Seed only if empty, so a second run measures the same sheet rather than
+    // re-seeding it and changing what is being compared.
+    let already = download_csv(browser, &doc_id, "0")
+        .await
+        .map(|csv| !csv_at(&csv, 1, 2).unwrap_or_default().trim().is_empty())
+        .unwrap_or(false);
+    if already {
+        println!("-- already seeded, leaving it alone --\n");
+    } else {
+        println!("-- seeding {rows} rows x 2 columns --");
+        let Some((window, _)) = sheets_window(&desktop).await else {
+            eprintln!("lost the window");
+            return ExitCode::FAILURE;
+        };
+        let Ok(mut w) =
+            SpreadsheetWriter::open(desktop.clone(), &window, doc_id.clone(), None, 1).await
+        else {
+            eprintln!("writer failed");
+            return ExitCode::FAILURE;
+        };
+        if w.write("A", "Customer").is_err() || w.write("B", "Amount").is_err() {
+            eprintln!("headers failed");
+            return ExitCode::FAILURE;
+        }
+        let _ = w.advance(1);
+        for i in 1..=rows {
+            if w.write("A", &format!("Cust{i}")).is_err()
+                || w.write("B", &format!("{}", i * 100)).is_err()
+            {
+                eprintln!("seeding row {i} failed");
+                return ExitCode::FAILURE;
+            }
+            let _ = w.advance(1);
+        }
+        println!("   seeded\n");
+    }
+
+    // ---- the measurement ----------------------------------------------------
+    let Some((window, _)) = sheets_window(&desktop).await else {
+        eprintln!("lost the window");
+        return ExitCode::FAILURE;
+    };
+    let Ok(mut reader) =
+        SpreadsheetReader::open(desktop.clone(), &window, doc_id.clone(), None, 2, 1, vec![
+            "A".to_string(),
+            "B".to_string(),
+        ])
+        .await
+    else {
+        eprintln!("reader failed");
+        return ExitCode::FAILURE;
+    };
+
+    let fields = vec![
+        FieldRef { name: "A".into(), locator: "A".into() },
+        FieldRef { name: "B".into(), locator: "B".into() },
+    ];
+
+    println!("-- walking {rows} rows through peek + advance --");
+    let started = std::time::Instant::now();
+    let mut walked = 0u64;
+    let mut per_row = Vec::new();
+    for _ in 0..rows {
+        let row_started = std::time::Instant::now();
+        match reader.peek(&fields) {
+            Ok(Advance::Record) => {}
+            Ok(Advance::Exhausted) => {
+                println!("   source exhausted after {walked} row(s)");
+                break;
+            }
+            Ok(other) => {
+                println!("   stopped: {other:?} after {walked} row(s)");
+                break;
+            }
+            Err(e) => {
+                println!("   READ FAILED after {walked} row(s): {e}");
+                println!("   (a PositionLost here is the stale-Name-Box symptom)");
+                break;
+            }
+        }
+        if reader.advance().is_err() {
+            break;
+        }
+        walked += 1;
+        per_row.push(row_started.elapsed());
+    }
+    let total = started.elapsed();
+
+    let cells = walked * fields.len() as u64;
+    println!("\n== RESULT ==");
+    println!("  rows walked      : {walked}");
+    println!("  cells read       : {cells}   (one Name Box navigation each)");
+    println!("  total            : {:.2}s", total.as_secs_f64());
+    if walked > 0 {
+        println!(
+            "  per row          : {:.2}s",
+            total.as_secs_f64() / walked as f64
+        );
+        println!(
+            "  per cell         : {:.3}s",
+            total.as_secs_f64() / cells.max(1) as f64
+        );
+    }
+    if let (Some(first), Some(last)) = (per_row.first(), per_row.last()) {
+        println!(
+            "  first row {:.2}s, last row {:.2}s",
+            first.as_secs_f64(),
+            last.as_secs_f64()
+        );
+    }
+    println!("\n  doc: {doc_id}");
+    ExitCode::SUCCESS
 }
