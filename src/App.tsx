@@ -445,7 +445,9 @@ function MainWindowView() {
             void workflowRun.openPreview(workflowRun.playbookId);
           }
         }}
-        onConfirmPreview={() => void workflowRun.confirmPreview()}
+        onConfirmPreview={(supervise) =>
+          void workflowRun.confirmPreview(supervise)
+        }
         onCancelPreview={() => void workflowRun.cancelPreview()}
         onPause={() => void workflowRun.pause()}
         onResume={() => void workflowRun.resume()}

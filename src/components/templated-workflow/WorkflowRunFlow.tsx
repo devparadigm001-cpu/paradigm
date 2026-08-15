@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import type {
   NewBatchView,
@@ -27,7 +28,7 @@ export function WorkflowRunFlow({
 }: {
   stage: WorkflowRunStage;
   onConfirmBatch: () => void;
-  onConfirmPreview: () => void;
+  onConfirmPreview: (supervise: boolean) => void;
   onCancelPreview: () => void;
   onPause: () => void;
   onResume: () => void;
@@ -249,9 +250,14 @@ function FirstRecordPreview({
   onCancel,
 }: {
   preview: PreviewView;
-  onConfirm: () => void;
+  onConfirm: (supervise: boolean) => void;
   onCancel: () => void;
 }) {
+  // §4.5's supervision, off unless asked for. Local to this card on purpose:
+  // it is a decision about ONE run, and the card is unmounted the moment that
+  // run starts, so there is no stale choice to carry into the next one.
+  const [supervise, setSupervise] = useState(false);
+
   return (
     <Card wide>
       <h2 className="text-sm font-semibold">
@@ -314,11 +320,31 @@ function FirstRecordPreview({
         {preview.verdict}
       </p>
 
+      {/* §4.5. Unchecked by default: the default behaviour is §4.4's, where an
+          incomplete record is written blank, logged, and the run carries on.
+          That is what makes walking away possible, so it is what happens
+          unless someone asks for otherwise. */}
+      <label className="mt-3 flex items-start gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={supervise}
+          onChange={(e) => setSupervise(e.target.checked)}
+          className="mt-0.5"
+        />
+        <span>
+          Pause and ask me about incomplete records
+          <span className="text-muted-foreground block text-xs">
+            Off by default: the run fills what it can, notes the rest, and keeps
+            going without you.
+          </span>
+        </span>
+      </label>
+
       <div className="mt-3 flex justify-end gap-2">
         <Button variant="outline" size="sm" onClick={onCancel}>
           Cancel
         </Button>
-        <Button size="sm" onClick={onConfirm}>
+        <Button size="sm" onClick={() => onConfirm(supervise)}>
           Looks right — run the rest
         </Button>
       </div>

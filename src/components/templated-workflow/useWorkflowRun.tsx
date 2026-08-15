@@ -167,14 +167,20 @@ export function useWorkflowRun() {
     }, POLL_MS);
   }, [stopPolling, showSummary]);
 
-  /** §4.3's "confirm". The only way into a run. */
-  const confirmPreview = useCallback(async () => {
+  /**
+   * §4.3's "confirm". The only way into a run.
+   *
+   * `supervise` comes from the preview card's checkbox and is **off** unless
+   * the user ticks it, per §4.5. It was briefly hardcoded to `true` so the
+   * correction panel would have a record to attach a one-off to, which made
+   * every run stop on the first incomplete record -- the opposite of this
+   * feature's point, which is that the user can walk away. A supervised run
+   * is a choice someone makes, not a default they discover.
+   */
+  const confirmPreview = useCallback(async (supervise: boolean) => {
     try {
       const status = await invoke<RunStatusView>("start_workflow_run", {
-        // §4.5: stop on an incomplete record so a one-off correction has
-        // something to attach to. Without this the panel can only ever offer
-        // the permanent scope.
-        supervise: true,
+        supervise,
       });
       setStage({ name: "running", status });
       pollStatus();

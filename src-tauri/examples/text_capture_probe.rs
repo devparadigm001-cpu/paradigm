@@ -1,4 +1,4 @@
-//! Investigate the text-input capture truncation defect.
+﻿//! Investigate the text-input capture truncation defect.
 //!
 //!     cargo run --example text_capture_probe
 //!
@@ -11996,6 +11996,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "editmode") {
         return editmode_mode().await;
     }
+    if std::env::args().any(|a| a == "cbdump") {
+        return cbdump_mode().await;
+    }
     if std::env::args().any(|a| a == "uicorrection") {
         return uicorrection_mode().await;
     }
@@ -15303,7 +15306,17 @@ async fn uicorrection_mode() -> ExitCode {
     use paradigm_lib::run::DestinationWriter;
 
     let permanent = std::env::args().any(|a| a == "permanent");
-    let scope = if permanent { "permanent" } else { "one-off" };
+    // `nosupervise` drives the DEFAULT path instead of the correction flow:
+    // checkbox left alone, §4.4's rule verified. That is what most users will
+    // get, so it needs a probe of its own rather than being the untested half.
+    let supervise = !std::env::args().any(|a| a == "nosupervise");
+    let scope = if !supervise {
+        "unsupervised (§4.4 default)"
+    } else if permanent {
+        "permanent"
+    } else {
+        "one-off"
+    };
     let data_dir = std::env::args()
         .find(|a| a.contains("paradigm-ui-test"))
         .unwrap_or_else(|| {
@@ -15529,10 +15542,122 @@ async fn uicorrection_mode() -> ExitCode {
         .into_iter()
         .find(|t| t.starts_with("Looks right"))
         .unwrap_or_else(|| "Looks right — run the rest".to_string());
-    println!("-- Confirm, run starts (supervised) --");
+    // §4.5 supervision is opt-in and OFF by default, so the supervised path has
+    // to ASK. It used to be hardcoded on in `confirmPreview`, which meant this
+    // probe passed without ever exercising the choice -- and every ordinary
+    // user got a run that stopped on incomplete records without asking for it.
+    //
+    // The unsupervised path deliberately does not click the box, only reads it:
+    // "the default is off" is the claim under test, so setting it would be
+    // assuming the thing to be proved.
+    if supervise {
+        println!("-- ticking 'Pause and ask me about incomplete records' --");
+        if let Err(e) = click_app_checkbox(&desktop, "Pause and ask me").await {
+            eprintln!("  {e}");
+            return ExitCode::FAILURE;
+        }
+    } else {
+        println!("-- leaving the checkbox alone --");
+        if !app_checkbox_present(&desktop, "Pause and ask me").await {
+            eprintln!("   no supervision checkbox on the preview card at all");
+            return ExitCode::FAILURE;
+        }
+        println!("   present, and deliberately not touched");
+    }
+
+    println!("-- Confirm, run starts ({scope}) --");
     if let Err(e) = click_app_button(&desktop, &confirm).await {
         eprintln!("  {e}");
         return ExitCode::FAILURE;
+    }
+
+    // ---- §4.4's default: no pause, blank written, logged, run continues -----
+    //
+    // The half most users will actually see. §4.4: "continue, because a blank
+    // cell is reversible -- but log it clearly for the summary. Never silently
+    // skip without recording that it happened." All three clauses are checked:
+    // the run does not stop, the blank IS written (row 3 keeps its amount), and
+    // the summary names the record rather than passing over it.
+    if !supervise {
+        println!("\n-- the run should NOT pause; waiting for it to finish --");
+        let summary = match wait_for_text(&desktop, "Processed", 300).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("  the run never finished.\n{e}");
+                let screen = app_text(&desktop).await.join(" | ");
+                if screen.contains("has nothing in") {
+                    eprintln!("  it PAUSED on the incomplete record with supervision off.");
+                }
+                return ExitCode::FAILURE;
+            }
+        };
+        println!("  summary: {summary:?}");
+        let screen = app_text(&desktop).await.join(" | ");
+        println!("  screen: {screen}");
+
+        // Never paused. Checked against the screen rather than inferred from
+        // having reached a summary: a run that paused, was somehow resumed and
+        // then finished would otherwise look identical here.
+        let never_paused = !screen.contains("Point at the right column");
+        println!("  never offered a correction: {never_paused}");
+
+        // §4.4's "log it clearly". The wording comes from the summary card:
+        // "row 3 -> destination row 3 -- nothing in C, written blank".
+        let logged = screen.contains("flagged for review")
+            && screen.contains("written blank")
+            && screen.contains("C");
+        println!("  logged the incomplete record: {logged}");
+
+        println!("\n-- CSV ground truth --");
+        let Some(csv) = download_csv(browser, &doc_id, &gid2).await else {
+            eprintln!("could not download Sheet2");
+            return ExitCode::FAILURE;
+        };
+        println!("{}", csv.trim());
+
+        // Row 3 is the incomplete one: A blank because source C was blank, B
+        // still 200 because D was present. A run that skipped the record would
+        // leave B3 empty too, and one that shifted would put Initech there --
+        // so this single row separates "wrote it blank" from both failures.
+        let expected: [(usize, &str, &str); 4] = [
+            (2, "Acme", "100"),
+            (3, "", "200"),
+            (4, "Initech", "300"),
+            (5, "Umbrella", "400"),
+        ];
+        let mut rows_ok = true;
+        for (row, a_want, b_want) in expected {
+            let a = csv_at(&csv, 1, row).unwrap_or_default();
+            let b = csv_at(&csv, 2, row).unwrap_or_default();
+            let good = a.trim() == a_want && b.trim() == b_want;
+            let note = if row == 3 {
+                "incomplete: written blank, not skipped"
+            } else {
+                "complete"
+            };
+            println!(
+                "  A{row}={a:?} B{row}={b:?}  expected {a_want:?}/{b_want:?} ({note})  {}",
+                if good { "OK" } else { "WRONG" }
+            );
+            rows_ok &= good;
+        }
+
+        let _ = click_app_button(&desktop, "Close").await;
+        println!("\n  doc id for cleanup: {doc_id}");
+        let pass = never_paused && logged && rows_ok;
+        println!(
+            "\n{}",
+            if pass {
+                "PASS -- §4.4's default: blank written, logged, run continued, no pause"
+            } else {
+                "FAIL -- see above"
+            }
+        );
+        return if pass {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
     }
 
     // ---- the pause §4.5 needs ----------------------------------------------
@@ -16234,4 +16359,203 @@ mod csv_tests {
     fn a_row_past_the_end_is_none() {
         assert!(csv_at("a,b\n", 1, 9).is_none());
     }
+}
+
+/// Click a checkbox in the app window exactly once.
+///
+/// ## Why this does not verify the state it just set
+///
+/// It cannot. Measured on this app's own preview card: `is_toggled()` returns
+/// `false` for the supervision checkbox no matter what has been done to it --
+/// after `set_toggled(true)`, after `click()`, after focus-and-Space. The same
+/// run then paused on the incomplete record, which only a SUPERVISED run does,
+/// so the control had plainly been switched on while the property still said
+/// off. WebView2 exposes the node (`role:CheckBox`, correct name, real bounds,
+/// enabled, visible) without exposing a usable toggle state.
+///
+/// The first version cascaded through set_toggled -> invoke -> click -> Space,
+/// stopping when `is_toggled` agreed. Since it never agreed, it ran all four,
+/// and three of them actually worked -- so the box was toggled an odd number of
+/// times and landed ON by arithmetic rather than by intent. It passed, and the
+/// pass meant nothing.
+///
+/// So: one click, no retries, no state check. Whether it worked is decided by
+/// what the run then does -- pausing on an incomplete record is behaviour only
+/// a supervised run produces, and no misreported property can fake it. That is
+/// the same rule `click_and_wait` follows for buttons: check the effect, not
+/// the mechanism.
+async fn click_app_checkbox(desktop: &Desktop, name_starts_with: &str) -> Result<(), String> {
+    let find = || async {
+        let windows = desktop
+            .locator("role:Window")
+            .within(desktop.root())
+            .all(Some(Duration::from_secs(8)), Some(3))
+            .await
+            .ok()?;
+        let window = windows
+            .into_iter()
+            .find(|w| w.name().unwrap_or_default().trim() == "Paradigm")?;
+        desktop
+            .locator("role:CheckBox")
+            .within(window)
+            .all(Some(Duration::from_secs(6)), None)
+            .await
+            .ok()?
+            .into_iter()
+            .find(|c| {
+                c.name()
+                    .unwrap_or_default()
+                    .trim()
+                    .starts_with(name_starts_with)
+            })
+    };
+
+    let el = find()
+        .await
+        .ok_or_else(|| format!("no checkbox starting {name_starts_with:?} in the app window"))?;
+
+    // Foreground first. Measured: click() on this checkbox returned Ok against
+    // a background window and nothing happened -- the same "delivery is not
+    // reaction" gap click_and_wait activates for.
+    if let Some(w) = app_window(desktop).await {
+        let _ = w.activate_window();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    el.click()
+        .map_err(|e| format!("clicking the checkbox failed: {e}"))?;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    println!("   clicked {name_starts_with:?} once");
+    Ok(())
+}
+/// Is the checkbox on screen at all?
+///
+/// Presence only, deliberately. The obvious version of this returned
+/// `is_toggled()` so the unsupervised probe could assert "the default is off"
+/// -- but `is_toggled` reads `false` for this control in every state (see
+/// [`click_app_checkbox`]), so that assertion could not have failed. It was a
+/// check that always passed, sitting in front of the exact behaviour it was
+/// supposed to be guarding, which is worse than having no check at all.
+///
+/// What proves the default is the PAIR of runs: leave it alone and the run must
+/// write blank and carry on; click it once and the same run must pause. Only
+/// one thing differs between them, and neither outcome can be produced by a
+/// misreported property. Presence is still worth asserting -- a checkbox that
+/// silently stopped rendering would otherwise look exactly like a working
+/// default.
+async fn app_checkbox_present(desktop: &Desktop, name_starts_with: &str) -> bool {
+    let Some(window) = app_window(desktop).await else {
+        return false;
+    };
+    desktop
+        .locator("role:CheckBox")
+        .within(window)
+        .all(Some(Duration::from_secs(6)), None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .any(|c| {
+            c.name()
+                .unwrap_or_default()
+                .trim()
+                .starts_with(name_starts_with)
+        })
+}
+
+/// cbdump -- what does the app actually expose for its checkboxes?
+///
+/// Written when `set_toggled`, `invoke`, `click` and Space were all accepted on
+/// the supervision checkbox and none of them changed `is_toggled`. The answer
+/// was not that the element was wrong: the node is correct (`role:CheckBox`,
+/// right name, real 18x18 bounds, enabled, visible) and the clicks WORKED --
+/// the run went on to pause, which only a supervised run does. `is_toggled`
+/// simply does not reflect the state of a WebView2 checkbox. See
+/// `docs/known-issues/webview2-checkbox-toggle-state-not-exposed.md`.
+///
+/// Kept because it is the fastest way to ask the same question of the next
+/// webview control, and because the answer was the opposite of the obvious one.
+async fn cbdump_mode() -> ExitCode {
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = app_window(&desktop).await else {
+        eprintln!("the Paradigm window is not reachable");
+        return ExitCode::FAILURE;
+    };
+    let _ = window.activate_window();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    for role in ["role:CheckBox", "role:RadioButton", "role:Group"] {
+        let found = desktop
+            .locator(role)
+            .within(window.clone())
+            .all(Some(Duration::from_secs(6)), None)
+            .await
+            .unwrap_or_default();
+        println!("\n== {role}: {} node(s) ==", found.len());
+        for (i, el) in found.iter().enumerate() {
+            let name = el.name().unwrap_or_default();
+            if role == "role:Group" && !name.contains("Pause and ask") {
+                continue;
+            }
+            let bounds = el
+                .bounds()
+                .map(|(x, y, w, h)| format!("{x:.0},{y:.0} {w:.0}x{h:.0}"))
+                .unwrap_or_else(|_| "<none>".into());
+            println!(
+                "  #{i} name={:?}\n      toggled={:?} enabled={:?} visible={:?} bounds={bounds}",
+                name.chars().take(60).collect::<String>(),
+                el.is_toggled(),
+                el.is_enabled(),
+                el.is_visible(),
+            );
+        }
+    }
+
+    // The behavioural question: does a keyboard Space on the focused control
+    // move it, when the pattern-based routes did not?
+    println!("\n== keyboard attempt on the supervision checkbox ==");
+    let boxes = desktop
+        .locator("role:CheckBox")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(6)), None)
+        .await
+        .unwrap_or_default();
+    let Some(target) = boxes
+        .into_iter()
+        .find(|c| c.name().unwrap_or_default().starts_with("Pause and ask"))
+    else {
+        println!("  no supervision checkbox on screen -- is the preview card up?");
+        return ExitCode::SUCCESS;
+    };
+    println!("  before: {:?}", target.is_toggled());
+    match target.focus() {
+        Ok(()) => println!("  focused"),
+        Err(e) => println!("  focus failed: {e}"),
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    match desktop.focused_element() {
+        Ok(f) => println!("  focus landed on: {:?} / {:?}", f.role(), f.name()),
+        Err(e) => println!("  no focused element: {e}"),
+    }
+    if let Ok(f) = desktop.focused_element() {
+        let _ = f.press_key(" ");
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let after = desktop
+        .locator("role:CheckBox")
+        .within(window)
+        .all(Some(Duration::from_secs(6)), None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|c| c.name().unwrap_or_default().starts_with("Pause and ask"))
+        .map(|c| c.is_toggled());
+    println!("  after Space: {after:?}");
+    ExitCode::SUCCESS
 }
