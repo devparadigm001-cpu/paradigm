@@ -11999,6 +11999,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "cbdump") {
         return cbdump_mode().await;
     }
+    if std::env::args().any(|a| a == "menudump") {
+        return menudump_mode().await;
+    }
     if std::env::args().any(|a| a == "uicorrection") {
         return uicorrection_mode().await;
     }
@@ -16557,5 +16560,89 @@ async fn cbdump_mode() -> ExitCode {
         .find(|c| c.name().unwrap_or_default().starts_with("Pause and ask"))
         .map(|c| c.is_toggled());
     println!("  after Space: {after:?}");
+    ExitCode::SUCCESS
+}
+
+/// menudump -- what does an open Sheets window expose as menus?
+///
+/// `sheetstrash` looks for a `role:MenuItem` or `role:Button` named exactly
+/// "File" and refused on all ten scratch documents. Either the locator is
+/// stale or the menu bar is not in the tree until something touches it; this
+/// says which, instead of guessing at a new selector.
+async fn menudump_mode() -> ExitCode {
+    // The character test is not decoration: `argv[0]` is
+    // "target\debug\examples\text_capture_probe.exe", which is over 40 chars,
+    // and a length-only filter picked THAT as the document id and then spent a
+    // minute reporting that no window was showing it.
+    let Some(id) = std::env::args().skip(1).find(|a| {
+        a.len() >= 40
+            && a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }) else {
+        eprintln!("usage: text_capture_probe menudump <doc-id>");
+        return ExitCode::FAILURE;
+    };
+    let browser = "msedge";
+    let url = format!("https://docs.google.com/spreadsheets/d/{id}/edit");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", &url])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    println!("waiting for the document...");
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Retried rather than waited-once: a cold Sheets load is comfortably longer
+    // than any single sleep worth hardcoding, and the first attempt failing is
+    // not evidence the document is absent.
+    let mut window = None;
+    for attempt in 1..=6 {
+        if let Some(w) = window_for_doc(&desktop, &id).await {
+            window = Some(w);
+            break;
+        }
+        println!("   not up yet (attempt {attempt})");
+        tokio::time::sleep(Duration::from_secs(8)).await;
+    }
+    let Some(window) = window else {
+        println!("no window showing {id}");
+        return ExitCode::FAILURE;
+    };
+    let _ = window.activate_window();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    for role in [
+        "role:MenuItem",
+        "role:MenuBar",
+        "role:Menu",
+        "role:Button",
+        "role:PopupButton",
+    ] {
+        let found = desktop
+            .locator(role)
+            .within(window.clone())
+            .all(Some(Duration::from_secs(6)), None)
+            .await
+            .unwrap_or_default();
+        let names: Vec<String> = found
+            .iter()
+            .map(|e| e.name().unwrap_or_default())
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty() && n.len() < 40)
+            .take(40)
+            .collect();
+        println!("\n{role}: {} node(s)", found.len());
+        for n in names {
+            println!("   {n:?}");
+        }
+    }
     ExitCode::SUCCESS
 }
