@@ -7320,11 +7320,44 @@ async fn download_csv(browser: &str, doc_id: &str, gid: &str) -> Option<String> 
         tokio::time::sleep(Duration::from_secs(1)).await;
         if let Some((p, _)) = newest_csv() {
             if Some(&p) != before.as_ref() {
-                return std::fs::read_to_string(&p).ok();
+                let body = std::fs::read_to_string(&p).ok()?;
+                warn_if_quoted(&body);
+                return Some(body);
             }
         }
     }
     None
+}
+
+/// Say so, loudly, when an export contains a quoted field.
+///
+/// Every ground-truth check in this file reads cells through [`csv_at`], and
+/// `csv_at` used to split on `,` and `\n` with no quote awareness. A cell
+/// holding either one shifted every row below it, and the probe that found the
+/// open-editor defect reported "no value landed in the wrong cell" while its
+/// own export showed one -- see
+/// `docs/known-issues/an-open-cell-editor-turns-a-write-into-an-append.md`.
+///
+/// The parser is fixed. This guards the *class*, not that bug: a quoted field
+/// means a cell contains a comma, a quote or a newline, which is precisely when
+/// naive parsing and correct parsing diverge. Google's exporter quotes a field
+/// if and only if one of those is present, so a body with no `"` anywhere is
+/// parser-independent -- and every seeded value in this file is plain text, so
+/// a quote appearing at all means something unexpected reached a cell.
+///
+/// Printed rather than fatal. The reading is "look at this before believing the
+/// verdict", and a probe that aborts here would destroy the evidence it just
+/// downloaded.
+fn warn_if_quoted(body: &str) {
+    if !body.contains('"') {
+        return;
+    }
+    println!("  !! this export contains a quoted field -- a cell holds a comma,");
+    println!("  !! a quote, or a newline. No value seeded by this probe does.");
+    println!("  !! Read the raw body below before trusting any cell check above:");
+    for (i, line) in body.lines().take(12).enumerate() {
+        println!("  !!   {:>2}| {line}", i + 1);
+    }
 }
 
 async fn sheetsmulti_mode() -> ExitCode {
