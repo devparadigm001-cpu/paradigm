@@ -1,4 +1,4 @@
-//! Tauri commands: the frontend's entry point to the Phase 1 pipeline.
+﻿//! Tauri commands: the frontend's entry point to the Phase 1 pipeline.
 //!
 //! Wiring only. Every command here is a thin wrapper over functions already
 //! built and tested in Steps 3-6. No business logic lives in this file, and
@@ -308,13 +308,6 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
     let (template, no_template_reason) =
         propose_template(&report.source_links, report.pastes_observed);
 
-    // >>> TEMPORARY DEBUG AID -- remove once pattern detection is understood.
-    // Search for DETECT-DEBUG to find every line of it. stderr only: none of
-    // this is stored, and the source links it prints are transient by design
-    // (§3), which is exactly why they cannot be recovered afterwards.
-    debug_detection_inputs(&report, &template, &no_template_reason);
-    // <<< TEMPORARY DEBUG AID
-
     let policy = RedactionPolicy::placeholder();
     let summary = CaptureSummary {
         session_name: report.session_name.clone(),
@@ -335,76 +328,6 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
     *links = Some(report.source_links);
 
     Ok(summary)
-}
-
-/// DETECT-DEBUG: print what detection was given and what it concluded.
-///
-/// **Temporary.** Added because the inputs to detection are transient -- source
-/// links live in app state for the length of one compile decision and are never
-/// written anywhere -- so a recording that fails to produce a pattern leaves no
-/// evidence behind to diagnose. This is the only place that evidence exists.
-///
-/// stderr only, deliberately: printing it is a diagnostic, storing it would be
-/// a durable position-plus-content trail, which is the thing §3 refuses.
-///
-/// Delete this function and its one caller together; both are marked.
-fn debug_detection_inputs(
-    report: &crate::capture::CaptureReport,
-    template: &Option<TemplateProposal>,
-    reason: &Option<String>,
-) {
-    eprintln!("\n[DETECT-DEBUG] ---- pattern detection at stop ----");
-    eprintln!("[DETECT-DEBUG] actions captured : {}", report.actions.len());
-    eprintln!("[DETECT-DEBUG] pastes observed  : {}", report.pastes_observed);
-    eprintln!("[DETECT-DEBUG] source links     : {}", report.source_links.len());
-
-    if report.source_links.is_empty() && report.pastes_observed > 0 {
-        eprintln!(
-            "[DETECT-DEBUG]   -> pastes happened but NO links formed. A link needs a cell\n\
-             [DETECT-DEBUG]      position read at Ctrl+C AND at Ctrl+V; whichever end could\n\
-             [DETECT-DEBUG]      not be read is the one to look at."
-        );
-    }
-    for link in &report.source_links {
-        eprintln!(
-            "[DETECT-DEBUG]   #{:<3} {}!{}  ->  {}!{}",
-            link.seq,
-            link.source_document,
-            link.source_cell,
-            link.destination_document,
-            link.destination_cell
-        );
-    }
-
-    match detect::link::dominant_surfaces(&report.source_links) {
-        Some((source, destination)) => {
-            eprintln!("[DETECT-DEBUG] surfaces         : {source}  ->  {destination}");
-            let observations = detect::link::observations(&report.source_links);
-            eprintln!(
-                "[DETECT-DEBUG] usable positions : {} of {} links parsed",
-                observations.len(),
-                report.source_links.len()
-            );
-            eprintln!(
-                "[DETECT-DEBUG] detection said   : {:?}",
-                detect::detect(&observations, &source, &destination)
-            );
-        }
-        None => eprintln!("[DETECT-DEBUG] surfaces         : none resolvable"),
-    }
-
-    match (template, reason) {
-        (Some(t), _) => eprintln!(
-            "[DETECT-DEBUG] RESULT           : pattern offered, {} field(s), {} examples",
-            t.fields.len(),
-            t.examples
-        ),
-        (None, Some(r)) => eprintln!("[DETECT-DEBUG] RESULT           : no pattern -- {r}"),
-        (None, None) => eprintln!(
-            "[DETECT-DEBUG] RESULT           : no pattern, and NOTHING shown to the user"
-        ),
-    }
-    eprintln!("[DETECT-DEBUG] ----------------------------------------\n");
 }
 
 /// Run detection over a session's source links and describe the outcome.
