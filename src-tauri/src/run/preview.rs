@@ -591,3 +591,90 @@ mod tests {
         assert!(matches!(err, PreviewError::NoFields), "got {err:?}");
     }
 }
+
+/// Warn when a run is about to write over a destination it has never written.
+///
+/// ## The situation this catches
+///
+/// The ledger decides two things, and the second is easy to miss: which rows
+/// are new, and — through `batch::resume_destination_row` — **where the
+/// destination resumes**. That resume row is `first_row + processed * step`, so
+/// an empty ledger resumes at `first_row`: the TOP of the destination.
+///
+/// A workflow with an empty ledger is therefore not merely going to redo work.
+/// It is going to write over whatever is already there, from the beginning,
+/// and it will do so silently. Measured: two playbooks ran once each over the
+/// same five source rows into the same destination, and the destination
+/// afterwards held five rows, not ten. Ten writes, five rows, no duplicate to
+/// notice.
+///
+/// The common way to arrive here is not exotic. Re-recording a workflow makes a
+/// NEW workflow with a new id and an empty ledger, in the same list under a
+/// similar name — and deleting the old one takes its ledger with it, by design.
+/// It happened twice in one hour to the same user. See
+/// `docs/known-issues/deleting-a-workflow-silently-discards-its-ledger.md`.
+///
+/// ## Why BOTH conditions are required
+///
+/// An empty ledger alone is the normal state of every genuinely new workflow
+/// writing into a genuinely empty destination — warning there would fire on the
+/// happy path and teach the user to dismiss it. Occupied cells alone are normal
+/// too: a workflow that has processed rows before is *expected* to have filled
+/// its destination, and resumes past it.
+///
+/// Only the pair is suspicious: nothing recorded as done, yet something already
+/// written where this run is about to start.
+pub fn overwrite_warning(
+    processed: usize,
+    destination_row: u64,
+    occupied: &[String],
+) -> Option<String> {
+    if processed > 0 || occupied.is_empty() {
+        return None;
+    }
+    let cells = occupied
+        .iter()
+        .map(|c| format!("{c}{destination_row}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "This workflow has no record of processing anything, so it will start writing at row \
+         {destination_row} — but {cells} already contains data. If this workflow was recorded \
+         again, it starts over and will write OVER what is there rather than after it. Check \
+         the destination before confirming."
+    ))
+}
+
+#[cfg(test)]
+mod overwrite_tests {
+    use super::overwrite_warning;
+
+    /// The measured scenario: nothing in the ledger, data already at the target.
+    #[test]
+    fn an_empty_ledger_over_occupied_cells_warns() {
+        let warning = overwrite_warning(0, 2, &["A".into(), "B".into()])
+            .expect("this is the case the warning exists for");
+        assert!(warning.contains("A2, B2"), "it must name the cells: {warning}");
+        assert!(warning.contains("row 2"));
+        assert!(
+            warning.contains("OVER"),
+            "the overwrite is the point, not the redundant work: {warning}"
+        );
+    }
+
+    /// A genuinely new workflow writing into a genuinely empty destination is
+    /// the happy path, and must stay silent -- a warning here would fire on
+    /// every first run and train the user to ignore it.
+    #[test]
+    fn a_fresh_workflow_with_an_empty_destination_is_silent() {
+        assert_eq!(overwrite_warning(0, 2, &[]), None);
+    }
+
+    /// And a workflow that HAS processed rows is expected to have filled its
+    /// destination; it resumes past that, so occupied cells are not a signal.
+    #[test]
+    fn an_established_workflow_is_silent_even_over_occupied_cells() {
+        assert_eq!(overwrite_warning(5, 7, &["A".into()]), None);
+        assert_eq!(overwrite_warning(1, 3, &["A".into(), "B".into()]), None);
+    }
+}

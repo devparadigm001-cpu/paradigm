@@ -921,6 +921,18 @@ pub struct PreviewView {
     /// nonsense, so this informs the user rather than deciding for them.
     pub verdict: String,
     pub verdict_is_reassuring: bool,
+    /// Set when this run would write OVER data already in the destination.
+    ///
+    /// Only ever present when the workflow's ledger is empty AND the row it
+    /// would start at already holds something — the signature of a re-recorded
+    /// workflow resuming at the top instead of after its previous output.
+    /// `None` on every ordinary run, so §4.9's quiet-by-default holds.
+    ///
+    /// Deliberately separate from `verdict`, which is the model's advisory read
+    /// on whether the MAPPING makes sense. This is a fact about the
+    /// destination, established by reading it, and folding the two together
+    /// would put a measured statement behind a hedge that belongs to a guess.
+    pub overwrite_warning: Option<String>,
 }
 
 /// Nothing to preview, and why. §4.8's "nothing new" is an answer, not a fault.
@@ -1048,6 +1060,16 @@ pub async fn preview_workflow_run(
     // Header rows first: the verdict needs words, not column letters, and the
     // preview shows the user which column is which.
     let source_shape = reader.shape().map_err(|e| e.to_string())?;
+    // How many rows this workflow has on record. Zero means it has never
+    // written anything — which is what turns an occupied destination row from
+    // the ordinary state of a workflow mid-way through into a warning.
+    let processed_so_far = {
+        let conn = state.db.lock().await;
+        run::processed_count(&conn, &playbook_id, &template.source_id).unwrap_or(0)
+    };
+    // Filled while the destination reader is open: the mapped columns that
+    // already hold something at the row a run would start writing at.
+    let mut occupied: Vec<String> = Vec::new();
     let destination_shape = {
         // A second reader on the destination, purely to read its header row.
         // Reading is non-destructive, and `SourceShape` is the only thing that
@@ -1072,9 +1094,19 @@ pub async fn preview_workflow_run(
                 )
                 .await
                 {
-                    Ok(mut r) => r.shape().unwrap_or(crate::source::SourceShape {
-                        columns: vec![],
-                    }),
+                    Ok(mut r) => {
+                        // The same reader, at the row the run would start on --
+                        // it was opened with `destination_row` as its first
+                        // row. Anything non-blank here is something a fresh
+                        // workflow would write over rather than after.
+                        occupied = r
+                            .shape_at(destination_row)
+                            .map(|s| s.columns.into_iter().map(|c| c.locator).collect())
+                            .unwrap_or_default();
+                        r.shape().unwrap_or(crate::source::SourceShape {
+                            columns: vec![],
+                        })
+                    }
                     Err(_) => crate::source::SourceShape { columns: vec![] },
                 }
             }
@@ -1212,6 +1244,14 @@ pub async fn preview_workflow_run(
                 verdict_is_reassuring: matches!(
                     preview.verdict(),
                     crate::detect::verify::Verdict::Sensible { .. }
+                ),
+                // Read from the destination itself, not inferred: `occupied`
+                // holds the mapped columns that already have something at the
+                // row this run would start on.
+                overwrite_warning: run::preview::overwrite_warning(
+                    processed_so_far,
+                    preview.destination_row(),
+                    &occupied,
                 ),
             };
 
@@ -2113,6 +2153,7 @@ mod tests {
             }],
             verdict: "looks sensible".into(),
             verdict_is_reassuring: true,
+            overwrite_warning: None,
         });
         let v = serde_json::to_value(&ready).expect("serialise");
         assert_eq!(v["kind"], "ready");

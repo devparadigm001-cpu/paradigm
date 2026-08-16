@@ -310,6 +310,21 @@ function FirstRecordPreview({
         </tbody>
       </table>
 
+      {/* Above the model's verdict, and louder than it, because the two are
+          different kinds of claim. The verdict is an advisory guess about
+          whether the MAPPING reads sensibly; this is a measured fact about the
+          destination — those cells were read, and they have something in them.
+          A run that proceeds here overwrites rather than appends, and does so
+          silently, so this is the one thing on the card worth interrupting for. */}
+      {preview.overwrite_warning ? (
+        <p
+          role="alert"
+          className="border-destructive/50 text-destructive mt-3 rounded border p-2 text-xs font-medium"
+        >
+          {preview.overwrite_warning}
+        </p>
+      ) : null}
+
       <p
         className={
           preview.verdict_is_reassuring

@@ -12090,6 +12090,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "surfacecheck") {
         return surfacecheck_mode().await;
     }
+    if std::env::args().any(|a| a == "overwritecheck") {
+        return overwritecheck_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -18419,4 +18422,157 @@ async fn surfacecheck_mode() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// overwritecheck -- does the preview warn about an overwrite, and only then?
+///
+/// Two playbooks, identical except for where they write:
+///
+///   A) destination that ALREADY HOLDS DATA, empty ledger -> must warn. This is
+///      the re-recorded-workflow case: it resumes at the top and writes over
+///      what is there.
+///   B) destination that is genuinely EMPTY, empty ledger -> must stay silent.
+///      Every genuinely new workflow looks like this, and a warning here would
+///      fire on the happy path and train the user to dismiss it.
+///
+/// Driven through the app's real UI so the message under test is the one a user
+/// would see.
+async fn overwritecheck_mode() -> ExitCode {
+    use paradigm_lib::compile::CompiledTemplate;
+    use paradigm_lib::detect::FieldMapping;
+
+    let occupied_dest = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "1g3lvtsYyGc_aIqoiPBKJRlsSjkk4i2AAg72VPFvPm3Q".to_string());
+    let empty_dest = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "1d2LLTBv-Fu56cnLpinSVQC59JMRf2816AsWIBvIM8eQ".to_string());
+    let source = "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs".to_string();
+
+    let data_dir = {
+        let base = std::env::var("APPDATA").expect("APPDATA");
+        std::path::Path::new(&base).join("com.amitj.paradigm")
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(&data_dir);
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let make = |dest: &str, name: &str| {
+        let mut conn = paradigm_lib::db::open(&db_path, &key_path).expect("db");
+        let mut stream = paradigm_lib::capture::CapturedStream::new(
+            paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
+        );
+        stream.admit(paradigm_lib::capture::ActionCandidate {
+            kind: paradigm_lib::capture::ActionKind::Click,
+            identifiers: vec!["msedge.exe".into()],
+            process_name: None,
+            element_role: Some("Button".into()),
+            element_name: Some("Next".into()),
+            payload: None,
+            detail: None,
+            timestamp_ms: 0,
+        });
+        let playbook = paradigm_lib::compile::compile(
+            stream.actions(),
+            name,
+            &paradigm_lib::compile::ReversibilityPolicy::placeholder(),
+            &paradigm_lib::labeling::RedactionPolicy::placeholder(),
+        )
+        .with_template(CompiledTemplate {
+            source_id: source.clone(),
+            destination_id: dest.to_string(),
+            source_step: 1,
+            destination_step: 1,
+            examples: 3,
+            fields: vec![
+                FieldMapping { source_field: "A".into(), destination_field: "A".into() },
+                FieldMapping { source_field: "B".into(), destination_field: "B".into() },
+            ],
+        });
+        paradigm_lib::compile::store::store(&mut conn, &playbook).expect("store");
+        playbook.id
+    };
+
+    let mut results = Vec::new();
+    for (dest, name, expect_warning) in [
+        (occupied_dest.as_str(), "OVERWRITE CASE", true),
+        (empty_dest.as_str(), "EMPTY CASE", false),
+    ] {
+        let id = make(dest, name);
+        println!("\n================ {name} ================");
+        println!("  playbook {id}\n  destination {dest}");
+
+        if let Err(e) = click_and_wait(&desktop, "Refresh", "repeating", 20, 4).await {
+            eprintln!("  refresh: {e}");
+            return ExitCode::FAILURE;
+        }
+        let check = {
+            let Some(window) = app_window(&desktop).await else {
+                eprintln!("  lost the app window");
+                return ExitCode::FAILURE;
+            };
+            desktop
+                .locator("role:Button")
+                .within(window)
+                .all(Some(Duration::from_secs(6)), None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .find_map(|b| {
+                    let n = b.name().unwrap_or_default();
+                    (n.starts_with("Check for new records for") && n.contains(name)).then_some(n)
+                })
+        };
+        let Some(check) = check else {
+            eprintln!("  no Check-for-new button for {name}");
+            return ExitCode::FAILURE;
+        };
+        if let Err(e) = click_and_wait(&desktop, &check, "Run the workflow on these", 180, 3).await
+        {
+            eprintln!("  check for new: {e}");
+            return ExitCode::FAILURE;
+        }
+        if let Err(e) =
+            click_and_wait(&desktop, "Preview first record", "About to write", 180, 3).await
+        {
+            eprintln!("  preview: {e}");
+            return ExitCode::FAILURE;
+        }
+
+        let screen = app_text(&desktop).await.join(" | ");
+        let warned = screen.contains("will start writing at row")
+            && screen.contains("already contains data");
+        println!("  warning shown : {warned}   (expected {expect_warning})");
+        if warned {
+            if let Some(line) = app_text(&desktop)
+                .await
+                .into_iter()
+                .find(|t| t.contains("already contains data"))
+            {
+                println!("  message: {line}");
+            }
+        }
+        results.push((name, warned == expect_warning, warned));
+
+        let _ = click_app_button(&desktop, "Cancel").await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    println!("\n== RESULT ==");
+    let mut all = true;
+    for (name, ok, warned) in &results {
+        println!("  {name:<16} warned={warned}  {}", if *ok { "AS EXPECTED" } else { "WRONG" });
+        all &= ok;
+    }
+    if all {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }

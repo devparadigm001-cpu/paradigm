@@ -46,6 +46,12 @@ export type PreviewView = {
    */
   verdict: string;
   verdict_is_reassuring: boolean;
+  /**
+   * Present only when this run would write OVER data already in the
+   * destination -- an empty ledger plus an occupied starting row, which is what
+   * a re-recorded workflow looks like. Null on every ordinary run.
+   */
+  overwrite_warning: string | null;
 };
 
 /**

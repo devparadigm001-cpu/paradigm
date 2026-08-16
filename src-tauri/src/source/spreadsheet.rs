@@ -458,6 +458,28 @@ impl SpreadsheetReader {
             .map(|f| self.read_cell(&f.locator, row))
             .collect()
     }
+
+    /// [`shape`](Self::shape) for an arbitrary row.
+    ///
+    /// `shape` answers "what are this source's columns called", which is the
+    /// header row. The overwrite warning asks a different question of the same
+    /// machinery -- "what is already in the row a run would start writing at"
+    /// -- and gets the same useful property: a column whose cell is blank is
+    /// left out entirely, so a non-empty result IS the list of occupied cells.
+    pub fn shape_at(&mut self, row: u64) -> Result<SourceShape, SourceError> {
+        let mut columns = Vec::new();
+        let scan_columns = self.scan_columns.clone();
+        for column in &scan_columns {
+            let value = self.read_cell(column, row)?;
+            if !value.trim().is_empty() {
+                columns.push(super::ColumnShape {
+                    locator: column.clone(),
+                    label: value.trim().to_string(),
+                });
+            }
+        }
+        Ok(SourceShape { columns })
+    }
 }
 
 fn bounds_of(el: &UIElement) -> Result<Rect, SourceError> {
