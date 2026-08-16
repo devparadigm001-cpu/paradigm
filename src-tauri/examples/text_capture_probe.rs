@@ -7378,6 +7378,22 @@ async fn download_csv(browser: &str, doc_id: &str, gid: &str) -> Option<String> 
             if Some(&p) != before.as_ref() {
                 let body = std::fs::read_to_string(&p).ok()?;
                 warn_if_quoted(&body);
+                // Delete what this fetch downloaded, the same discipline
+                // `fetch_export_blocking` follows.
+                //
+                // This helper had no cleanup and is used by nearly every probe
+                // here -- exports, ledger checks, ground-truth verification --
+                // so it is what actually filled the user's Downloads folder,
+                // 63 files at one point. The production reader was measured
+                // clean over a nine-record run (2 files before, 2 after) and
+                // was never the cause; this was.
+                //
+                // Only the file that appeared, never "the newest .csv": a
+                // download of the user's own arriving mid-probe must not be
+                // collateral.
+                if let Err(e) = std::fs::remove_file(&p) {
+                    println!("  !! could not remove the downloaded export {}: {e}", p.display());
+                }
                 return Some(body);
             }
         }
@@ -20144,7 +20160,23 @@ async fn tworundoc_mode() -> ExitCode {
             }
         };
 
-    println!("-- running --");
+    // Counted around the RUN ONLY. The CSV verification below uses
+    // `download_csv`, which is the probe helper and does NOT clean up, so
+    // counting across it would blame the reader for the probe.
+    let count_csv = || {
+        dirs_downloads()
+            .map(|d| {
+                std::fs::read_dir(d)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("csv"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let downloads_before = count_csv();
+    println!("-- running -- Downloads .csv before: {downloads_before}");
     let started = std::time::Instant::now();
     let control = paradigm_lib::run::control::RunControl::new();
     let corrections = paradigm_lib::run::correction::RunCorrections::new();
@@ -20160,6 +20192,15 @@ async fn tworundoc_mode() -> ExitCode {
         &supervision,
     );
     let took = started.elapsed().as_secs_f64();
+    let downloads_after = count_csv();
+    println!(
+        "   Downloads .csv after the run: {downloads_after} (was {downloads_before}) -> {}",
+        if downloads_after == downloads_before {
+            "NO ACCUMULATION"
+        } else {
+            "GREW -- the per-record fetch is leaving files behind"
+        }
+    );
 
     match &report {
         Ok(r) => {
