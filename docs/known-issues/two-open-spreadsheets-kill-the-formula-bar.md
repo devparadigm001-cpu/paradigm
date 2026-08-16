@@ -6,6 +6,35 @@ by any mechanism tried. Investigated 2026-08-16.
 **Severity:** high, and it lands on exactly the configuration a templated
 workflow needs.
 
+> ## CORRECTION, 2026-08-16 (later the same session)
+>
+> **The title and the one-line finding below are overstated, and the measurement
+> that contradicts them is mine.** In the two-document state, with both
+> documents open at the same moment:
+>
+> * `source::spreadsheet::SpreadsheetReader` fails on **both** documents —
+>   reproduced repeatedly, as described below;
+> * `run::spreadsheet::SpreadsheetWriter` **wrote a cell and verified it by
+>   reading the formula bar back**, in that same state, confirmed independently
+>   by CSV export.
+>
+> So it is NOT true that two open documents kill the formula bar for everything.
+> Something reads it fine in exactly the conditions where something else cannot.
+>
+> The two paths differ in how they choose the element: the writer still uses
+> `require_formula_bar` (nearest qualifying Edit, no exclusions), while the
+> reader now excludes Name Boxes and demands proof. That inverts the model this
+> document was built on — it suggests the reader may now be insisting on a dead
+> element while the writer happens to pick a live one, rather than the content
+> being universally absent.
+>
+> **This was not chased further, deliberately.** It arrived at the end of a long
+> session, it contradicts a conclusion published an hour earlier, and a tired
+> guess about why would be worth less than nothing. Everything below is left
+> exactly as it was written so the overstatement is visible rather than quietly
+> edited away. Treat the reproduction data as sound and the *generalisation* as
+> unproven.
+
 ## The finding, in one line
 
 If **two or more distinct Google Sheets documents are open**, the formula bar of

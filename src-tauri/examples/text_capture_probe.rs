@@ -12114,6 +12114,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "clicktest") {
         return clicktest_mode().await;
     }
+    if std::env::args().any(|a| a == "runcsvspike") {
+        return runcsvspike_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -19408,5 +19411,85 @@ async fn clicktest_mode() -> ExitCode {
             "STILL EMPTY -- real interaction does not revive it either."
         }
     );
+    ExitCode::SUCCESS
+}
+
+/// runcsvspike -- two measurements the per-record-export design depends on.
+///
+/// A) STEADY-STATE EXPORT COST. The scan fetches once; a run would fetch once
+///    per record. The spike measured ~2.0s for a cold-ish fetch, but a run
+///    makes them back to back, so what matters is the warm repeat cost.
+///
+/// B) DOES THE DESTINATION STILL WRITE with two documents open? This is the
+///    question that decides whether CSV source reads are a fix or half a fix.
+///    `SpreadsheetWriter::write` verifies every write by reading the cell back
+///    THROUGH THE FORMULA BAR -- the same element that goes blank when a second
+///    spreadsheet is open. If read-back fails, the write is refused, and no
+///    amount of fixing the source side helps.
+async fn runcsvspike_mode() -> ExitCode {
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::DestinationWriter;
+
+    let source = "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs";
+    let scratch = "1d2LLTBv-Fu56cnLpinSVQC59JMRf2816AsWIBvIM8eQ";
+
+    // ---- A) steady-state export cost -------------------------------------
+    println!("== A) export cost, back to back, as a run would ==");
+    let mut times = Vec::new();
+    for i in 1..=5 {
+        let started = std::time::Instant::now();
+        let got = download_csv("msedge", source, "0").await;
+        let took = started.elapsed().as_secs_f64();
+        println!(
+            "   fetch {i}: {took:.2}s  {}",
+            if got.is_some() { "ok" } else { "FAILED" }
+        );
+        times.push(took);
+    }
+    let warm: f64 = times.iter().skip(1).sum::<f64>() / (times.len() - 1) as f64;
+    println!("   first {:.2}s, warm average {:.2}s", times[0], warm);
+    println!("   current per-record formula-bar cost: ~1.95s for two columns\n");
+
+    // ---- B) can the destination still be written? -------------------------
+    println!("== B) writing with TWO documents open ==");
+    let desktop = Desktop::new(false, false).expect("desktop");
+
+    let mut open_docs = 0;
+    for doc in [source, scratch] {
+        if paradigm_lib::run::surfaces::window_for(&desktop, doc).await.is_some() {
+            open_docs += 1;
+        }
+    }
+    println!("   documents currently resolvable: {open_docs}");
+    if open_docs < 2 {
+        println!("   NOT the two-document state -- open both and re-run, or this proves nothing");
+    }
+
+    let Some(window) = paradigm_lib::run::surfaces::window_for(&desktop, scratch).await else {
+        println!("   scratch destination not open; cannot test the write");
+        return ExitCode::FAILURE;
+    };
+    match SpreadsheetWriter::open(desktop.clone(), &window, scratch.to_string(), None, 1).await {
+        Ok(mut w) => {
+            let marker = "RUNCSV-PROBE";
+            match w.write("D", marker) {
+                Ok(()) => println!("   write to D1 SUCCEEDED -- read-back verified"),
+                Err(e) => {
+                    println!("   write to D1 REFUSED: {e}");
+                    println!("   ^ the write itself may have landed; it is the VERIFY that failed");
+                }
+            }
+            // Ground truth, independent of the formula bar.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            match download_csv("msedge", scratch, "0").await {
+                Some(csv) => println!(
+                    "   CSV says D1 = {:?}",
+                    csv_at(&csv, 4, 1).unwrap_or_default()
+                ),
+                None => println!("   could not export to check"),
+            }
+        }
+        Err(e) => println!("   writer would not open: {e}"),
+    }
     ExitCode::SUCCESS
 }
