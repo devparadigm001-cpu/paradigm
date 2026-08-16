@@ -12154,6 +12154,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "tworundoc") {
         return tworundoc_mode().await;
     }
+    if std::env::args().any(|a| a == "polltest") {
+        return polltest_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -20248,6 +20251,89 @@ async fn tworundoc_mode() -> ExitCode {
             return if all_match { ExitCode::SUCCESS } else { ExitCode::FAILURE };
         }
         _ => println!("  could not export both to compare"),
+    }
+    ExitCode::SUCCESS
+}
+
+/// polltest -- how much of a fetch is the download, and how much is the POLL?
+///
+/// Before asking whether the export could be captured in memory, it is worth
+/// knowing what the file actually costs. `fetch_export_blocking` sleeps a full
+/// second before its first look, so every fetch takes at least 1s no matter how
+/// quickly the download lands. If the download is much faster than that, most
+/// of the "file overhead" is not the file at all -- it is the polling
+/// granularity, and it is removable without any of the complexity that
+/// in-memory capture would need.
+async fn polltest_mode() -> ExitCode {
+    let doc = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs".to_string());
+    let trials: usize = std::env::args()
+        .nth(3)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(4);
+
+    let downloads = dirs_downloads().expect("downloads");
+    let list = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(&downloads)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("csv"))
+            .collect()
+    };
+
+    println!("== polltest: true download latency, polled every 50ms ==\n");
+    let mut latencies = Vec::new();
+
+    for trial in 1..=trials {
+        let before = list();
+        let url = format!(
+            "https://docs.google.com/spreadsheets/d/{doc}/export?format=csv&gid=0"
+        );
+        let started = std::time::Instant::now();
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Start-Process",
+                "msedge",
+                "-ArgumentList",
+                &format!("'{url}'"),
+            ])
+            .status();
+
+        let mut landed = None;
+        for _ in 0..600 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Some(p) = list().into_iter().find(|p| !before.contains(p)) {
+                landed = Some((started.elapsed().as_secs_f64(), p));
+                break;
+            }
+        }
+        match landed {
+            Some((secs, path)) => {
+                // Read and remove, same discipline as the production fetch.
+                let bytes = std::fs::read_to_string(&path).map(|s| s.len()).unwrap_or(0);
+                let _ = std::fs::remove_file(&path);
+                println!("  trial {trial}: file appeared after {secs:.2}s ({bytes} bytes)");
+                latencies.push(secs);
+            }
+            None => println!("  trial {trial}: never appeared"),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    if !latencies.is_empty() {
+        let avg: f64 = latencies.iter().sum::<f64>() / latencies.len() as f64;
+        let min = latencies.iter().cloned().fold(f64::MAX, f64::min);
+        println!("\n  true latency: min {min:.2}s, average {avg:.2}s");
+        println!("  production fetch floor with a 1s poll: 1.00s + work");
+        println!(
+            "  so polling granularity is costing roughly {:.2}s per fetch",
+            (1.0f64 - min).max(0.0)
+        );
     }
     ExitCode::SUCCESS
 }
