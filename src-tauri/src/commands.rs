@@ -831,7 +831,14 @@ pub async fn check_for_new_records(
     // about one consistent moment.
     let scan = match crate::source::csv_snapshot::exportable_doc_id(&template.source_id) {
         Some(doc_id) => {
-            let body = crate::source::csv_snapshot::fetch_export(doc_id, "0")
+            // Needed only so the export window can be closed afterwards. The
+            // fetch itself is a browser launch and a file read; without a
+            // desktop handle the window it opens on a cold browser would be
+            // left behind, and its address bar carries the document id.
+            let desktop = terminator::Desktop::new(false, false)
+                .map_err(|e| format!("accessibility engine unavailable: {e}"))?;
+            let body = crate::source::csv_snapshot::fetch_export(&desktop, doc_id, "0")
+                .await
                 .map_err(|e| format!("could not export the source: {e}"))?;
             let mut reader = crate::source::csv_snapshot::CsvSnapshot::new(
                 template.source_id.clone(),

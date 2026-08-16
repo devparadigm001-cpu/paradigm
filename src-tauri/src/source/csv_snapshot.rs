@@ -361,7 +361,11 @@ mod tests {
 /// exactly what is new, rather than "the newest .csv" -- a user's own download
 /// arriving mid-scan must not be collateral. Tonight's probes, which had no
 /// cleanup, left 63 export files behind; that is the mistake this avoids.
-pub fn fetch_export(doc_id: &str, gid: &str) -> Result<String, SourceError> {
+pub async fn fetch_export(
+    desktop: &terminator::Desktop,
+    doc_id: &str,
+    gid: &str,
+) -> Result<String, SourceError> {
     let unreachable = |m: String| SourceError::Unreachable(m);
 
     let downloads = dirs_downloads()
@@ -392,6 +396,7 @@ pub fn fetch_export(doc_id: &str, gid: &str) -> Result<String, SourceError> {
             let body = std::fs::read_to_string(fresh)
                 .map_err(|e| unreachable(format!("could not read the export: {e}")))?;
             let _ = std::fs::remove_file(fresh);
+            close_export_window(desktop).await;
             return Ok(body);
         }
     }
@@ -434,4 +439,88 @@ pub fn exportable_doc_id(source_id: &str) -> Option<&str> {
         None if doc.trim().is_empty() => None,
         None => Some(doc),
     }
+}
+
+/// Close the window left showing the export URL, if closing it is safe.
+///
+/// ## Why this is needed at all
+///
+/// The export is fetched by opening its URL in the browser. When a browser is
+/// already running the export lands in a tab that closes itself once the
+/// download completes, and nothing is left behind. When the browser is **cold**
+/// -- the unattended case this reader exists for -- there is no other tab to
+/// fall back to, so the window stays, titled "Untitled", parked on the export
+/// URL. Measured: one leftover window per cold scan.
+///
+/// That is litter, and worse than litter: the export URL contains the document
+/// id, so `run::surfaces::window_for` matched the dead window in preference to
+/// the real document and a run would have read from a window with no
+/// spreadsheet in it.
+///
+/// ## The edge case, and why it decides the behaviour
+///
+/// The export may be a TAB inside a window holding the user's own tabs.
+/// Closing that window would take their work with it, to tidy up after
+/// ourselves -- which is not a trade this is allowed to make.
+///
+/// So a window is closed only when it is showing an export URL **and** its
+/// title does not report other pages behind it. A browser titled
+/// "… and N more pages" is telling us it has tabs we would destroy, and it is
+/// also exactly the case that does not need us: those windows already close
+/// their own export tab.
+///
+/// When the window IS alone, closing it ends that browser process -- and that
+/// is correct here rather than merely acceptable. The scan started that browser
+/// itself, seconds earlier, purely to fetch a file. Leaving a browser running
+/// that the user did not open, on a URL they did not visit, is the more
+/// intrusive option.
+///
+/// Best-effort throughout. A scan that produced a correct answer must not fail
+/// because a window would not close; the `window_for` guard covers what this
+/// misses.
+async fn close_export_window(desktop: &terminator::Desktop) {
+    let Ok(windows) = desktop
+        .locator("role:Window")
+        .within(desktop.root())
+        .all(Some(std::time::Duration::from_secs(5)), Some(3))
+        .await
+    else {
+        return;
+    };
+
+    for w in windows {
+        let address = address_of(desktop, &w).await;
+        if !crate::run::surfaces::is_export_url(&address) {
+            continue;
+        }
+        let title = w.name().unwrap_or_default().to_lowercase();
+        if title.contains(" more page") || title.contains(" more tab") {
+            // Someone else's tabs live here. Leave it; the guard handles it.
+            continue;
+        }
+        let _ = w.close();
+    }
+}
+
+/// The address bar's text for a window, if it has one.
+///
+/// Duplicated from `run::surfaces` rather than shared: that one is private, and
+/// exporting it to reach across from the source layer would couple two modules
+/// that otherwise know nothing about each other for four lines of locator.
+async fn address_of(desktop: &terminator::Desktop, window: &terminator::UIElement) -> String {
+    let Ok(bars) = desktop
+        .locator("role:Edit|name:Address and search bar")
+        .within(window.clone())
+        .all(Some(std::time::Duration::from_secs(4)), None)
+        .await
+    else {
+        return String::new();
+    };
+    for b in &bars {
+        let t = b.text(0).unwrap_or_default();
+        if !t.is_empty() {
+            return t;
+        }
+    }
+    String::new()
 }

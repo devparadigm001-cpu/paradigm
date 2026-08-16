@@ -70,11 +70,39 @@ pub async fn window_for(desktop: &Desktop, document: &str) -> Option<UIElement> 
         .ok()?;
 
     for w in windows {
-        if address_of(desktop, &w).await.contains(document) {
+        let address = address_of(desktop, &w).await;
+        if is_export_url(&address) {
+            continue;
+        }
+        if address.contains(document) {
             return Some(w);
         }
     }
     None
+}
+
+/// Is this address a CSV export rather than a document being viewed?
+///
+/// A guard, and a permanent one. The export URL **contains the document id** --
+/// `.../d/<id>/export?format=csv&gid=0` -- so a browser window left sitting on
+/// one satisfies a plain `contains(document)` match perfectly. The run would
+/// then open a reader on a window holding no spreadsheet: no Name Box, no
+/// formula bar, and a failure somewhere far from the cause.
+///
+/// That is not hypothetical. `csv_snapshot::fetch_export` opens exactly this
+/// URL to fetch a scan's data, and on a COLD browser -- the unattended case it
+/// exists for -- the window it opens has no other tab to fall back to and
+/// lingers as "Untitled". Measured: `window_for` then matched it in preference
+/// to the real document.
+///
+/// `fetch_export` now closes that window, so this should rarely fire. It is
+/// kept anyway because the close is best-effort and this is not: any future
+/// route that leaves an export URL on screen -- a user opening one by hand, a
+/// failed download, a second export mechanism -- would resurrect the same bug,
+/// and a document is never legitimately *worked in* through its export URL.
+pub fn is_export_url(address: &str) -> bool {
+    let lower = address.to_lowercase();
+    lower.contains("/export?") || lower.contains("format=csv")
 }
 
 /// Open a reader on the source and a writer on the destination.
@@ -379,5 +407,36 @@ mod not_found_tests {
         assert!(!background_tabs_in(&titles(&[])));
         // "more" alone must not be enough -- a document can be named anything.
         assert!(!background_tabs_in(&titles(&["Read more about pages.docx"])));
+    }
+}
+
+#[cfg(test)]
+mod export_guard_tests {
+    use super::is_export_url;
+
+    /// The exact address that poisoned matching, verbatim from a live window.
+    #[test]
+    fn an_export_url_is_recognised() {
+        assert!(is_export_url(
+            "https://docs.google.com/spreadsheets/d/1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs/export?format=csv&gid=0"
+        ));
+        assert!(is_export_url("https://docs.google.com/spreadsheets/d/ID/export?format=tsv"));
+        // Case is not guaranteed by anything.
+        assert!(is_export_url("HTTPS://DOCS.GOOGLE.COM/SPREADSHEETS/D/ID/EXPORT?FORMAT=CSV"));
+    }
+
+    /// And a document actually being worked in must still match.
+    ///
+    /// The guard is only safe because a document is never legitimately edited
+    /// through its export URL -- if this ever failed, the guard would be
+    /// hiding real windows rather than dead ones.
+    #[test]
+    fn a_document_being_viewed_is_not_excluded() {
+        assert!(!is_export_url(
+            "https://docs.google.com/spreadsheets/d/1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs/edit?gid=0#gid=0"
+        ));
+        assert!(!is_export_url("https://docs.google.com/spreadsheets/d/ID/edit"));
+        assert!(!is_export_url("https://example.com"));
+        assert!(!is_export_url(""));
     }
 }
