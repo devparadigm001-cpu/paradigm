@@ -1,7 +1,9 @@
 # Templated runs leave no run history
 
 **Status:** open, worth scheduling. Found 2026-08-15 while diagnosing a
-different report.
+different report, and confirmed the same evening by the very next investigation
+— which could not answer "what did Check for new actually do" from anything but
+ledger timestamps. See "Confirmed again, immediately" below.
 **Where:** `run::background` / `run::run_with_control` do not call
 `replay::journal::start_run`.
 **Severity:** observability. Nothing is lost or corrupted — but a whole class of
@@ -35,6 +37,39 @@ The timeline had to be rebuilt from `workflow_processed_rows.processed_at`
 instead: usable only because a run happens to mark each row as it goes, and
 only for runs that wrote something. A run that stopped on drift, was cancelled,
 or failed before its first write leaves nothing at all.
+
+## Confirmed again, immediately, by the next investigation
+
+This doc closed with "the next investigation will hit the same wall". The next
+investigation started **within the hour** and hit it on its first question.
+
+A second report arrived: rows already processed had been written again after new
+ones were added to the source. Three things were asked for. Two were answerable
+from the ledger — which rows are recorded, and whether the keys match. The third
+was not:
+
+> **show what Check for new actually reported/did in this run — which rows did
+> it identify as "new", and which rows did it actually write to.**
+
+There is no record of the run. Not a partial one, not a lossy one — none. The
+answer had to be reconstructed from `workflow_processed_rows.processed_at`, and
+the reconstruction rested on an accident: the five entries were spaced
+12.52–12.61s apart with no gap anywhere, which is what one continuous pass looks
+like and is not what two runs separated by a user adding rows would look like.
+
+That inference was correct, and it should not have been necessary. It also only
+worked because the run **wrote something**. The same question about a run that
+stopped on drift, hit a suspicious gap, was cancelled, or failed before its
+first write would have had no evidence at all — not even timestamps to space
+out.
+
+What a `runs` row would have answered directly, with no inference:
+
+* when the run started, and whether it was the first for that playbook;
+* how it ended, and on which stop;
+* that it was a templated run rather than a replay.
+
+Every one of those was needed. None was available.
 
 ## Why this matters more than it sounds
 

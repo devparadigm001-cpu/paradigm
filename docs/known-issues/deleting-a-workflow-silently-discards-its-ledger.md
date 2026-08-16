@@ -1,9 +1,14 @@
 # Deleting a workflow silently discards what it had processed
 
-**Status:** open, worth scheduling. Diagnosed 2026-08-15 from a real report.
-**Where:** `compile::store::delete`, the `delete_playbook` command, and the
-delete confirmation dialog in `src/components/delete-playbook`.
-**Severity:** the user re-does work they already did, against live documents.
+**Status:** open, **worth prioritising**. Diagnosed 2026-08-15 from a real
+report, then hit AGAIN by the same user within the same hour — see "This is not
+a rare edge case" below.
+**Where:** `compile::store::delete`, the `delete_playbook` command, the delete
+confirmation dialog in `src/components/delete-playbook`, and
+`run::batch::resume_destination_row`.
+**Severity:** the workflow **silently overwrites** the destination from the top
+rather than appending to it. Not merely redundant work — see "The consequence
+is worse than re-pasting".
 
 ## What the user sees
 
@@ -63,6 +68,84 @@ ledger. Rows the old one processed are legitimately new to it. That is correct
 behaviour, and it is also a nasty surprise, because the user did not experience
 themselves as creating a new workflow — they re-recorded "the same" one.
 
+## The consequence is worse than re-pasting
+
+The ledger does not only decide which rows are new. It also decides **where the
+destination resumes**:
+
+```rust
+let done = processed_count(conn, playbook_id, source_id)? as i64;
+Ok(((first_row as i64) + done.saturating_mul(destination_step)).max(1) as u64)
+```
+
+With an empty ledger `done == 0`, so the resume row is `first_row` — the
+**top** of the destination. A re-recorded workflow therefore does not append
+after what the previous one wrote. It writes **over** it, from the beginning.
+
+Measured on the second occurrence. Two different playbooks each ran once over
+the same five source rows, into the same destination. Afterwards the
+destination held:
+
+```
+Customer,Amount
+Blue Horizon Supply,1150
+Redwood Manufacturing,675.25
+Silverline Consulting,920.5
+Cedar Point Logistics,340
+Marigold Retail Group,1580.75
+```
+
+**Five rows, not ten.** Ten writes landed in five cells' worth of rows.
+
+That is the dangerous part, and it cuts two ways:
+
+* **It is nearly invisible.** Because the values were identical, the overwrite
+  left no trace. Nothing in the destination shows that a second workflow
+  rewrote it. Had the source changed between the two runs — a corrected
+  amount, an edited name — the newer values would have been silently replaced
+  by whatever the second run read, with no duplicate row to notice.
+* **The guard that would catch it is the wrong shape.** `resume_destination_row`
+  documents its own assumption — "that the destination started empty at
+  `first_row` and that this workflow is the only thing writing to it" — and
+  names §4.3's preview as the check. But the preview shows the *first* record's
+  target cell, which for a fresh ledger is exactly where the previous workflow
+  also started. It looks correct, because it IS the same cell. The preview
+  cannot distinguish "resuming an empty destination" from "about to overwrite
+  another workflow's output".
+
+So the honest statement of severity is not "it may reprocess rows". It is: a
+re-recorded workflow silently overwrites its destination from row one, and
+neither the ledger, the preview, nor the finished sheet will say so.
+
+## This is not a rare edge case
+
+It happened twice in one hour, to the same user, on the same pair of documents
+— the second time while the first was still being written up. Both dumps were
+taken directly from the live store:
+
+| | first occurrence | second occurrence |
+|---|---|---|
+| playbook | `4f7c5cd1-…` `"s"` | `d9b3fd21-…` `"a"` |
+| created | 01:00:39 | 01:15:05 |
+| ledger written | 01:02:35 → 01:03:26 | 01:17:14 → 01:18:05 |
+| rows processed | 2–6 | 2–6 |
+
+`"s"` no longer exists in the store. In both cases the ledger timestamps are
+spaced **12.52–12.61s apart with no gap anywhere**, which is what a single
+continuous pass looks like — so neither playbook re-processed its own rows.
+Each ran exactly once, and each was a *new* workflow that had never seen those
+rows.
+
+The second report arrived described as "this playbook has NOT been
+deleted/recreated", which is the whole problem in one sentence: re-recording
+produces a new workflow, with a new id and an empty ledger, appearing in the
+same list under a similar name. From the outside it is the same workflow. From
+the ledger's point of view it has never run.
+
+That is why the warning below is worth prioritising rather than scheduling
+loosely. The confusion is not hypothetical, it is not rare, and the thing it
+costs is silent overwriting of a live document.
+
 ## What is NOT claimed
 
 That a deleted playbook actually processed rows 2-4. The cascade destroyed that
@@ -82,9 +165,19 @@ SELECT COUNT(*) FROM workflow_processed_rows WHERE playbook_id = ?1
 Warn, do not block. Something like:
 
 > This workflow has processed **5 records**. Deleting it means a re-recorded
-> version starts over and may process them again.
+> version starts over — it will process those records again and write them
+> from the top of the destination, over what is already there.
 
-Deletion is the user's call; they simply cannot currently make it informed.
+Deletion is the user's call; they simply cannot currently make it informed. The
+wording should name the overwrite, not just the reprocessing — the reprocessing
+is the cost the user can see afterwards, and the overwrite is the one they
+cannot.
+
+Worth pairing with it, and cheaper than it looks: the §4.3 preview already
+knows the resume row and the ledger count. A preview that opens on a destination
+cell which is **not** empty, for a workflow whose ledger is empty, is describing
+this exact situation and could say so. That is the check
+`resume_destination_row` claims the preview provides, actually provided.
 
 ## Deliberately not proposed
 
