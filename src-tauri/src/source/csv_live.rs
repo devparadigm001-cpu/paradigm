@@ -1,42 +1,21 @@
 //! A [`SourceReader`] that re-exports the source once per record.
 //!
-//! # NOT WIRED IN. It panics in an async caller.
+//! ## It fetches synchronously, and that is the point
 //!
-//! Built, unit-tested, and then found unusable by live testing — recorded here
-//! rather than quietly shipped.
-//!
-//! [`SourceReader`] is a **synchronous** trait and `fetch_export` is async, so
-//! this bridges them by holding a runtime and calling `block_on`. That is fine
-//! on the run's own `std::thread`, which has no reactor. It is fatal anywhere
-//! already inside one:
+//! An earlier version bridged the synchronous [`SourceReader`] trait to an
+//! async fetch by holding a runtime and calling `block_on`. That works on the
+//! run own `std::thread`, which has no reactor, and panics outright inside any
+//! async caller -- which the §4.3 preview is:
 //!
 //! ```text
-//! thread 'main' panicked at src/source/csv_live.rs:
 //! Cannot start a runtime from within a runtime.
 //! ```
 //!
-//! And the §4.3 preview reads the source from `preview_workflow_run`, which is
-//! an async command. So wiring this into `run::surfaces::open_for` — the
-//! natural seam, since it serves both — makes every preview panic. The wiring
-//! was written, tested, hit exactly that, and has been reverted.
-//!
-//! ## What it needs before it can be used
-//!
-//! A fetch that does not require a runtime. The download itself is already
-//! synchronous — spawn the browser, poll the Downloads folder — and only
-//! `close_export_window` is async, because the locator API is. Options, none
-//! attempted:
-//!
-//! * a synchronous fetch that skips the window close, leaving that to the
-//!   `is_export_url` guard which already exists for exactly this;
-//! * an async `SourceReader`, which changes the trait every implementation and
-//!   caller depends on;
-//! * fetching outside the reader and handing bodies in, which gives up the
-//!   per-record freshness that is the entire point.
-//!
-//! The first looks right and is small. It was not done tonight because the
-//! standard here is a live end-to-end proof, and there was not time to build
-//! and prove it properly — see the commit that reverted the wiring.
+//! So the fetch is [`fetch_export_blocking`], which needs no runtime. The only
+//! async part was closing the leftover export window; that is dropped, and
+//! [`crate::run::surfaces::is_export_url`] already refuses to match a document
+//! by a window sitting on its export URL, which is the harm such a window
+//! actually does.
 //!
 //! ## Why this exists rather than reusing [`CsvSnapshot`]
 //!
@@ -72,7 +51,7 @@
 //! count unmoved, so per-record fetching needs no window reuse.
 
 use super::{Advance, FieldRef, SourceError, SourcePosition, SourceReader, SourceRecord, SourceShape};
-use crate::source::csv_snapshot::{fetch_export, CsvSnapshot};
+use crate::source::csv_snapshot::{fetch_export_blocking, CsvSnapshot};
 
 /// Re-fetches the source for each record it is asked about.
 pub struct CsvLiveReader {
@@ -93,20 +72,10 @@ pub struct CsvLiveReader {
     /// are asked at the same moment about the same row. So the fetch happens
     /// once per record and both are served from it.
     cached: Option<(u64, CsvSnapshot)>,
-    desktop: terminator::Desktop,
-    /// The trait is synchronous and fetching is not, so the reader carries a
-    /// runtime to bridge them.
-    ///
-    /// Blocking here is safe and is what already happens elsewhere: a run
-    /// executes on its own `std::thread` with no reactor, and
-    /// `run::surfaces` already stands up a runtime on that thread for the same
-    /// reason. Nothing else is waiting on this thread while a record is read.
-    runtime: tokio::runtime::Runtime,
 }
 
 impl CsvLiveReader {
     pub fn new(
-        desktop: terminator::Desktop,
         doc_id: impl Into<String>,
         source_id: impl Into<String>,
         gid: impl Into<String>,
@@ -114,12 +83,6 @@ impl CsvLiveReader {
         header_row: u64,
         scan_columns: Vec<String>,
     ) -> Result<Self, SourceError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                SourceError::Unreachable(format!("could not start a runtime to fetch with: {e}"))
-            })?;
         Ok(Self {
             doc_id: doc_id.into(),
             source_id: source_id.into(),
@@ -128,8 +91,6 @@ impl CsvLiveReader {
             header_row,
             scan_columns,
             cached: None,
-            desktop,
-            runtime,
         })
     }
 
@@ -140,11 +101,10 @@ impl CsvLiveReader {
             None => true,
         };
         if stale {
-            let body = self.runtime.block_on(fetch_export(
-                &self.desktop,
-                &self.doc_id,
-                &self.gid,
-            ))?;
+            // Synchronous by design. See `fetch_export_blocking` -- the async
+            // variant forced a runtime into a sync trait method, which panics
+            // inside any async caller, and the preview is one.
+            let body = fetch_export_blocking(&self.doc_id, &self.gid)?;
             // `first_row` is the row being asked about, so the snapshot is
             // positioned exactly where this reader is.
             let snapshot = CsvSnapshot::new(

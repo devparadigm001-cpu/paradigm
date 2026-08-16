@@ -120,9 +120,17 @@ pub async fn open_for(
     let (source_doc, source_sheet) = split_surface_id(&template.source_id);
     let (destination_doc, destination_sheet) = split_surface_id(&template.destination_id);
 
-    let source_window = match window_for(desktop, source_doc).await {
-        Some(w) => w,
-        None => return Err(not_found(desktop, "source", source_doc).await),
+    // The SOURCE may not need a window at all -- see the reader choice below.
+    // The destination always does, because writing needs the live grid.
+    let exportable =
+        crate::source::csv_snapshot::exportable_doc_id(&template.source_id).map(str::to_string);
+
+    let source_window = match &exportable {
+        Some(_) => None,
+        None => match window_for(desktop, source_doc).await {
+            Some(w) => Some(w),
+            None => return Err(not_found(desktop, "source", source_doc).await),
+        },
     };
     let destination_window = match window_for(desktop, destination_doc).await {
         Some(w) => w,
@@ -135,17 +143,57 @@ pub async fn open_for(
         .map(|f| f.source_field.clone())
         .collect();
 
-    let reader = SpreadsheetReader::open(
-        desktop.clone(),
-        &source_window,
-        template.source_id.clone(),
-        source_sheet.map(str::to_string),
-        source_row,
-        header_row,
-        scan_columns,
-    )
-    .await
-    .map_err(|e| format!("could not open the source: {e}"))?;
+    // The run's source is read by EXPORT when the surface names a whole
+    // document, and through the formula bar only when it does not.
+    //
+    // Not an optimisation -- a correctness requirement. A Sheets formula bar
+    // reports nothing until the page has been typed into, and nobody ever types
+    // into a source document, so `SpreadsheetReader` opened on a freshly loaded
+    // source refuses. See
+    // `docs/known-issues/the-formula-bar-only-reports-after-the-page-is-typed-into.md`.
+    // An export needs no window and no provocation, and costs ~2.12s per record
+    // against ~1.95s for a two-column formula-bar read -- flat in columns
+    // rather than linear.
+    //
+    // A sheet-qualified source (`<doc>!Sheet2`) still uses the reader: the
+    // export URL selects a sheet by gid, a template names one by NAME, and
+    // mapping between them needs the document open, which is the cost this
+    // avoids. Those sources are also the one-document case that already worked.
+    //
+    // The DESTINATION is deliberately untouched. It writes before it reads
+    // back, so its page is always awake by the time it reads, and it has never
+    // had this problem.
+    let reader: Box<dyn crate::source::SourceReader + Send> = match (&exportable, &source_window) {
+        (Some(doc_id), _) => Box::new(
+            crate::source::csv_live::CsvLiveReader::new(
+                doc_id.clone(),
+                template.source_id.clone(),
+                "0",
+                source_row,
+                header_row,
+                scan_columns,
+            )
+            .map_err(|e| format!("could not open the source: {e}"))?,
+        ),
+        (None, Some(window)) => Box::new(
+            SpreadsheetReader::open(
+                desktop.clone(),
+                window,
+                template.source_id.clone(),
+                source_sheet.map(str::to_string),
+                source_row,
+                header_row,
+                scan_columns,
+            )
+            .await
+            .map_err(|e| format!("could not open the source: {e}"))?,
+        ),
+        (None, None) => {
+            return Err(format!(
+                "no open window is showing the source document {source_doc}"
+            ))
+        }
+    };
 
     let writer = SpreadsheetWriter::open(
         desktop.clone(),
@@ -157,7 +205,7 @@ pub async fn open_for(
     .await
     .map_err(|e| format!("could not open the destination: {e}"))?;
 
-    Ok((Box::new(reader), Box::new(writer)))
+    Ok((reader, Box::new(writer)))
 }
 
 /// What the user has selected in a surface, in the terms a correction needs.

@@ -12135,6 +12135,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "livereadtest") {
         return livereadtest_mode().await;
     }
+    if std::env::args().any(|a| a == "tworundoc") {
+        return tworundoc_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -20074,4 +20077,136 @@ async fn livereadtest_mode() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// tworundoc -- a real run between TWO separate documents, end to end.
+///
+/// The configuration that never worked: source and destination as different
+/// spreadsheets, both open, source never typed into. Drives the actual run loop
+/// through the real surfaces and verifies the destination by CSV export, not by
+/// what the run reports about itself.
+async fn tworundoc_mode() -> ExitCode {
+    use paradigm_lib::compile::CompiledTemplate;
+    use paradigm_lib::detect::FieldMapping;
+
+    let source = "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs";
+    let destination = "1d2LLTBv-Fu56cnLpinSVQC59JMRf2816AsWIBvIM8eQ";
+
+    let template = CompiledTemplate {
+        source_id: source.to_string(),
+        destination_id: destination.to_string(),
+        source_step: 1,
+        destination_step: 1,
+        examples: 3,
+        fields: vec![
+            FieldMapping { source_field: "A".into(), destination_field: "A".into() },
+            FieldMapping { source_field: "B".into(), destination_field: "B".into() },
+        ],
+    };
+
+    // A fresh playbook, so the ledger is empty and every source row is new.
+    let dir = {
+        let base = std::env::var("APPDATA").expect("APPDATA");
+        std::path::Path::new(&base).join("com.amitj.paradigm")
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(&dir);
+    let mut conn = paradigm_lib::db::open(&db_path, &key_path).expect("db");
+    let mut stream = paradigm_lib::capture::CapturedStream::new(
+        paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
+    );
+    stream.admit(paradigm_lib::capture::ActionCandidate {
+        kind: paradigm_lib::capture::ActionKind::Click,
+        identifiers: vec!["msedge.exe".into()],
+        process_name: None,
+        element_role: Some("Button".into()),
+        element_name: Some("Next".into()),
+        payload: None,
+        detail: None,
+        timestamp_ms: 0,
+    });
+    let playbook = paradigm_lib::compile::compile(
+        stream.actions(),
+        "TWO-DOCUMENT RUN",
+        &paradigm_lib::compile::ReversibilityPolicy::placeholder(),
+        &paradigm_lib::labeling::RedactionPolicy::placeholder(),
+    )
+    .with_template(template.clone());
+    paradigm_lib::compile::store::store(&mut conn, &playbook).expect("store");
+    println!("playbook {}\n  {source}\n  -> {destination}\n", playbook.id);
+
+    let desktop = Desktop::new(false, false).expect("desktop");
+    let (mut reader, mut writer) =
+        match paradigm_lib::run::surfaces::open_for(&desktop, &template, 2, 1, 2).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("open_for FAILED: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    println!("-- running --");
+    let started = std::time::Instant::now();
+    let control = paradigm_lib::run::control::RunControl::new();
+    let corrections = paradigm_lib::run::correction::RunCorrections::new();
+    let supervision = paradigm_lib::run::supervision::RunSupervision::off();
+    let report = paradigm_lib::run::run_with_control(
+        &conn,
+        &playbook.id,
+        &template,
+        reader.as_mut(),
+        writer.as_mut(),
+        &control,
+        &corrections,
+        &supervision,
+    );
+    let took = started.elapsed().as_secs_f64();
+
+    match &report {
+        Ok(r) => {
+            println!("  stopped: {:?}", r.stop);
+            println!("  {} record(s) in {took:.1}s", r.records.len());
+            for rec in &r.records {
+                println!("     row {} -> {}", rec.position.row_key, rec.destination);
+            }
+        }
+        Err(e) => {
+            println!("  run FAILED: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    println!("\n-- CSV ground truth: source vs destination --");
+    let src = download_csv("msedge", source, "0").await;
+    let dst = download_csv("msedge", destination, "0").await;
+    match (src, dst) {
+        (Some(s), Some(d)) => {
+            let mut all_match = true;
+            for row in 2..=10usize {
+                let sa = csv_at(&s, 1, row).unwrap_or_default();
+                let sb = csv_at(&s, 2, row).unwrap_or_default();
+                if sa.trim().is_empty() && sb.trim().is_empty() {
+                    break;
+                }
+                let da = csv_at(&d, 1, row).unwrap_or_default();
+                let db = csv_at(&d, 2, row).unwrap_or_default();
+                let good = sa == da && sb == db;
+                all_match &= good;
+                println!(
+                    "  row {row}: src {sa:?}/{sb:?}  dst {da:?}/{db:?}  {}",
+                    if good { "MATCH" } else { "DIFFER" }
+                );
+            }
+            println!(
+                "\n{}",
+                if all_match {
+                    "PASS -- every source row landed in the matching destination row"
+                } else {
+                    "FAIL -- see above"
+                }
+            );
+            return if all_match { ExitCode::SUCCESS } else { ExitCode::FAILURE };
+        }
+        _ => println!("  could not export both to compare"),
+    }
+    ExitCode::SUCCESS
 }

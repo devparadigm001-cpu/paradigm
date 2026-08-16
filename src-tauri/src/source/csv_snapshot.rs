@@ -366,6 +366,41 @@ pub async fn fetch_export(
     doc_id: &str,
     gid: &str,
 ) -> Result<String, SourceError> {
+    let body = fetch_export_blocking(doc_id, gid)?;
+    close_export_window(desktop).await;
+    Ok(body)
+}
+
+/// [`fetch_export`] without the window close, and without needing a runtime.
+///
+/// The download was always synchronous -- spawn the browser, poll the Downloads
+/// folder -- and only closing the leftover window needed `async`, because the
+/// locator API is async.
+///
+/// That async-ness was fatal for the one caller that matters most.
+/// [`SourceReader`](super::SourceReader) is a **synchronous** trait, so a
+/// per-record reader bridging to an async fetch had to hold a runtime and
+/// `block_on` it. That works on the run's own `std::thread`, which has no
+/// reactor, and panics outright anywhere already inside one:
+///
+/// ```text
+/// Cannot start a runtime from within a runtime.
+/// ```
+///
+/// The §4.3 preview reads the source from an async command, so that panic was
+/// not a corner case -- it was every preview.
+///
+/// Dropping the close is safe because the case it cleans up after is already
+/// covered defensively: [`crate::run::surfaces::is_export_url`] refuses to
+/// match a document by a window sitting on its export URL, which is the actual
+/// harm a leftover window does. The guard was written for exactly this and was
+/// deliberately kept even when the close was added, on the grounds that the
+/// close is best-effort and the guard is not.
+///
+/// What is genuinely given up is tidiness: on a **cold** browser, where the
+/// export window has no sibling tab to fall back to, one "Untitled" window can
+/// be left behind. With a browser already running the export tab closes itself.
+pub fn fetch_export_blocking(doc_id: &str, gid: &str) -> Result<String, SourceError> {
     let unreachable = |m: String| SourceError::Unreachable(m);
 
     let downloads = dirs_downloads()
@@ -396,7 +431,6 @@ pub async fn fetch_export(
             let body = std::fs::read_to_string(fresh)
                 .map_err(|e| unreachable(format!("could not read the export: {e}")))?;
             let _ = std::fs::remove_file(fresh);
-            close_export_window(desktop).await;
             return Ok(body);
         }
     }
@@ -536,4 +570,29 @@ async fn address_of(desktop: &terminator::Desktop, window: &terminator::UIElemen
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::exportable_doc_id;
+
+    /// Which reader the run uses hangs entirely on this predicate, so the two
+    /// shapes are pinned rather than assumed.
+    ///
+    /// A bare document id exports -- that is the two-document case the formula
+    /// bar cannot serve. A sheet-qualified surface does NOT, because the export
+    /// URL selects a sheet by gid and a template names one by NAME; exporting
+    /// gid=0 and hoping would answer confidently about the wrong sheet. Those
+    /// are also the one-document workflows that already worked through
+    /// `SpreadsheetReader`, so they keep using it.
+    #[test]
+    fn a_bare_document_exports_and_a_qualified_one_does_not() {
+        assert_eq!(
+            exportable_doc_id("1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs"),
+            Some("1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs")
+        );
+        assert_eq!(exportable_doc_id("1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs!Sheet1"), None);
+        assert_eq!(exportable_doc_id("doc!Sheet2"), None);
+        assert_eq!(exportable_doc_id(""), None);
+    }
 }
