@@ -164,17 +164,27 @@ pub async fn open_for(
     // back, so its page is always awake by the time it reads, and it has never
     // had this problem.
     let reader: Box<dyn crate::source::SourceReader + Send> = match (&exportable, &source_window) {
-        (Some(doc_id), _) => Box::new(
-            crate::source::csv_live::CsvLiveReader::new(
-                doc_id.clone(),
+        // ONE export for the whole run, deliberately. See
+        // `docs/known-issues/the-run-reads-its-source-once.md`: source reads are
+        // no longer live during a run, which is a confirmed decision favouring
+        // speed over mid-run freshness, not an oversight.
+        //
+        // `CsvSnapshot` rather than a second reader that fetches per record.
+        // Once the body is fetched once and served for the rest of the run, a
+        // dedicated type would differ from `CsvSnapshot` only in who called
+        // `fetch_export_blocking` -- so the fetch moved here, to the seam that
+        // already knows which document this is, and the near-duplicate went.
+        (Some(doc_id), _) => {
+            let body = crate::source::csv_snapshot::fetch_export_blocking(doc_id, "0")
+                .map_err(|e| format!("could not export the source: {e}"))?;
+            Box::new(crate::source::csv_snapshot::CsvSnapshot::new(
                 template.source_id.clone(),
-                "0",
+                &body,
                 source_row,
                 header_row,
                 scan_columns,
-            )
-            .map_err(|e| format!("could not open the source: {e}"))?,
-        ),
+            ))
+        }
         (None, Some(window)) => Box::new(
             SpreadsheetReader::open(
                 desktop.clone(),

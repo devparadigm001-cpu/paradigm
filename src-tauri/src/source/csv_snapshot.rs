@@ -9,21 +9,39 @@
 //! cell edited 1.3s earlier is already in it. Both measured; see
 //! `docs/known-issues/batch-scan-cost-is-linear-in-rows.md`.
 //!
-//! So this is a **scan-only** reader, and that boundary is deliberate:
+//! This began as a **scan-only** reader. It now serves the run as well, which
+//! is a decision the user made explicitly and with the cost stated. Both halves
+//! of the original argument are worth keeping, because only one of them turned
+//! out to be true:
 //!
 //! * **A scan is a single read-only question** -- "which rows are unprocessed"
 //!   -- asked once and answered from one consistent moment. A snapshot is
-//!   exactly the right shape for it.
+//!   exactly the right shape for it. That still holds.
 //! * **A run is not.** It interleaves reads with writes, pauses for §4.5
 //!   corrections, and can sit waiting on a human for minutes. Answering its
-//!   reads from a snapshot taken at spawn would mean writing values the source
-//!   no longer holds, silently, with §4.5's drift check looking at the same
-//!   stale copy and finding nothing wrong. The run keeps reading live.
+//!   reads from a snapshot taken at spawn means writing values the source no
+//!   longer holds, silently. That risk is real and has not gone away -- it was
+//!   weighed against the cost of the alternative and deliberately accepted.
 //!
-//! That split is why this is a second implementation behind the existing
-//! interface rather than a replacement -- §2's "generator interface,
-//! spreadsheet-only for now" anticipated exactly this, and the trait needed no
-//! change to accept it.
+//! The alternative was a sibling reader that re-exported the sheet before every
+//! record. Measured over a nine-record sheet it cost ~9-10s per record and
+//! **failed to finish the sheet in either trial**, because back-to-back export
+//! windows interfere with each other. One export costs ~1-2s for the whole run.
+//! See `docs/known-issues/the-run-reads-its-source-once.md` for the numbers and
+//! for what a run gives up in exchange.
+//!
+//! One clause of the old argument was simply wrong and is corrected here: a
+//! snapshot does **not** leave §4.5's drift check "looking at the same stale
+//! copy and finding nothing wrong." The source shape is read once, in
+//! `run::background`, before the record loop starts -- and the loop never reads
+//! it again. A body exported at `open_for` is contemporaneous with that check,
+//! so it compares the source's real shape at run start, as it always did. What
+//! the per-record fetch actually bought was fresher *values*, not fresher drift
+//! detection.
+//!
+//! §2's "generator interface, spreadsheet-only for now" anticipated a second
+//! implementation behind this interface, and the trait needed no change to
+//! accept it.
 //!
 //! ## What it does NOT solve
 //!
@@ -231,6 +249,35 @@ mod tests {
     /// The export shape this actually meets: a header, some rows, and the
     /// allocated-but-blank rows Sheets emits as bare commas.
     const SHEET: &str = "Customer,Amount\r\nAcme,100\r\nGlobex,200\r\nInitech,300\r\n,\r\n,\r\n,\r\n,\r\n,\r\n,\r\n";
+
+    /// The run's source reader walks every record from the body it was built
+    /// with, and nothing in the read path reaches for a fresh one.
+    ///
+    /// This is the contract `run::surfaces::open_for` now depends on: it
+    /// exports once and hands the body here. The reader this replaced dropped
+    /// its cache in `advance` to force a re-fetch per record; if that idea ever
+    /// comes back, `advance` will have to do more than increment and this test
+    /// is where it shows up. See
+    /// `docs/known-issues/the-run-reads-its-source-once.md`.
+    #[test]
+    fn one_export_body_serves_the_whole_run() {
+        let f = fields(&["A", "B"]);
+        let mut reader = CsvSnapshot::new("doc!Sheet1", SHEET, 2, 1, vec!["A".into(), "B".into()]);
+
+        let mut seen = Vec::new();
+        while matches!(reader.peek(&f), Ok(Advance::Record)) {
+            let record = reader.read(&f).expect("read");
+            seen.push(record.fields.get("A").cloned().unwrap_or_default());
+            reader.advance().expect("advance");
+        }
+
+        assert_eq!(seen, vec!["Acme", "Globex", "Initech"]);
+        // The shape still reads the header out of that same body, which is what
+        // keeps the run-start drift check meaningful.
+        let shape = reader.shape().expect("shape");
+        let labels: Vec<&str> = shape.columns.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, vec!["Customer", "Amount"]);
+    }
 
     #[test]
     fn a_column_letter_maps_to_the_right_index() {
