@@ -12129,6 +12129,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "waketest") {
         return waketest_mode().await;
     }
+    if std::env::args().any(|a| a == "churntest") {
+        return churntest_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -19873,5 +19876,88 @@ async fn waketest_mode() -> ExitCode {
     } else if before == after {
         println!("\n  No change. Writing is not the difference either.");
     }
+    ExitCode::SUCCESS
+}
+
+/// churntest -- what does one export per record do to the browser?
+///
+/// A scan fetches once. A run would fetch once per record, so five records mean
+/// five exports. `fetch_export` opens the export URL in the browser and closes
+/// the window afterwards when it is alone -- this measures what that actually
+/// costs in windows and processes across a realistic sequence, before the
+/// design commits to it.
+async fn churntest_mode() -> ExitCode {
+    let doc = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs".to_string());
+    let records: usize = std::env::args()
+        .nth(3)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(5);
+
+    let desktop = Desktop::new(false, false).expect("desktop");
+    let count_windows = || {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Get-Process msedge -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -ne '' }).Count",
+            ])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok())
+            .unwrap_or(-1)
+    };
+    let count_procs = || {
+        std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Get-Process msedge -ErrorAction SilentlyContinue).Count",
+            ])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i32>().ok())
+            .unwrap_or(-1)
+    };
+    let downloads = || {
+        dirs_downloads()
+            .map(|d| {
+                std::fs::read_dir(d)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("csv"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+
+    println!("== churntest: {records} consecutive exports, as a run would ==\n");
+    println!("  start: windows={} procs={} downloads={}", count_windows(), count_procs(), downloads());
+
+    let mut times = Vec::new();
+    for i in 1..=records {
+        let started = std::time::Instant::now();
+        let body = paradigm_lib::source::csv_snapshot::fetch_export(&desktop, &doc, "0").await;
+        let took = started.elapsed().as_secs_f64();
+        times.push(took);
+        println!(
+            "  record {i}: {took:.2}s  {}  windows={} procs={} downloads={}",
+            match &body {
+                Ok(b) => format!("{} bytes", b.len()),
+                Err(e) => format!("FAILED: {}", first_line(&e.to_string())),
+            },
+            count_windows(),
+            count_procs(),
+            downloads()
+        );
+    }
+
+    let avg: f64 = times.iter().sum::<f64>() / times.len() as f64;
+    println!("\n  end:   windows={} procs={} downloads={}", count_windows(), count_procs(), downloads());
+    println!("  average {avg:.2}s per record");
+    println!("\n  If windows and downloads end where they started, per-record fetching");
+    println!("  leaves nothing behind and needs no window reuse.");
     ExitCode::SUCCESS
 }
