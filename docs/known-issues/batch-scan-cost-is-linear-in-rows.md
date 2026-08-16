@@ -64,7 +64,11 @@ Prompted by a different-sounding report — that the app "keeps clicking Enter"
 on the last-selected cell during a scan. It turned out to be this same
 behaviour seen from the outside, and chasing it produced hard numbers.
 
-### The clicking is real, and it is `press_key`
+### The clicking is real, and it is `press_key` — but only when focus fails
+
+**Corrected 2026-08-15** (see "Range-reading" below, where the implementation
+was finally read rather than inferred). The first version of this section said
+every `press_key` clicks. It does not.
 
 `goto` reads as a keystroke:
 
@@ -72,11 +76,29 @@ behaviour seen from the outside, and chasing it produced hard numbers.
 self.name_box.press_key("{Enter}")
 ```
 
-It is not. The default is
-`press_key(key, try_focus_before = true, try_click_before = true)`, so **every
-call performs a real mouse click on the element first**. Nothing at the call
-site says so. One click per cell read is why a scan looks like the app is
-clicking rather than merely thinking.
+The default is `press_key(key, try_focus_before = true, try_click_before =
+true)`, and the Windows implementation does this:
+
+```rust
+if try_focus_before {
+    match self.focus() {
+        Ok(_)  => { /* focused; NO click */ }
+        Err(_) => if try_click_before { self.click() }   // fallback only
+    }
+}
+```
+
+So the click happens on every call where **`focus()` failed**, not on every
+call. That matters for reading the original report: a user who says a scan
+"keeps clicking" is telling you that focus is failing repeatedly on the Name
+Box — which is a symptom to chase, not cosmetic noise, and sits in the same
+family as the intermittent `PositionLost` in
+[an-open-cell-editor-turns-a-write-into-an-append.md](an-open-cell-editor-turns-a-write-into-an-append.md)'s
+neighbourhood.
+
+It also explains the measurement below better than the original reading did:
+removing the click did not speed anything up because in the healthy case there
+was no click to remove — the 21% regression was pure state-tracking overhead.
 
 Per-cell, not per-row: `read_cell` does one `goto`, `read_row` one per mapped
 field, and `peek` on a **blank** row additionally reads `LOOKAHEAD_ROWS = 5`
@@ -133,6 +155,77 @@ change there needs a correctness measurement, not a stopwatch.
 This is why option (1) below is still the real fix: it removes navigations
 entirely rather than trying to make each one cheaper, and every attempt to make
 them cheaper now has a number showing why it does not work.
+
+## Range-reading, investigated 2026-08-15: the tree does not offer it
+
+Option (1) below — "ask the source for a range instead of a row at a time" — was
+investigated before building. **The accessibility tree does not expose a
+range's values.** Measured with `text_capture_probe rangeread`, differentially:
+snapshot every text-bearing element with **A2** selected, snapshot again with
+**A2:B6** (ten cells) selected, and diff. A hopeful search would have found the
+formula bar showing the active cell and called it progress; a diff cannot.
+
+Both states contain **19 text-bearing elements**. Exactly two differ:
+
+| element | one cell | range of ten |
+|---|---|---|
+| Name Box | `"A2"` | `"A2:B6"` |
+| formula bar | `"A2"`'s value | still only the **active** cell's value |
+
+No new element appears, and **no element holds more than one cell's value** --
+checked against all five known values in the range, not by eye.
+
+So per-cell navigation is not a missed optimisation. It is the only thing the
+tree offers, and `SourceReader` is not leaving anything on the table. Option (1)
+as written -- "a change to `SourceReader`, not to `scan`" -- is **not
+implementable against the accessibility tree**, and that sentence was wrong.
+
+### The clipboard route is UNRESOLVED, not ruled out
+
+Select the range, Ctrl+C, read the clipboard. Three attempts, all failing to
+deliver the keystroke at all:
+
+* `press_key("^c")` -- focus fell back to a click, which collapsed the range to
+  a single cell. The copy was meaningless, and without the Name Box check added
+  afterwards it would have looked like a clean negative result.
+* `press_key_with_state_and_focus("^c", false, false)` -- nothing focused, keys
+  went nowhere.
+* `press_key_with_state_and_focus("^c", true, false)` -- focused, still nothing
+  copied.
+
+In every attempt the Name Box read `"A2:B6"` at the moment of the copy, so the
+selection was right; the clipboard was simply unchanged. **This is a delivery
+failure, not evidence against the approach** -- the same trap as the reverted
+click "optimisation", where a mechanism failed before the hypothesis was
+reached. Whether Sheets would put a TSV block on the clipboard for a selected
+range is still unmeasured here.
+
+Two things to settle before anyone tries again:
+
+1. **How to send Ctrl+C through `terminator` at all.** `press_key` ends in
+   `send_keys(key, 10)`, which is SendKeys syntax, so `^c` should be right --
+   but it demonstrably did not arrive. Prove the keystroke lands on something
+   observable before spending it on this question.
+2. **Whether taking the clipboard is acceptable at all.** Nothing in the design
+   forbids it -- §3 permits transient handling of source values, and the
+   clipboard mentions in
+   [multiline-document-capture-duplicates.md](multiline-document-capture-duplicates.md)
+   are about `use_clipboard: false` in replay's typing path, not a prohibition.
+   The real objection is ownership: a scan that silently replaces what the user
+   had copied is taking something that is not the app's, and doing it every time
+   Check for new runs. Save-and-restore is possible -- the probe does it -- but
+   it is not free and not atomic, and a crash mid-scan leaves the clipboard
+   holding spreadsheet rows.
+
+### What this means for the real fix
+
+If the clipboard route is also unavailable, the remaining candidate is the
+**CSV-export design** -- the same `export?format=csv` request every probe in
+this repo already uses as ground truth. That is not a patch to `SourceReader`;
+it is a second source implementation with its own authentication, freshness and
+sheet-selection questions, and it deserves its own evaluation rather than being
+bolted on. Recorded here so that option (1) below is read as "needs a design",
+not "needs an afternoon".
 
 ## What would change it, roughly in order of appeal
 

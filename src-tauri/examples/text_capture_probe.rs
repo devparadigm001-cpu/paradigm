@@ -12069,6 +12069,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "navstress") {
         return navstress_mode().await;
     }
+    if std::env::args().any(|a| a == "rangeread") {
+        return rangeread_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -17400,4 +17403,249 @@ async fn navstress_mode() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+// ----------------------------------------------------- rangeread mode ----
+// Can more than one cell be read in a single operation?
+//
+// `batch-scan-cost-is-linear-in-rows.md` names "ask the source for a range
+// instead of a row at a time" as the real fix. Before building it, the question
+// is whether Google Sheets exposes such a thing AT ALL through the
+// accessibility tree -- because if it does not, the fix is a different design,
+// not a change to `SourceReader`.
+//
+// Differential, not a hopeful search: snapshot every text-bearing element with
+// ONE cell selected, snapshot again with a RANGE selected, and diff. Anything
+// that reveals more than one cell must differ between those two states. A
+// hopeful search would find the formula bar showing the active cell and be
+// tempted to call it progress.
+//
+// Then, only if the tree has nothing: does select + Ctrl+C + read clipboard
+// work, and what does it cost? The user's clipboard is saved and restored
+// either way -- a scan that silently eats what someone had copied is not
+// acceptable regardless of how fast it is.
+// -------------------------------------------------------------------------
+
+/// Every element in the window that carries text, as `role|name = value`.
+async fn text_surface(desktop: &Desktop, window: &UIElement) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for role in [
+        "role:Edit",
+        "role:Text",
+        "role:Document",
+        "role:Group",
+        "role:StatusBar",
+        "role:DataItem",
+        "role:Table",
+        "role:Custom",
+    ] {
+        if let Ok(found) = desktop
+            .locator(role)
+            .within(window.clone())
+            .all(Some(Duration::from_secs(4)), None)
+            .await
+        {
+            for el in found {
+                let name = el.name().unwrap_or_default();
+                let value = el.text(0).unwrap_or_default();
+                if value.trim().is_empty() && name.trim().is_empty() {
+                    continue;
+                }
+                out.push((
+                    format!("{}|{}", role, name.chars().take(40).collect::<String>()),
+                    value.chars().take(200).collect::<String>(),
+                ));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn clipboard_get() -> String {
+    std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Get-Clipboard -Raw"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
+fn clipboard_set(value: &str) {
+    // Round-trips through a file so newlines and quoting survive intact.
+    let path = std::env::temp_dir().join("paradigm-clipboard-restore.txt");
+    if std::fs::write(&path, value).is_ok() {
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("Get-Content -Raw '{}' | Set-Clipboard", path.display()),
+            ])
+            .status();
+    }
+}
+
+async fn rangeread_mode() -> ExitCode {
+    println!("== rangeread: can a range be read in one operation? ==\n");
+
+    let url = scratch_url();
+    if !url.contains("/spreadsheets/d/") {
+        eprintln!("set PARADIGM_SCRATCH_DOC to the seeded scan sheet");
+        return ExitCode::FAILURE;
+    }
+    let browser = "msedge";
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", url.as_str()])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut found = None;
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if let Some(w) = sheets_window(&desktop).await {
+            found = Some(w);
+            break;
+        }
+    }
+    let Some((window, doc_id)) = found else {
+        eprintln!("no spreadsheet window");
+        return ExitCode::FAILURE;
+    };
+    let _ = window.activate_window();
+    println!("doc: {doc_id}\n");
+
+    // ---- 1. single cell -----------------------------------------------------
+    println!("-- selecting A2 (single cell) --");
+    goto_sheet_via_namebox(&desktop, "A2").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let Some((window, _)) = sheets_window(&desktop).await else {
+        eprintln!("lost the window");
+        return ExitCode::FAILURE;
+    };
+    let single = text_surface(&desktop, &window).await;
+    println!("   {} text-bearing element(s)\n", single.len());
+
+    // ---- 2. a range ---------------------------------------------------------
+    println!("-- selecting A2:B6 (range of 10 cells) --");
+    goto_sheet_via_namebox(&desktop, "A2:B6").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let Some((window, _)) = sheets_window(&desktop).await else {
+        eprintln!("lost the window");
+        return ExitCode::FAILURE;
+    };
+    let ranged = text_surface(&desktop, &window).await;
+    println!("   {} text-bearing element(s)\n", ranged.len());
+
+    // ---- 3. the diff --------------------------------------------------------
+    println!("-- what CHANGED between one cell and ten --");
+    let mut changed = 0;
+    for (key, value) in &ranged {
+        let before = single.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        if before.as_deref() != Some(value.as_str()) {
+            changed += 1;
+            println!("   {key}");
+            println!("      one cell : {:?}", before.unwrap_or_default());
+            println!("      range    : {value:?}");
+        }
+    }
+    if changed == 0 {
+        println!("   nothing changed at all");
+    }
+
+    // Does ANY single element carry more than one of the known values?
+    let markers = ["Blue Horizon", "Redwood", "Silverline", "Cedar Point", "Marigold"];
+    println!("\n-- does any ONE element hold multiple cell values? --");
+    let mut multi = false;
+    for (key, value) in &ranged {
+        let hits = markers.iter().filter(|m| value.contains(**m)).count();
+        if hits > 1 {
+            multi = true;
+            println!("   {key} holds {hits} values: {value:?}");
+        }
+    }
+    if !multi {
+        println!("   no element holds more than one cell's value");
+    }
+
+    // ---- 4. the clipboard route --------------------------------------------
+    println!("\n-- select + Ctrl+C + read clipboard --");
+    let saved = clipboard_get();
+    println!("   saved the user's clipboard ({} bytes)", saved.len());
+
+    goto_sheet_via_namebox(&desktop, "A2:B6").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Confirm the RANGE is still selected at the moment of the copy. The first
+    // attempt used plain `press_key`, which clicks the element first -- that
+    // click collapsed the selection back to one cell, so Ctrl+C copied nothing
+    // and the run "proved" the clipboard route does not work when it had never
+    // been tried. Checking the Name Box here makes that failure impossible to
+    // mistake for a result.
+    let selection = {
+        let mut reading = String::new();
+        if let Some((w, _)) = sheets_window(&desktop).await {
+            if let Ok(boxes) = desktop
+                .locator("name:Name box")
+                .within(w)
+                .all(Some(Duration::from_secs(4)), None)
+                .await
+            {
+                if let Some(edit) = boxes
+                    .into_iter()
+                    .next()
+                    .and_then(|g| g.children().ok())
+                    .and_then(|c| c.into_iter().find(|e| e.role() == "Edit"))
+                {
+                    reading = edit.text(0).unwrap_or_default();
+                }
+            }
+        }
+        reading
+    };
+    println!("   Name Box reads {:?} at the moment of copy", selection.trim());
+
+    let started = std::time::Instant::now();
+    if let Ok(focused) = desktop.focused_element() {
+        // No focus change, no click -- the selection must survive the keypress.
+        let _ = focused.press_key_with_state_and_focus("^c", true, false);
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let copied = clipboard_get();
+    let took = started.elapsed();
+
+    let values = markers.iter().filter(|m| copied.contains(**m)).count();
+    println!("   {} bytes in {:.2}s", copied.len(), took.as_secs_f64());
+    println!("   holds {values} of the 5 known values");
+    if values > 0 {
+        let preview: String = copied.chars().take(160).collect();
+        println!("   raw: {preview:?}");
+    }
+
+    clipboard_set(&saved);
+    let restored = clipboard_get();
+    println!(
+        "   clipboard restored: {}",
+        restored.trim() == saved.trim()
+    );
+
+    println!("\n== VERDICT ==");
+    println!("  elements differing between 1 cell and 10 : {changed}");
+    println!("  any element holding >1 cell value        : {multi}");
+    println!("  clipboard held {values}/5 values in {:.2}s", took.as_secs_f64());
+    if !multi {
+        println!("\n  The accessibility tree does NOT expose a range's values.");
+        println!("  Per-cell navigation is not a missed optimisation there --");
+        println!("  it is the only thing the tree offers.");
+    }
+    println!("\n  doc: {doc_id}");
+    ExitCode::SUCCESS
 }

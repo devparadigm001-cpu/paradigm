@@ -367,9 +367,22 @@ impl SpreadsheetReader {
         })?;
         // `press_key` is NOT just a keystroke. Its default is
         // `press_key(key, try_focus_before = true, try_click_before = true)`,
-        // so every call performs a real mouse CLICK on the element first.
-        // Nothing at the call site says so, and it is why a user watching a
-        // scan sees the app clicking once per cell read.
+        // and the Windows implementation focuses the element, then CLICKS IT AS
+        // A FALLBACK if the focus call fails:
+        //
+        //     if try_focus_before {
+        //         match self.focus() {
+        //             Ok(_) => ...,
+        //             Err(_) => if try_click_before { self.click() }
+        //         }
+        //     }
+        //
+        // So the click is not on every call -- it is on every call where focus
+        // FAILED. A user reporting that a scan "keeps clicking" is therefore
+        // reporting that focus is failing repeatedly, which is a symptom worth
+        // reading rather than cosmetic noise. (An earlier version of this
+        // comment said every call clicks. It does not; corrected against the
+        // implementation.)
         //
         // Dropping that click was tried and REVERTED, because it is measurably
         // worse. The only public way to control the flag is
