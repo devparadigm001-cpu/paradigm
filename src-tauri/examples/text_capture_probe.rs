@@ -12102,6 +12102,18 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "editdump") {
         return editdump_mode().await;
     }
+    if std::env::args().any(|a| a == "windowsweep") {
+        return windowsweep_mode().await;
+    }
+    if std::env::args().any(|a| a == "distinctsweep") {
+        return distinctsweep_mode().await;
+    }
+    if std::env::args().any(|a| a == "focustest") {
+        return focustest_mode().await;
+    }
+    if std::env::args().any(|a| a == "clicktest") {
+        return clicktest_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -18833,5 +18845,568 @@ async fn editdump_mode() -> ExitCode {
             text.chars().take(48).collect::<String>()
         );
     }
+    ExitCode::SUCCESS
+}
+
+/// windowsweep -- does the formula bar go blank because of WINDOW COUNT?
+///
+/// The claim under test came from two observations, not an experiment: reads
+/// worked with one Sheets window and returned newlines-plus-a-BOM with three.
+/// Two data points are a correlation. This runs the same read repeatedly at
+/// each window count and reports raw per-trial data, so "consistent at 3" and
+/// "intermittent everywhere" can be told apart.
+///
+/// Per trial it records what actually varies: how many Name Box elements the
+/// window exposes, how many Edits, exactly what the formula bar reports, and --
+/// when that is empty -- whether waiting and reading again fixes it, which is
+/// the timing question.
+async fn windowsweep_mode() -> ExitCode {
+    use paradigm_lib::source::spreadsheet::rank_formula_bar_candidates;
+
+    let doc = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "1g3lvtsYyGc_aIqoiPBKJRlsSjkk4i2AAg72VPFvPm3Q".to_string());
+    let cell = "A2";
+    let expected = "Blue Horizon Supply";
+    let trials: usize = std::env::args()
+        .nth(3)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(5);
+
+    println!("== windowsweep: {doc} {cell}, expecting {expected:?} ==");
+    println!("   {trials} trial(s) at each window count\n");
+
+    let url = format!("https://docs.google.com/spreadsheets/d/{doc}/edit");
+
+    for count in 1..=3usize {
+        // Fresh browser each configuration, so a previous arrangement cannot
+        // carry over.
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force",
+            ])
+            .status();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        for _ in 0..count {
+            let _ = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "Start-Process",
+                    "msedge",
+                    "-ArgumentList",
+                    &format!("'--new-window','{url}'"),
+                ])
+                .status();
+            tokio::time::sleep(Duration::from_secs(18)).await;
+        }
+
+        let desktop = match Desktop::new(false, false) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no desktop: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // How many Sheets windows actually exist, as opposed to how many were
+        // asked for -- Edge merges them sometimes.
+        let sheets_windows = desktop
+            .locator("role:Window")
+            .within(desktop.root())
+            .all(Some(Duration::from_secs(8)), Some(3))
+            .await
+            .unwrap_or_default();
+        let mut showing = 0;
+        for w in &sheets_windows {
+            if address_of(&desktop, w).await.contains(&doc) {
+                showing += 1;
+            }
+        }
+
+        println!("---- asked for {count} window(s); {showing} window(s) show the doc ----");
+
+        let mut ok = 0;
+        for trial in 1..=trials {
+            let Some(window) = paradigm_lib::run::surfaces::window_for(&desktop, &doc).await
+            else {
+                println!("  trial {trial}: window_for found nothing");
+                continue;
+            };
+
+            let name_box_rects: Vec<_> = desktop
+                .locator("name:Name box")
+                .within(window.clone())
+                .all(Some(Duration::from_secs(5)), None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|g| g.children().unwrap_or_default())
+                .filter(|e| e.role() == "Edit")
+                .collect();
+            let name_box_count = name_box_rects.len();
+            let Some(name_box) = name_box_rects.first() else {
+                println!("  trial {trial}: no Name Box at all");
+                continue;
+            };
+
+            let edits = desktop
+                .locator("role:Edit")
+                .within(window.clone())
+                .all(Some(Duration::from_secs(6)), None)
+                .await
+                .unwrap_or_default();
+
+            let nb_rect = match name_box.bounds() {
+                Ok((x, y, w, h)) => paradigm_lib::source::spreadsheet::Rect { x, y, w, h },
+                Err(_) => continue,
+            };
+            let excluded: Vec<_> = name_box_rects
+                .iter()
+                .filter_map(|e| {
+                    e.bounds()
+                        .ok()
+                        .map(|(x, y, w, h)| paradigm_lib::source::spreadsheet::Rect { x, y, w, h })
+                })
+                .collect();
+            let rects: Vec<(usize, paradigm_lib::source::spreadsheet::Rect)> = edits
+                .iter()
+                .enumerate()
+                .filter_map(|(i, el)| {
+                    el.bounds()
+                        .ok()
+                        .map(|(x, y, w, h)| {
+                            (i, paradigm_lib::source::spreadsheet::Rect { x, y, w, h })
+                        })
+                })
+                .collect();
+            let ranked = rank_formula_bar_candidates(nb_rect, &rects, &excluded);
+            let Some(&fb) = ranked.first() else {
+                println!("  trial {trial}: no formula bar candidate (name boxes {name_box_count})");
+                continue;
+            };
+
+            // The reader's own navigation.
+            let _ = name_box.set_value(cell);
+            let _ = name_box.press_key("{Enter}");
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let landed = name_box.text(0).unwrap_or_default();
+
+            let raw = edits[fb].text(0).unwrap_or_default();
+            let cleaned = raw.trim().trim_matches('\u{feff}').trim().to_string();
+            let matched = cleaned == expected;
+
+            // The timing question: if it came back empty, does waiting help?
+            let mut after_wait = String::new();
+            if !matched {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                after_wait = edits[fb]
+                    .text(0)
+                    .unwrap_or_default()
+                    .trim()
+                    .trim_matches('\u{feff}')
+                    .trim()
+                    .to_string();
+            }
+
+            if matched {
+                ok += 1;
+            }
+            println!(
+                "  trial {trial}: nameboxes={name_box_count} edits={} landed={:?} fb={:?}{}",
+                edits.len(),
+                landed.trim(),
+                cleaned.chars().take(30).collect::<String>(),
+                if matched {
+                    "  OK".to_string()
+                } else {
+                    format!("  MISMATCH; after 3s wait: {:?}", after_wait.chars().take(30).collect::<String>())
+                }
+            );
+        }
+        println!("  => {ok}/{trials} correct at {showing} window(s)\n");
+    }
+    ExitCode::SUCCESS
+}
+
+/// distinctsweep -- the same read, with OTHER documents open alongside.
+///
+/// `windowsweep` ruled out window count: three windows on the SAME document
+/// read correctly 5/5. The failing configuration had three windows on THREE
+/// DIFFERENT documents, so the variable under test here is how many *distinct*
+/// spreadsheets are open, not how many windows.
+async fn distinctsweep_mode() -> ExitCode {
+    use paradigm_lib::source::spreadsheet::rank_formula_bar_candidates;
+
+    let target = "1g3lvtsYyGc_aIqoiPBKJRlsSjkk4i2AAg72VPFvPm3Q";
+    let others = [
+        "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs",
+        "1d2LLTBv-Fu56cnLpinSVQC59JMRf2816AsWIBvIM8eQ",
+    ];
+    let cell = "A2";
+    let expected = "Blue Horizon Supply";
+    let trials: usize = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(4);
+
+    println!("== distinctsweep: reading {target} {cell}, expecting {expected:?} ==\n");
+
+    for extra in 0..=2usize {
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force",
+            ])
+            .status();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Target first, then `extra` OTHER documents alongside it.
+        let mut open = vec![target.to_string()];
+        open.extend(others.iter().take(extra).map(|s| s.to_string()));
+        for doc in &open {
+            let _ = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    "Start-Process",
+                    "msedge",
+                    "-ArgumentList",
+                    &format!(
+                        "'--new-window','https://docs.google.com/spreadsheets/d/{doc}/edit'"
+                    ),
+                ])
+                .status();
+            tokio::time::sleep(Duration::from_secs(18)).await;
+        }
+
+        let desktop = match Desktop::new(false, false) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no desktop: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!("---- target plus {extra} other document(s) open ----");
+
+        let mut ok = 0;
+        for trial in 1..=trials {
+            let Some(window) =
+                paradigm_lib::run::surfaces::window_for(&desktop, target).await
+            else {
+                println!("  trial {trial}: window_for found nothing");
+                continue;
+            };
+            let boxes: Vec<_> = desktop
+                .locator("name:Name box")
+                .within(window.clone())
+                .all(Some(Duration::from_secs(5)), None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|g| g.children().unwrap_or_default())
+                .filter(|e| e.role() == "Edit")
+                .collect();
+            let Some(name_box) = boxes.first() else {
+                println!("  trial {trial}: no Name Box");
+                continue;
+            };
+            let edits = desktop
+                .locator("role:Edit")
+                .within(window.clone())
+                .all(Some(Duration::from_secs(6)), None)
+                .await
+                .unwrap_or_default();
+            let nb = match name_box.bounds() {
+                Ok((x, y, w, h)) => paradigm_lib::source::spreadsheet::Rect { x, y, w, h },
+                Err(_) => continue,
+            };
+            let excluded: Vec<_> = boxes
+                .iter()
+                .filter_map(|e| {
+                    e.bounds()
+                        .ok()
+                        .map(|(x, y, w, h)| paradigm_lib::source::spreadsheet::Rect { x, y, w, h })
+                })
+                .collect();
+            let rects: Vec<(usize, paradigm_lib::source::spreadsheet::Rect)> = edits
+                .iter()
+                .enumerate()
+                .filter_map(|(i, el)| {
+                    el.bounds().ok().map(|(x, y, w, h)| {
+                        (i, paradigm_lib::source::spreadsheet::Rect { x, y, w, h })
+                    })
+                })
+                .collect();
+            let ranked = rank_formula_bar_candidates(nb, &rects, &excluded);
+            let Some(&fb) = ranked.first() else {
+                println!("  trial {trial}: no candidate (nameboxes {})", boxes.len());
+                continue;
+            };
+
+            let _ = name_box.set_value(cell);
+            let _ = name_box.press_key("{Enter}");
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let landed = name_box.text(0).unwrap_or_default();
+            let raw = edits[fb].text(0).unwrap_or_default();
+            let cleaned = raw.trim().trim_matches('\u{feff}').trim().to_string();
+            let matched = cleaned == expected;
+            if matched {
+                ok += 1;
+            }
+            println!(
+                "  trial {trial}: nameboxes={} edits={} landed={:?} fb={:?} {}",
+                boxes.len(),
+                edits.len(),
+                landed.trim(),
+                cleaned.chars().take(28).collect::<String>(),
+                if matched { "OK" } else { "MISMATCH" }
+            );
+        }
+        println!("  => {ok}/{trials} correct with {extra} other doc(s)\n");
+    }
+    ExitCode::SUCCESS
+}
+
+/// focustest -- with another document open, does FOCUS decide it?
+///
+/// `distinctsweep` established the trigger exactly: one other spreadsheet open
+/// and the formula bar reads empty, 0/4, deterministically. The obvious
+/// mechanism is that only the foreground document maintains a live formula bar
+/// and the rest keep an empty skeleton. This tests that directly, and tests
+/// whether waiting alone is enough -- the timing question.
+async fn focustest_mode() -> ExitCode {
+    use paradigm_lib::source::spreadsheet::rank_formula_bar_candidates;
+
+    let target = "1g3lvtsYyGc_aIqoiPBKJRlsSjkk4i2AAg72VPFvPm3Q";
+    let other = "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs";
+    let expected = "Blue Horizon Supply";
+
+    let _ = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force",
+        ])
+        .status();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    for doc in [target, other] {
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Start-Process",
+                "msedge",
+                "-ArgumentList",
+                &format!("'--new-window','https://docs.google.com/spreadsheets/d/{doc}/edit'"),
+            ])
+            .status();
+        tokio::time::sleep(Duration::from_secs(18)).await;
+    }
+
+    let desktop = Desktop::new(false, false).expect("desktop");
+    println!("== target + 1 other document open; target is NOT foreground ==\n");
+
+    let read_once = |label: &'static str| {
+        let desktop = desktop.clone();
+        async move {
+            let Some(window) =
+                paradigm_lib::run::surfaces::window_for(&desktop, target).await
+            else {
+                println!("  {label}: window_for found nothing");
+                return;
+            };
+            if label.contains("activate") {
+                let _ = window.activate_window();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            let boxes: Vec<_> = desktop
+                .locator("name:Name box")
+                .within(window.clone())
+                .all(Some(Duration::from_secs(5)), None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|g| g.children().unwrap_or_default())
+                .filter(|e| e.role() == "Edit")
+                .collect();
+            let Some(name_box) = boxes.first() else {
+                println!("  {label}: no Name Box");
+                return;
+            };
+            let edits = desktop
+                .locator("role:Edit")
+                .within(window.clone())
+                .all(Some(Duration::from_secs(6)), None)
+                .await
+                .unwrap_or_default();
+            let nb = match name_box.bounds() {
+                Ok((x, y, w, h)) => paradigm_lib::source::spreadsheet::Rect { x, y, w, h },
+                Err(_) => return,
+            };
+            let excluded: Vec<_> = boxes
+                .iter()
+                .filter_map(|e| {
+                    e.bounds()
+                        .ok()
+                        .map(|(x, y, w, h)| paradigm_lib::source::spreadsheet::Rect { x, y, w, h })
+                })
+                .collect();
+            let rects: Vec<(usize, paradigm_lib::source::spreadsheet::Rect)> = edits
+                .iter()
+                .enumerate()
+                .filter_map(|(i, el)| {
+                    el.bounds().ok().map(|(x, y, w, h)| {
+                        (i, paradigm_lib::source::spreadsheet::Rect { x, y, w, h })
+                    })
+                })
+                .collect();
+            let Some(&fb) = rank_formula_bar_candidates(nb, &rects, &excluded).first() else {
+                println!("  {label}: no candidate");
+                return;
+            };
+            let _ = name_box.set_value("A2");
+            let _ = name_box.press_key("{Enter}");
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let first = edits[fb].text(0).unwrap_or_default();
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let after = edits[fb].text(0).unwrap_or_default();
+            let clean = |s: &str| s.trim().trim_matches('\u{feff}').trim().to_string();
+            println!(
+                "  {label}: edits={} fb={:?} after+4s={:?} {}",
+                edits.len(),
+                clean(&first).chars().take(28).collect::<String>(),
+                clean(&after).chars().take(28).collect::<String>(),
+                if clean(&first) == expected || clean(&after) == expected {
+                    "OK"
+                } else {
+                    "EMPTY"
+                }
+            );
+        }
+    };
+
+    read_once("no activation      ").await;
+    read_once("no activation (2nd)").await;
+    read_once("with activation    ").await;
+    read_once("with activation(2nd)").await;
+    println!("\n  If activation is the difference, focus decides it and a reader");
+    println!("  must foreground the document it is reading -- which steals focus.");
+    ExitCode::SUCCESS
+}
+
+/// clicktest -- does REAL interaction with the page revive the formula bar?
+///
+/// Everything else is ruled out: not window count, not which element is picked
+/// (the same element reports content in one state and newlines in the other),
+/// not `activate_window`, not a 4s wait. What has not been tried is a genuine
+/// mouse click into the grid -- `set_value` on the Name Box drives UIA and may
+/// never register as the page being used.
+async fn clicktest_mode() -> ExitCode {
+    use paradigm_lib::source::spreadsheet::rank_formula_bar_candidates;
+    let target = "1g3lvtsYyGc_aIqoiPBKJRlsSjkk4i2AAg72VPFvPm3Q";
+    let expected = "Blue Horizon Supply";
+
+    let desktop = Desktop::new(false, false).expect("desktop");
+    let Some(window) = paradigm_lib::run::surfaces::window_for(&desktop, target).await else {
+        eprintln!("no window showing the target -- run focustest first");
+        return ExitCode::FAILURE;
+    };
+    let _ = window.activate_window();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let boxes: Vec<_> = desktop
+        .locator("name:Name box")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|g| g.children().unwrap_or_default())
+        .filter(|e| e.role() == "Edit")
+        .collect();
+    let Some(name_box) = boxes.first() else {
+        eprintln!("no Name Box");
+        return ExitCode::FAILURE;
+    };
+    let edits = desktop
+        .locator("role:Edit")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(6)), None)
+        .await
+        .unwrap_or_default();
+    let (nbx, nby, nbw, nbh) = name_box.bounds().unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let nb = paradigm_lib::source::spreadsheet::Rect { x: nbx, y: nby, w: nbw, h: nbh };
+    let excluded: Vec<_> = boxes
+        .iter()
+        .filter_map(|e| {
+            e.bounds()
+                .ok()
+                .map(|(x, y, w, h)| paradigm_lib::source::spreadsheet::Rect { x, y, w, h })
+        })
+        .collect();
+    let rects: Vec<(usize, paradigm_lib::source::spreadsheet::Rect)> = edits
+        .iter()
+        .enumerate()
+        .filter_map(|(i, el)| {
+            el.bounds()
+                .ok()
+                .map(|(x, y, w, h)| (i, paradigm_lib::source::spreadsheet::Rect { x, y, w, h }))
+        })
+        .collect();
+    let Some(&fb) = rank_formula_bar_candidates(nb, &rects, &excluded).first() else {
+        eprintln!("no formula bar candidate");
+        return ExitCode::FAILURE;
+    };
+    let clean = |s: &str| s.trim().trim_matches('\u{feff}').trim().to_string();
+
+    let _ = name_box.set_value("A2");
+    let _ = name_box.press_key("{Enter}");
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    println!("before any click : {:?}", clean(&edits[fb].text(0).unwrap_or_default()));
+
+    // A real click into the grid, roughly a couple of rows below the Name Box.
+    // A real click on the grid, found through the tree rather than by
+    // coordinates -- the window sits off the primary screen, so raw screen
+    // coordinates would be a guess.
+    let grid = desktop
+        .locator("role:Table")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .next();
+    match &grid {
+        Some(g) => {
+            println!("clicking the grid element");
+            let _ = g.click();
+        }
+        None => println!("no role:Table to click; clicking the window"),
+    }
+    if grid.is_none() {
+        let _ = window.click();
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("after grid click : {:?}", clean(&edits[fb].text(0).unwrap_or_default()));
+
+    // Then navigate again, now that the page has genuinely been used.
+    let _ = name_box.set_value("A2");
+    let _ = name_box.press_key("{Enter}");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let after = clean(&edits[fb].text(0).unwrap_or_default());
+    println!("after click+goto : {after:?}");
+    println!(
+        "\n  {}",
+        if after == expected {
+            "REVIVED by real interaction -- a reader could click before reading."
+        } else {
+            "STILL EMPTY -- real interaction does not revive it either."
+        }
+    );
     ExitCode::SUCCESS
 }
