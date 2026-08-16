@@ -260,3 +260,75 @@ Times the scan's real inner loop — `peek` then `advance`, the same two calls
 `scan_with_limit` makes — and reports per-cell as well as per-row, because the
 cost is per cell. Seeds the sheet only if it is empty, so a before/after pair
 measures the same data; `clearscratch` blanks it between runs.
+
+## CSV-export spike, 2026-08-15: fast and fresh, but it needs the browser
+
+Measured with `text_capture_probe csvspike` against the same live sheet, using
+the existing `export?format=csv` mechanism every probe here already uses as
+ground truth. A spike, not an implementation.
+
+### Speed and freshness: both good
+
+| | measured |
+|---|---|
+| one export, 3 consecutive fetches | 2.33s, 2.35s, 1.30s — **~2.0s average** |
+| per-cell scan, same sheet | ~0.98s per cell, 2 cells per row |
+| break-even | **~2 rows** |
+| projected at `SCAN_LIMIT = 200` | **391s per-cell vs 2.0s export (~196x)** |
+
+An export costs the same whatever the row count; the per-cell path does not.
+That is the whole case, and it is why the ratio on a small sheet understates it.
+
+**Freshness is not a problem.** A cell was edited and the very next export —
+**1.3 seconds later** — already contained the new value. No lag, no polling, no
+stale-read window. This was the risk most likely to kill the idea outright and
+it did not materialise.
+
+### The real obstacle is authentication
+
+A plain fetch of the export URL with no browser session:
+
+```
+STATUS=401
+```
+
+The export URL is **not** publicly readable. Every use of it in this repo works
+because it drives the signed-in **browser**, which carries the session cookie,
+and then reads the downloaded file out of the Downloads folder.
+
+That is fine for a probe and awkward for a product feature. It means a
+CSV-based scan would either:
+
+1. **keep driving the browser** — which works today, but opens a window per
+   export and drops a file in the user's Downloads every time Check for new
+   runs. §4.10's "does not lock the window" is not literally violated, but the
+   spirit is; and
+2. **hold real Google credentials** — OAuth, token storage, refresh, revocation,
+   and a consent screen. That is a product decision about connecting an
+   account, not a `SourceReader` refactor.
+
+There is no third option in which an unattended run quietly fetches a CSV.
+
+### Conclusion for the "real fix"
+
+The performance case is settled and strong — roughly 196x at the scan ceiling,
+with no freshness penalty. The blocker is entirely about **access**, and it is
+the kind that needs a decision rather than an implementation.
+
+So option (1) below stands as the right direction and remains **not a quick
+fix**. What it needs next is a decision on how the app is allowed to reach the
+user's spreadsheet, not more measurement.
+
+### One caveat about the spike itself
+
+The first run reported "54 data rows" and a 52.8x ratio. Both were wrong: Sheets
+exports every allocated-but-blank row as a bare `,`, and the row filter counted
+those as data, inflating the denominator tenfold. Corrected to count lines with
+at least one non-empty field before the numbers above were taken.
+
+The same run also left a `FRESH-3` marker in the sheet's D1. Its cleanup called
+`write("D", "")`, and **writing an empty string does not clear a cell** —
+`type_here` types nothing, the old value survives, the read-back then fails, and
+the error was swallowed. Deleting is a different operation from writing nothing;
+the probe now uses the Name Box and the Delete key and verifies against the
+export. `clearcell` was added for the same reason.

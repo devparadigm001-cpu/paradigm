@@ -12072,6 +12072,12 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "rangeread") {
         return rangeread_mode().await;
     }
+    if std::env::args().any(|a| a == "csvspike") {
+        return csvspike_mode().await;
+    }
+    if std::env::args().any(|a| a == "clearcell") {
+        return clearcell_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -17648,4 +17654,305 @@ async fn rangeread_mode() -> ExitCode {
     }
     println!("\n  doc: {doc_id}");
     ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------- csvspike mode ----
+// SPIKE: is a CSV-export-based scan viable? Measure, do not build.
+//
+// Four questions, in the order that can kill the idea earliest:
+//
+//   1) how long does one export actually take, repeatedly;
+//   2) does a fresh export reflect an edit made seconds ago, or lag -- a scan
+//      reading stale data would silently miss or duplicate records, which is
+//      worse than being slow;
+//   3) what does it need to authenticate, and does the templated use case
+//      (unattended, no tab necessarily open) differ from how every probe in
+//      this repo already uses the same URL;
+//   4) the comparison against the per-cell path on the same sheet.
+//
+// No SourceReader is written here. The point is to find out whether one is
+// worth writing.
+// -------------------------------------------------------------------------
+
+async fn csvspike_mode() -> ExitCode {
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::DestinationWriter;
+
+    println!("== csvspike: is a CSV-export scan viable? ==\n");
+
+    let url = scratch_url();
+    let Some(doc_id) = url
+        .split("/d/")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .map(str::to_string)
+    else {
+        eprintln!("set PARADIGM_SCRATCH_DOC to the sheet under test");
+        return ExitCode::FAILURE;
+    };
+    let browser = "msedge";
+    println!("doc: {doc_id}\n");
+
+    // ---- 1. how long is one export? ----------------------------------------
+    println!("-- 1) export timing, three consecutive fetches --");
+    let mut export_times = Vec::new();
+    let mut rows_seen = 0usize;
+    for attempt in 1..=3 {
+        let started = std::time::Instant::now();
+        let csv = download_csv(browser, &doc_id, "0").await;
+        let took = started.elapsed();
+        match &csv {
+            Some(body) => {
+                // Lines that hold DATA, not lines that are non-empty. Sheets
+                // exports every allocated-but-blank row as a bare "," -- this
+                // sheet has 5 real rows and ~50 of those -- and counting them
+                // as data inflated the row count to 54, which in turn inflated
+                // the comparison below by an order of magnitude. A ratio built
+                // on a miscounted denominator is exactly the kind of number
+                // that gets quoted later.
+                let rows = body
+                    .lines()
+                    .filter(|l| l.split(',').any(|f| !f.trim().is_empty()))
+                    .count();
+                rows_seen = rows;
+                println!(
+                    "   fetch {attempt}: {:.2}s   {} bytes, {rows} non-empty line(s)",
+                    took.as_secs_f64(),
+                    body.len()
+                );
+                export_times.push(took.as_secs_f64());
+            }
+            None => println!("   fetch {attempt}: FAILED after {:.2}s", took.as_secs_f64()),
+        }
+    }
+    let export_avg = if export_times.is_empty() {
+        f64::NAN
+    } else {
+        export_times.iter().sum::<f64>() / export_times.len() as f64
+    };
+
+    // ---- 2. freshness -------------------------------------------------------
+    //
+    // The question that can kill this outright. A real edit, then export until
+    // it appears. Written to D1 -- outside the mapped columns A and B -- and
+    // blanked afterwards, so the data the other probes rely on is untouched.
+    println!("\n-- 2) freshness: edit a cell, then export until it shows --");
+    let marker = format!("FRESH-{}", export_times.len());
+    let edit_at = {
+        let Some((window, _)) = sheets_window(&desktop_or_die().await).await else {
+            eprintln!("   lost the spreadsheet window");
+            return ExitCode::FAILURE;
+        };
+        let desktop = desktop_or_die().await;
+        let Ok(mut w) =
+            SpreadsheetWriter::open(desktop.clone(), &window, doc_id.clone(), None, 1).await
+        else {
+            eprintln!("   writer failed");
+            return ExitCode::FAILURE;
+        };
+        if let Err(e) = w.write("D", &marker) {
+            eprintln!("   could not write the marker: {e}");
+            return ExitCode::FAILURE;
+        }
+        std::time::Instant::now()
+    };
+    println!("   wrote D1 = {marker:?}");
+
+    let mut appeared_after = None;
+    for attempt in 1..=5 {
+        let csv = download_csv(browser, &doc_id, "0").await;
+        let elapsed = edit_at.elapsed().as_secs_f64();
+        let present = csv.as_deref().map(|b| b.contains(&marker)).unwrap_or(false);
+        println!(
+            "   export {attempt} at +{elapsed:.1}s from the edit: marker {}",
+            if present { "PRESENT" } else { "absent" }
+        );
+        if present {
+            appeared_after = Some(elapsed);
+            break;
+        }
+    }
+
+    // Put D1 back -- with Delete, and CHECKED.
+    //
+    // The first version called `write("D", "")`, which does not clear a cell:
+    // `type_here` types the empty string, which types nothing, the old value
+    // survives, and the read-back then fails the write. That error was
+    // swallowed with `let _ =`, and this probe left "FRESH-3" sitting in a live
+    // sheet until an export happened to show it. Writing nothing is not the
+    // same operation as deleting.
+    {
+        let desktop = desktop_or_die().await;
+        if goto_sheet_via_namebox(&desktop, "D1").await.is_none() {
+            eprintln!("   WARNING: could not select D1 -- the marker may still be there");
+        }
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        if let Ok(el) = desktop.focused_element() {
+            let _ = el.press_key("{Delete}");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    // Confirmed against the export, because a cleanup that only believes its
+    // own keystroke is how the marker survived the first time.
+    match download_csv(browser, &doc_id, "0").await {
+        Some(csv) if csv.contains(&marker) => {
+            println!("   !! D1 STILL HOLDS {marker:?} -- clear it by hand before reusing this sheet");
+        }
+        Some(_) => println!("   D1 cleared, confirmed by export"),
+        None => println!("   !! could not export to confirm D1 was cleared"),
+    }
+
+    // ---- 3. what does it take to authenticate? -----------------------------
+    //
+    // Every export in this repo goes through the BROWSER, which carries the
+    // signed-in session. The templated use case is unattended, so the question
+    // is what happens without that session -- a plain fetch, no cookies.
+    println!("\n-- 3) does the export URL work WITHOUT the browser session? --");
+    let export_url =
+        format!("https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv&gid=0");
+    let probe = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "try {{ $r = Invoke-WebRequest -Uri '{export_url}' -MaximumRedirection 0 \
+                 -ErrorAction Stop; \
+                 Write-Output \"STATUS=$($r.StatusCode)\"; \
+                 Write-Output \"TYPE=$($r.Headers['Content-Type'])\"; \
+                 Write-Output \"HEAD=$($r.Content.Substring(0,[Math]::Min(80,$r.Content.Length)))\" }} \
+                 catch {{ Write-Output \"STATUS=$($_.Exception.Response.StatusCode.value__)\"; \
+                 Write-Output \"LOCATION=$($_.Exception.Response.Headers['Location'])\" }}"
+            ),
+        ])
+        .output();
+    match &probe {
+        Ok(out) => {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                println!("   {line}");
+            }
+        }
+        Err(e) => println!("   could not probe: {e}"),
+    }
+
+    // ---- 4. the comparison --------------------------------------------------
+    //
+    // The per-cell number is the measured baseline from `scantime` on the same
+    // shape of sheet: 0.977s per cell, two mapped columns per row.
+    const PER_CELL: f64 = 0.977;
+    let data_rows = rows_seen.saturating_sub(1);
+    let per_cell_total = data_rows as f64 * 2.0 * PER_CELL;
+
+    println!("\n== RESULT ==");
+    println!("  rows in the sheet          : {data_rows} data row(s)");
+    println!("  one CSV export             : {export_avg:.2}s average of 3");
+    println!("  per-cell scan, same rows   : {per_cell_total:.2}s  ({data_rows} x 2 cells x {PER_CELL}s)");
+    if export_avg.is_finite() && export_avg > 0.0 {
+        println!("  ratio on THIS sheet        : {:.1}x", per_cell_total / export_avg);
+        let breakeven = (export_avg / (2.0 * PER_CELL)).ceil();
+        println!("  break-even                 : ~{breakeven:.0} row(s)");
+        // The ratio on a small sheet understates the case and would be the
+        // wrong number to quote. An export costs the same whatever the row
+        // count; the per-cell path does not. So the honest comparison is how
+        // the gap grows, projected at the ceiling the scan already enforces.
+        let at_limit = 200.0 * 2.0 * PER_CELL;
+        println!(
+            "  projected at SCAN_LIMIT=200 : {at_limit:.0}s per-cell vs {export_avg:.2}s export \
+             ({:.0}x)",
+            at_limit / export_avg
+        );
+    }
+    match appeared_after {
+        Some(s) => println!("  edit visible in export     : after {s:.1}s"),
+        None => println!("  edit visible in export     : NOT within 5 exports -- STALE"),
+    }
+    println!("\n  doc: {doc_id}");
+    ExitCode::SUCCESS
+}
+
+/// A desktop handle or a hard stop -- the spike has nothing to say without one.
+async fn desktop_or_die() -> Desktop {
+    Desktop::new(false, false).expect("accessibility engine")
+}
+
+/// clearcell -- blank ONE named cell and verify it, via the Name Box + Delete.
+///
+/// Exists because `SpreadsheetWriter::write(col, "")` does NOT clear a cell:
+/// `type_here` types the empty string, which types nothing, so the old value
+/// survives and the read-back then fails the write. The `csvspike` probe used
+/// it to undo a freshness marker, swallowed the error with `let _ =`, and left
+/// "FRESH-3" sitting in a live sheet. Deleting is a different operation from
+/// writing nothing, and this is that operation.
+async fn clearcell_mode() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(doc_id) = args.iter().find(|a| {
+        a.len() >= 40
+            && a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }) else {
+        eprintln!("usage: text_capture_probe clearcell <doc-id> <cell>");
+        return ExitCode::FAILURE;
+    };
+    let Some(cell) = args.iter().find(|a| {
+        a.len() <= 8
+            && a.chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false)
+            && a.chars().skip(1).any(|c| c.is_ascii_digit())
+    }) else {
+        eprintln!("give a cell reference, e.g. D1");
+        return ExitCode::FAILURE;
+    };
+    println!("== clearing {cell} in {doc_id} ==");
+
+    let browser = "msedge";
+    let url = format!("https://docs.google.com/spreadsheets/d/{doc_id}/edit");
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", &url])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut window = None;
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if let Some(w) = window_for_doc(&desktop, doc_id).await {
+            window = Some(w);
+            break;
+        }
+    }
+    let Some(window) = window else {
+        eprintln!("no window showing {doc_id}");
+        return ExitCode::FAILURE;
+    };
+    let _ = window.activate_window();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    if goto_sheet_via_namebox(&desktop, cell).await.is_none() {
+        eprintln!("could not select {cell}");
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    if let Ok(el) = desktop.focused_element() {
+        let _ = el.press_key("{Delete}");
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Verified against the export, not against the keystroke.
+    match download_csv(browser, doc_id, "0").await {
+        Some(csv) => {
+            println!("--- first two lines after clearing ---");
+            for line in csv.lines().take(2) {
+                println!("  {line}");
+            }
+            ExitCode::SUCCESS
+        }
+        None => {
+            eprintln!("could not export to confirm");
+            ExitCode::FAILURE
+        }
+    }
 }
