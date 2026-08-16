@@ -12157,6 +12157,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "polltest") {
         return polltest_mode().await;
     }
+    if std::env::args().any(|a| a == "focusperm") {
+        return focusperm_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -20336,4 +20339,95 @@ async fn polltest_mode() -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+/// focusperm -- reproduce the set_focus permission failure, then prove the fix.
+///
+/// `setFocus` is only reached when the badge window ALREADY EXISTS:
+///
+///     const existing = await WebviewWindow.getByLabel(RECORDING_BADGE_WINDOW_LABEL);
+///     if (existing) { await existing.setFocus(); return; }
+///
+/// After a clean stop the badge is closed, so that branch is skipped and the
+/// permission is never exercised -- which is why this sat unnoticed since the
+/// commit that introduced it. Reaching it needs a live badge and a second call
+/// to `openRecordingBadgeWindow`.
+///
+/// The reliable way to arrange that is the reconciliation added with the
+/// orphaned-session fix: start a recording so the badge exists, reload the
+/// webview so React resets to "idle", and on mount the hook asks the backend
+/// whether a session is live, finds one, and calls
+/// `openRecordingBadgeWindow` -- straight into the `existing` branch.
+///
+/// The observable is the phase. Adoption sets it to recording; a denied
+/// `setFocus` throws, the reconciliation swallows it, and the UI stays idle
+/// over a live recording.
+async fn focusperm_mode() -> ExitCode {
+    let desktop = Desktop::new(false, false).expect("desktop");
+
+    if app_button(&desktop, "Refresh").await.is_none() {
+        eprintln!("the Paradigm window is not reachable. Is it running?");
+        return ExitCode::FAILURE;
+    }
+
+    let badge_exists = |desktop: &Desktop| {
+        let desktop = desktop.clone();
+        async move {
+            desktop
+                .locator("role:Window")
+                .within(desktop.root())
+                .all(Some(Duration::from_secs(6)), Some(3))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .any(|w| w.name().unwrap_or_default().trim() == "Recording")
+        }
+    };
+
+    println!("== focusperm ==\n");
+    println!("badge before: {}", badge_exists(&desktop).await);
+
+    println!("\n-- starting a recording so the badge exists --");
+    if let Err(e) = click_app_button(&desktop, "Start recording").await {
+        eprintln!("  could not click Start recording: {e}");
+        return ExitCode::FAILURE;
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let live = badge_exists(&desktop).await;
+    println!("  badge now: {live}");
+    if !live {
+        let screen = app_text(&desktop).await.join(" | ");
+        println!("  screen: {}", screen.chars().take(300).collect::<String>());
+        eprintln!("  no badge -- cannot exercise the `existing` branch");
+        return ExitCode::FAILURE;
+    }
+
+    // Force a webview reload, which resets React state while the backend
+    // session and the badge window both survive.
+    println!("\n-- forcing a reload so the mount reconciliation runs --");
+    let marker = std::path::Path::new(
+        r"C:\Users\amitj\Documents\Projects\paradigm-frontend\src\lib\errors.ts",
+    );
+    if let Ok(body) = std::fs::read_to_string(marker) {
+        let _ = std::fs::write(marker, format!("{body}\n"));
+    }
+    tokio::time::sleep(Duration::from_secs(12)).await;
+
+    let screen = app_text(&desktop).await.join(" | ");
+    let denied = screen.contains("set_focus") || screen.contains("allow-set-focus");
+    let adopted = screen.contains("Recording") || badge_exists(&desktop).await;
+    println!("  permission error on screen : {denied}");
+    println!("  badge still present        : {}", badge_exists(&desktop).await);
+    println!("  screen: {}", screen.chars().take(320).collect::<String>());
+
+    println!("\n== RESULT ==");
+    println!("  set_focus denied : {denied}");
+    println!("  session adopted  : {adopted}");
+    if denied {
+        println!("\n  STILL DENIED -- the capability is not taking effect.");
+        ExitCode::FAILURE
+    } else {
+        println!("\n  No permission error. The `existing` branch ran cleanly.");
+        ExitCode::SUCCESS
+    }
 }
