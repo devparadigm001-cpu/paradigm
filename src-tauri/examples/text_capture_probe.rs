@@ -12132,6 +12132,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "churntest") {
         return churntest_mode().await;
     }
+    if std::env::args().any(|a| a == "livereadtest") {
+        return livereadtest_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -19960,4 +19963,115 @@ async fn churntest_mode() -> ExitCode {
     println!("\n  If windows and downloads end where they started, per-record fetching");
     println!("  leaves nothing behind and needs no window reuse.");
     ExitCode::SUCCESS
+}
+
+/// livereadtest -- does the run's source read work now, in the failing case?
+///
+/// The original failure: two separate documents, a fresh source nobody has
+/// typed into, `SpreadsheetReader` refusing because the formula bar reports
+/// nothing. This opens the run's surfaces exactly as a run does -- through
+/// `open_for` -- and walks the source, so what is exercised is the wiring, not
+/// a reimplementation of it.
+async fn livereadtest_mode() -> ExitCode {
+    use paradigm_lib::compile::CompiledTemplate;
+    use paradigm_lib::detect::FieldMapping;
+    use paradigm_lib::source::{Advance, FieldRef, SourceReader};
+
+    let source = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs".to_string());
+    let destination = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "1g3lvtsYyGc_aIqoiPBKJRlsSjkk4i2AAg72VPFvPm3Q".to_string());
+
+    let template = CompiledTemplate {
+        source_id: source.clone(),
+        destination_id: destination.clone(),
+        source_step: 1,
+        destination_step: 1,
+        examples: 3,
+        fields: vec![
+            FieldMapping { source_field: "A".into(), destination_field: "A".into() },
+            FieldMapping { source_field: "B".into(), destination_field: "B".into() },
+        ],
+    };
+    let fields = vec![
+        FieldRef { name: "A".into(), locator: "A".into() },
+        FieldRef { name: "B".into(), locator: "B".into() },
+    ];
+
+    let desktop = Desktop::new(false, false).expect("desktop");
+    println!("== opening run surfaces for {source} -> {destination} ==\n");
+
+    let started = std::time::Instant::now();
+    let (mut reader, _writer) =
+        match paradigm_lib::run::surfaces::open_for(&desktop, &template, 2, 1, 2).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("open_for FAILED: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    println!("surfaces opened in {:.2}s\n", started.elapsed().as_secs_f64());
+
+    println!("-- walking the source --");
+    let walk_started = std::time::Instant::now();
+    let mut seen = Vec::new();
+    for _ in 0..12 {
+        match reader.peek(&fields) {
+            Ok(Advance::Record) => match reader.read(&fields) {
+                Ok(record) => {
+                    seen.push(format!(
+                        "{}|{}|{}",
+                        record.position.row_key,
+                        record.fields.get("A").cloned().unwrap_or_default(),
+                        record.fields.get("B").cloned().unwrap_or_default()
+                    ));
+                    if reader.advance().is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    println!("  read failed: {}", first_line(&e.to_string()));
+                    break;
+                }
+            },
+            Ok(other) => {
+                println!("  ended: {other:?}");
+                break;
+            }
+            Err(e) => {
+                println!("  peek failed: {}", first_line(&e.to_string()));
+                break;
+            }
+        }
+    }
+    let took = walk_started.elapsed().as_secs_f64();
+
+    println!("\n  {} record(s) in {took:.1}s", seen.len());
+    for s in &seen {
+        println!("     {s}");
+    }
+    if !seen.is_empty() {
+        println!("  {:.2}s per record", took / seen.len() as f64);
+    }
+
+    println!("\n-- CSV ground truth for the source --");
+    match download_csv("msedge", &source, "0").await {
+        Some(csv) => {
+            for row in 2..=(seen.len() + 1) {
+                println!(
+                    "     row {row}: {:?} / {:?}",
+                    csv_at(&csv, 1, row).unwrap_or_default(),
+                    csv_at(&csv, 2, row).unwrap_or_default()
+                );
+            }
+        }
+        None => println!("     could not export"),
+    }
+    if seen.is_empty() {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
