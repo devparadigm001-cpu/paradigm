@@ -12099,6 +12099,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "nameboxcount") {
         return nameboxcount_mode().await;
     }
+    if std::env::args().any(|a| a == "editdump") {
+        return editdump_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -18763,6 +18766,72 @@ async fn nameboxcount_mode() -> ExitCode {
             println!("  ^^ MORE THAN ONE. The reader takes the first and cannot tell");
             println!("     which tab it belongs to.");
         }
+    }
+    ExitCode::SUCCESS
+}
+
+/// editdump -- every Edit in a Sheets window, with bounds and what it reports
+/// AFTER navigating to a known non-empty cell.
+///
+/// The formula-bar rule filters by geometry and then by behaviour. When both
+/// reject everything, the question is which Edit actually holds the value --
+/// and that cannot be answered from rectangles alone. This navigates to a cell
+/// whose contents are known from the CSV, then prints what every Edit says.
+async fn editdump_mode() -> ExitCode {
+    let doc = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "1g3lvtsYyGc_aIqoiPBKJRlsSjkk4i2AAg72VPFvPm3Q".to_string());
+    let cell = std::env::args().nth(3).unwrap_or_else(|| "A2".to_string());
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = paradigm_lib::run::surfaces::window_for(&desktop, &doc).await else {
+        eprintln!("no window showing {doc}");
+        return ExitCode::FAILURE;
+    };
+    let _ = window.activate_window();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    println!("== navigating to {cell} in {doc} ==");
+    goto_sheet_via_namebox(&desktop, &cell).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let name_boxes: Vec<(f64, f64)> = desktop
+        .locator("name:Name box")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(5)), None)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|g| g.children().unwrap_or_default())
+        .filter(|e| e.role() == "Edit")
+        .filter_map(|e| e.bounds().ok().map(|(x, y, _, _)| (x, y)))
+        .collect();
+    println!("Name Box edits at: {name_boxes:?}\n");
+
+    let edits = desktop
+        .locator("role:Edit")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(6)), None)
+        .await
+        .unwrap_or_default();
+    println!("{} role:Edit element(s):", edits.len());
+    for (i, el) in edits.iter().enumerate() {
+        let (x, y, w, h) = el.bounds().unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let text = el.text(0).unwrap_or_default();
+        let is_name_box = name_boxes
+            .iter()
+            .any(|(nx, ny)| (nx - x).abs() < 2.0 && (ny - y).abs() < 2.0);
+        println!(
+            "  #{i:<2} {x:>7.0},{y:>5.0} {w:>6.0}x{h:<5.0} {}{:?}",
+            if is_name_box { "[NAME BOX] " } else { "" },
+            text.chars().take(48).collect::<String>()
+        );
     }
     ExitCode::SUCCESS
 }

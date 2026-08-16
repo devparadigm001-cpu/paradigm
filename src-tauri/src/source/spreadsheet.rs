@@ -74,40 +74,64 @@ impl Rect {
 const MIN_FIELD_W: f64 = 20.0;
 const MIN_FIELD_H: f64 = 8.0;
 
-/// Choose the formula bar from the window's `Edit` elements, given where the
-/// Name Box is.
+/// Two rectangles describing the same element, allowing for sub-pixel drift.
+fn same_rect(a: &Rect, b: &Rect) -> bool {
+    (a.x - b.x).abs() < 2.0
+        && (a.y - b.y).abs() < 2.0
+        && (a.w - b.w).abs() < 2.0
+        && (a.h - b.h).abs() < 2.0
+}
+
+/// Candidates in preference order: nearest qualifying `Edit` first.
 ///
-/// The rule, in order:
+/// `name_boxes` are excluded outright. A Sheets window exposes **more than one**
+/// element named "Name box" -- measured, two -- and the second sits immediately
+/// to the right of the first, on the same row, which is precisely the shape this
+/// rule looks for. It therefore won every time, and since it reports `""` rather
+/// than a cell reference, every read came back blank with no error and blank is
+/// a legitimate value everywhere downstream. See
+/// `docs/known-issues/a-second-name-box-is-picked-as-the-formula-bar.md`.
 ///
-/// 1. discard degenerate rectangles -- see [`MIN_FIELD_W`];
-/// 2. keep those sharing a row with the Name Box, by **vertical overlap**
-///    rather than by comparing tops or centres, so a taller formula bar still
-///    matches a shorter Name Box;
-/// 3. keep those beginning at or after the Name Box's right edge;
-/// 4. take the nearest.
-///
-/// Returns the winner's index in `candidates`, or `None` when nothing qualifies
-/// -- which is a real outcome, not a fallback to guessing. A reader that cannot
-/// identify the formula bar must fail loudly rather than read some other `Edit`.
-pub fn pick_formula_bar(name_box: Rect, candidates: &[(usize, Rect)]) -> Option<usize> {
+/// Returns an ordered list rather than one answer, because position alone is no
+/// longer trusted to settle it: [`SpreadsheetReader::open`] tries them in turn
+/// and keeps the first that demonstrably reports cell contents.
+pub fn rank_formula_bar_candidates(
+    name_box: Rect,
+    candidates: &[(usize, Rect)],
+    name_boxes: &[Rect],
+) -> Vec<usize> {
     let row_overlap = |c: &Rect| -> f64 {
         let top = name_box.top().max(c.top());
         let bottom = name_box.bottom().min(c.bottom());
         (bottom - top).max(0.0)
     };
 
-    candidates
+    let mut ranked: Vec<(usize, Rect)> = candidates
         .iter()
         .filter(|(_, c)| c.w >= MIN_FIELD_W && c.h >= MIN_FIELD_H)
         // Sharing a row means overlapping vertically by more than half the
         // shorter of the two -- a brush of a pixel or two is not a row.
         .filter(|(_, c)| row_overlap(c) > name_box.h.min(c.h) / 2.0)
         .filter(|(_, c)| c.x >= name_box.right())
-        .min_by(|(_, a), (_, b)| {
-            a.x.partial_cmp(&b.x)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(i, _)| *i)
+        // Never a Name Box, however well it fits the geometry.
+        .filter(|(_, c)| !name_boxes.iter().any(|nb| same_rect(c, nb)))
+        .cloned()
+        .collect();
+    ranked.sort_by(|(_, a), (_, b)| {
+        a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked.into_iter().map(|(i, _)| i).collect()
+}
+
+/// The single best positional candidate, or `None`.
+///
+/// Kept for the pure geometry tests. Real selection goes through
+/// [`rank_formula_bar_candidates`] plus a live check, because position alone
+/// picked a Name Box for weeks without anything noticing.
+pub fn pick_formula_bar(name_box: Rect, candidates: &[(usize, Rect)]) -> Option<usize> {
+    rank_formula_bar_candidates(name_box, candidates, &[])
+        .into_iter()
+        .next()
 }
 
 /// [`pick_formula_bar`], as the reader uses it: a failure to identify is an
@@ -318,6 +342,21 @@ impl SpreadsheetReader {
 
         let name_box_rect = bounds_of(&name_box)?;
 
+        // EVERY Name Box in the window, not just the one being used. There is
+        // more than one, and the extras are what this reader kept mistaking for
+        // the formula bar.
+        let name_box_rects: Vec<Rect> = desktop
+            .locator("name:Name box")
+            .within(window.clone())
+            .all(Some(std::time::Duration::from_secs(5)), None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|g| g.children().unwrap_or_default())
+            .filter(|e| e.role() == "Edit")
+            .filter_map(|e| bounds_of(&e).ok())
+            .collect();
+
         let edits = desktop
             .locator("role:Edit")
             .within(window.clone())
@@ -331,10 +370,52 @@ impl SpreadsheetReader {
             .filter_map(|(i, el)| bounds_of(el).ok().map(|r| (i, r)))
             .collect();
 
+        let ranked = rank_formula_bar_candidates(name_box_rect, &rects, &name_box_rects);
+        if ranked.is_empty() {
+            return Err(SourceError::Unreachable(format!(
+                "no formula bar found on the Name Box's row at {name_box_rect:?} and to its \
+                 right, among {} candidate field(s) once the window's {} Name Box(es) were \
+                 excluded. Refusing to read from another element.",
+                rects.len(),
+                name_box_rects.len()
+            )));
+        }
+
+        // Position got the wrong element for weeks without anything noticing,
+        // so position is no longer the last word. Each candidate has to
+        // DEMONSTRATE it reports cell contents before it is accepted.
+        //
         // Fails HERE, at construction, rather than on some later read. A reader
         // that exists is a reader that knows where the value comes from; there
         // is no half-built state in which reads quietly return the wrong thing.
-        let chosen = require_formula_bar(name_box_rect, &rects)?;
+        let mut chosen = None;
+        let mut why_not: Vec<String> = Vec::new();
+        for index in &ranked {
+            match proves_it_reports_contents(
+                &name_box,
+                &edits[*index],
+                sheet.as_deref(),
+                header_row,
+                &scan_columns,
+            ) {
+                Ok(()) => {
+                    chosen = Some(*index);
+                    break;
+                }
+                Err(reason) => why_not.push(format!("candidate {index}: {reason}")),
+            }
+        }
+        let Some(chosen) = chosen else {
+            return Err(SourceError::Unreachable(format!(
+                "no element on the Name Box's row could be shown to report cell contents, so \
+                 there is no formula bar to read from. Tried {} candidate(s): {}. If the \
+                 header row {header_row} is genuinely empty in every mapped column there is \
+                 nothing to verify against, and this reader cannot prove which element is the \
+                 formula bar rather than guessing.",
+                ranked.len(),
+                why_not.join("; ")
+            )));
+        };
 
         Ok(Self {
             name_box,
@@ -771,5 +852,145 @@ mod tests {
         // "!B2", which addresses nothing.
         assert_eq!(cell_ref(Some("   "), "B", 2), "B2");
         assert_eq!(cell_ref(Some("Orders"), "AA", 47), "Orders!AA47");
+    }
+}
+
+/// Does this element demonstrably report a cell's CONTENTS?
+///
+/// The check the positional rule lacked. "Nearest `Edit` to the right of the
+/// Name Box" is a description of where the formula bar usually sits, not a
+/// statement about what an element does — and a second Name Box satisfied it
+/// perfectly while reporting nothing.
+///
+/// Two things are required, and they exclude the two ways this has gone wrong:
+///
+/// * **It must not echo the reference.** Navigate to `A1` and a Name Box reads
+///   `"A1"`. That is the failure `require_formula_bar`'s docs always warned
+///   about — returning `"B2"` where a customer name was meant.
+/// * **It must report something for a cell that has something.** The header row
+///   is the one row a template can rely on having content, since the mapping was
+///   built from labelled columns. An element that stays empty across every
+///   header cell is not reading the grid, which is the failure that actually
+///   occurred: silent, blank, and indistinguishable from real empty data.
+///
+/// Navigating moves the user's selection. The reader does that on every read
+/// anyway, so this adds no new kind of side effect — only one more instance of
+/// it, once, at construction.
+fn proves_it_reports_contents(
+    name_box: &UIElement,
+    candidate: &UIElement,
+    sheet: Option<&str>,
+    header_row: u64,
+    scan_columns: &[String],
+) -> Result<(), String> {
+    if scan_columns.is_empty() {
+        return Err("no columns to verify against".to_string());
+    }
+
+    let mut echoed_a_reference = false;
+    for column in scan_columns {
+        let reference = cell_ref(sheet, column, header_row);
+        let bare = format!("{column}{header_row}");
+
+        if name_box.set_value(&reference).is_err() {
+            continue;
+        }
+        if name_box.press_key("{Enter}").is_err() {
+            continue;
+        }
+        std::thread::sleep(NAVIGATE_SETTLE);
+
+        // Only trust the probe if the navigation actually landed; otherwise a
+        // candidate could be blamed for a cell we never reached.
+        let landed = name_box.text(0).unwrap_or_default();
+        if landed.trim() != bare {
+            continue;
+        }
+
+        let reading = clean_cell_text(&candidate.text(0).unwrap_or_default());
+        if reading.trim() == bare {
+            // This is a Name Box wearing the geometry of a formula bar.
+            echoed_a_reference = true;
+            continue;
+        }
+        if !reading.trim().is_empty() {
+            return Ok(());
+        }
+    }
+
+    if echoed_a_reference {
+        Err("it echoes the cell reference back, so it is a Name Box".to_string())
+    } else {
+        Err(format!(
+            "it reported nothing for any of {scan_columns:?} at header row {header_row}"
+        ))
+    }
+}
+
+#[cfg(test)]
+mod name_box_exclusion_tests {
+    use super::{rank_formula_bar_candidates, Rect};
+
+    fn r(x: f64) -> Rect {
+        Rect { x, y: 195.0, w: 60.0, h: 20.0 }
+    }
+
+    /// The measured window: two Name Boxes, and the second is nearer to the
+    /// first than the real formula bar is.
+    ///
+    /// #0 at 2009 is the Name Box in use. #1 at 2085 is the second one --
+    /// empty, and previously chosen every time. The real formula bar is further
+    /// right at 2200.
+    #[test]
+    fn a_second_name_box_is_never_the_formula_bar() {
+        let name_box = r(2009.0);
+        let second_name_box = r(2085.0);
+        let formula_bar = r(2200.0);
+        let candidates = vec![(0, name_box), (1, second_name_box), (2, formula_bar)];
+
+        let ranked =
+            rank_formula_bar_candidates(name_box, &candidates, &[name_box, second_name_box]);
+
+        assert_eq!(
+            ranked,
+            vec![2],
+            "the only candidate left must be the real formula bar"
+        );
+    }
+
+    /// Without the exclusion the old rule picks the wrong one -- kept so the
+    /// test states what the bug WAS, not just what the fix does.
+    #[test]
+    fn without_the_exclusion_the_second_name_box_wins() {
+        let name_box = r(2009.0);
+        let second_name_box = r(2085.0);
+        let formula_bar = r(2200.0);
+        let candidates = vec![(0, name_box), (1, second_name_box), (2, formula_bar)];
+
+        let ranked = rank_formula_bar_candidates(name_box, &candidates, &[]);
+        assert_eq!(
+            ranked.first(),
+            Some(&1),
+            "this is the defect: nearest-to-the-right is the second Name Box"
+        );
+    }
+
+    /// Ranking, not just picking: `open` needs to try the next one if the first
+    /// cannot prove itself.
+    #[test]
+    fn candidates_come_back_in_left_to_right_order() {
+        let name_box = r(100.0);
+        let candidates = vec![(0, r(400.0)), (1, r(200.0)), (2, r(300.0))];
+        let ranked = rank_formula_bar_candidates(name_box, &candidates, &[]);
+        assert_eq!(ranked, vec![1, 2, 0]);
+    }
+
+    /// Excluding everything is a real outcome, and must not silently fall back.
+    #[test]
+    fn excluding_every_candidate_leaves_nothing() {
+        let name_box = r(2009.0);
+        let second = r(2085.0);
+        let candidates = vec![(0, name_box), (1, second)];
+        assert!(rank_formula_bar_candidates(name_box, &candidates, &[name_box, second]).is_empty());
     }
 }

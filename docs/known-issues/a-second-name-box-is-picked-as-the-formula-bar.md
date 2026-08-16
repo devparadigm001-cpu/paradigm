@@ -84,3 +84,58 @@ the property actually wanted.
 text_capture_probe nameboxcount          # counts Name box elements per window
 text_capture_probe destcheck <doc> <row> # what the reader reads vs the CSV
 ```
+
+## Fixed 2026-08-16, and what the fix did NOT fix
+
+**1. Name Boxes are excluded from candidates.** `rank_formula_bar_candidates`
+takes every Name Box rectangle in the window and filters them out, however well
+they fit the geometry. Two tests pin it: one that the real formula bar is chosen
+from the measured layout, and one stating what the bug WAS — without the
+exclusion, nearest-to-the-right is the second Name Box.
+
+**2. The choice is now proved, not assumed.** `open` no longer takes the
+nearest candidate. It ranks them and requires each to DEMONSTRATE it reports
+cell contents — navigate to a header cell, and reject the candidate if it
+echoes the reference back (a Name Box) or reports nothing across every mapped
+column. The first that proves itself is kept; if none do, `open` fails with what
+it tried and why.
+
+Verified against the exact failing case. In a clean single-window state:
+
+```
+shape_at(2) -> occupied ["A", "B"]
+      A2 = "Blue Horizon Supply"
+      B2 = "1150"
+CSV ground truth:  A2 = "Blue Horizon Supply"   B2 = "1150"
+```
+
+### The part that is NOT fixed
+
+With **several Sheets windows open at once**, the formula bar element still
+reports nothing. Dumped mid-failure, after navigating to a cell holding
+"Blue Horizon Supply":
+
+```
+#5   2153,205   724x27   "\n\n\n\n\n\n\n\n\u{feff}\n"      <- multi-window
+#5   2143,195   740x27   "Blue Horizon Supply\n"           <- single window
+```
+
+Same element, same cell, same document, same gid — content in one state and
+newlines-plus-a-BOM in the other. The Name Box reads the right cell throughout,
+so navigation is landing; it is the formula bar's *content* that is absent. The
+count of Name Box elements also varies between runs on the same window (two,
+then one), which suggests the tree carries stale entries when several Sheets
+windows exist.
+
+**What the fix changes about this is the failure mode, and that is the point.**
+Before, a blank read was indistinguishable from real empty data and flowed
+silently into `classify_row`, `peek` and the overwrite check. Now it fails at
+`open` with:
+
+> no element on the Name Box's row could be shown to report cell contents … Tried
+> 1 candidate(s): candidate 5: it reported nothing for any of ["A", "B"] at
+> header row 1.
+
+Silent wrong data became a loud refusal. The underlying multi-window rendering
+problem is separate, is not understood, and should be tracked on its own rather
+than folded in here.
