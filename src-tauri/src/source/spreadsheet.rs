@@ -180,6 +180,80 @@ pub fn parse_cell_ref(reference: &str) -> Option<(String, i64)> {
 /// navigation, so the number is a cost, not a free parameter.
 const LOOKAHEAD_ROWS: u64 = 5;
 
+/// How long a Name Box navigation is given to land before the formula bar is
+/// believed.
+///
+/// A correctness control, not a comfort margin: read too early and the formula
+/// bar still reports the PREVIOUS cell, which is the failure this module exists
+/// to prevent. Measured at ~92% of a cell read, so it is also where the scan's
+/// time goes -- see `docs/known-issues/batch-scan-cost-is-linear-in-rows.md`
+/// before shortening it.
+const NAVIGATE_SETTLE: std::time::Duration = std::time::Duration::from_millis(900);
+
+/// How many times a navigation may be re-issued before the position is refused.
+///
+/// One settle is not always enough, and the difference is not correctness but
+/// patience. Google Sheets can process the keypress late -- a background window
+/// is throttled by the browser, an auto-save or sync round-trip is in flight, a
+/// re-render is mid-frame -- and the cursor then arrives after we have already
+/// looked. That produced a real `PositionLost` during a scan with no user
+/// interaction, reported as "asked for B55 but Name Box reads K55": same row,
+/// and K55 was simply where the previous read had left the cursor.
+///
+/// Retrying changes how long we wait, never what we accept. Every attempt still
+/// verifies, and a position that never resolves is still refused -- loudly, and
+/// now naming what it asked for last, so the next occurrence says for itself
+/// whether the cursor moved or never left.
+const NAVIGATE_ATTEMPTS: usize = 3;
+
+/// Does the Name Box demonstrably show the cell that was asked for?
+///
+/// The single condition under which a navigation is accepted. Pulled out so it
+/// is testable rather than buried in an IO loop: the retry above must change
+/// how long we WAIT, never what we ACCEPT, and this is the whole of what it
+/// accepts. Equality after trimming -- no prefix match, no "close enough".
+fn landed_on(landed: &str, bare: &str) -> bool {
+    landed.trim() == bare
+}
+
+/// The message a refused navigation carries.
+///
+/// Pure so the diagnostic itself is tested. It exists because a failure that
+/// reports only where the cursor ENDED UP cannot distinguish the two cases that
+/// matter, and they call for opposite responses:
+///
+/// * the cursor moved somewhere unexpected -- something interfered;
+/// * the cursor never left -- our own navigation was late.
+///
+/// Naming the previously requested cell makes the next occurrence answer that
+/// for itself. A real report -- "asked for B55 but Name Box reads K55", same
+/// row, during a scan with no user interaction -- could not be settled without
+/// it, because K55 was very likely just where the previous read had left the
+/// cursor.
+fn position_lost_message(
+    reference: &str,
+    landed: &str,
+    attempts: usize,
+    last_requested: Option<&str>,
+) -> String {
+    let tail = match last_requested {
+        Some(previous) if landed.trim() == previous => format!(
+            ". The previous read asked for {previous:?}, which is what the Name Box still \
+             reads -- so the cursor never moved, and this is a navigation that did not land \
+             rather than something moving it"
+        ),
+        Some(previous) => format!(
+            ". The previous read asked for {previous:?}; the Name Box does not match that \
+             either, so the cursor moved somewhere neither read requested"
+        ),
+        None => ". Nothing has been read yet on this reader".to_string(),
+    };
+    format!(
+        "asked for {reference:?} but the Name Box reads {landed:?} after {attempts} attempts; \
+         refusing to read a cell that is not demonstrably the one requested{tail}"
+    )
+}
+
 /// Reads records out of a spreadsheet, one row at a time.
 pub struct SpreadsheetReader {
     // No `Desktop` is kept. Once the Name Box and formula bar are resolved,
@@ -193,6 +267,14 @@ pub struct SpreadsheetReader {
     sheet: Option<String>,
     row: u64,
     header_row: u64,
+    /// The last cell a navigation successfully landed on, bare (`"B54"`).
+    ///
+    /// Kept only to make a failure self-explaining. When `goto` refuses, the
+    /// question that actually matters is whether the cursor MOVED somewhere
+    /// unexpected or simply never left -- and those look identical in a message
+    /// that reports only where it ended up. If the Name Box reads what this
+    /// holds, nothing moved it and the navigation was merely late.
+    last_requested: Option<String>,
     /// Columns `shape()` inspects when looking for drift. Bounded because every
     /// column costs a navigation; see [`SpreadsheetReader::open`].
     scan_columns: Vec<String>,
@@ -261,6 +343,7 @@ impl SpreadsheetReader {
             sheet,
             row: first_row,
             header_row,
+            last_requested: None,
             scan_columns,
         })
     }
@@ -271,7 +354,7 @@ impl SpreadsheetReader {
     /// echoes back the bare cell after a qualified navigation, so the check
     /// compares against the cell part -- a comparison against the full
     /// reference would reject every cross-sheet read at the moment it worked.
-    fn goto(&self, column: &str, row: u64) -> Result<(), SourceError> {
+    fn goto(&mut self, column: &str, row: u64) -> Result<(), SourceError> {
         let reference = cell_ref(self.sheet.as_deref(), column, row);
         let bare = format!("{column}{row}");
 
@@ -304,27 +387,43 @@ impl SpreadsheetReader {
         // land before the formula bar is believed, and shortening it risks
         // reading the PREVIOUS cell's value, which is the failure this module
         // exists to prevent.
-        self.name_box
-            .press_key("{Enter}")
-            .map_err(|e| SourceError::Unreadable {
-                locator: column.to_string(),
-                row: row.to_string(),
-                reason: format!("could not submit the Name Box: {e}"),
-            })?;
-        std::thread::sleep(std::time::Duration::from_millis(900));
+        let mut landed = String::new();
+        for attempt in 1..=NAVIGATE_ATTEMPTS {
+            if attempt > 1 {
+                // Re-address before re-submitting. The box may be holding the
+                // reference already, or may have been re-rendered back to the
+                // current selection; setting it again makes the retry
+                // independent of which.
+                let _ = self.name_box.set_value(&reference);
+            }
+            self.name_box
+                .press_key("{Enter}")
+                .map_err(|e| SourceError::Unreadable {
+                    locator: column.to_string(),
+                    row: row.to_string(),
+                    reason: format!("could not submit the Name Box: {e}"),
+                })?;
+            std::thread::sleep(NAVIGATE_SETTLE);
 
-        let landed = self.name_box.text(0).unwrap_or_default();
-        if landed.trim() != bare {
-            return Err(SourceError::PositionLost(format!(
-                "asked for {reference:?} but the Name Box reads {landed:?}; refusing to read a \
-                 cell that is not demonstrably the one requested"
-            )));
+            landed = self.name_box.text(0).unwrap_or_default();
+            if landed_on(&landed, &bare) {
+                self.last_requested = Some(bare);
+                return Ok(());
+            }
         }
-        Ok(())
+
+        // Every attempt missed. The position is still refused -- retrying
+        // changes how long we wait, never what we accept.
+        Err(SourceError::PositionLost(position_lost_message(
+            &reference,
+            &landed,
+            NAVIGATE_ATTEMPTS,
+            self.last_requested.as_deref(),
+        )))
     }
 
     /// The value of one cell, cleaned.
-    fn read_cell(&self, column: &str, row: u64) -> Result<String, SourceError> {
+    fn read_cell(&mut self, column: &str, row: u64) -> Result<String, SourceError> {
         self.goto(column, row)?;
         let raw = self
             .formula_bar
@@ -340,7 +439,7 @@ impl SpreadsheetReader {
         Ok(clean_cell_text(&raw))
     }
 
-    fn read_row(&self, fields: &[FieldRef], row: u64) -> Result<Vec<String>, SourceError> {
+    fn read_row(&mut self, fields: &[FieldRef], row: u64) -> Result<Vec<String>, SourceError> {
         fields
             .iter()
             .map(|f| self.read_cell(&f.locator, row))
@@ -399,7 +498,12 @@ impl SourceReader for SpreadsheetReader {
 
     fn shape(&mut self) -> Result<SourceShape, SourceError> {
         let mut columns = Vec::new();
-        for column in &self.scan_columns {
+        // Cloned rather than borrowed: reading now takes `&mut self`, because a
+        // navigation records what it asked for so a later failure can say
+        // whether the cursor moved or never left. The list is one entry per
+        // mapped column and is walked once per drift check.
+        let scan_columns = self.scan_columns.clone();
+        for column in &scan_columns {
             let label = self.read_cell(column, self.header_row)?;
             if !label.trim().is_empty() {
                 columns.push(super::ColumnShape {
@@ -416,6 +520,74 @@ impl SourceReader for SpreadsheetReader {
 mod tests {
     use super::*;
 
+
+    /// The retry changes how long we wait, never what we accept.
+    ///
+    /// `landed_on` is the entire accept condition of the navigation loop, so
+    /// this is where "a bounded retry must not weaken the guarantee" is pinned.
+    /// If it ever softened to a prefix or a contains, a retry would eventually
+    /// accept the wrong cell instead of eventually refusing.
+    #[test]
+    fn a_navigation_is_accepted_only_on_an_exact_match() {
+        assert!(landed_on("B55", "B55"));
+        // Sheets pads the Name Box readback; trimming is intended.
+        assert!(landed_on("  B55 \n", "B55"));
+
+        // The real report. K55 shares a row with B55 and differs by one
+        // character-class; nothing about it may pass.
+        assert!(!landed_on("K55", "B55"));
+        // Prefix and suffix relationships are the ones a lax check would let
+        // through, and both are real cells.
+        assert!(!landed_on("B5", "B55"));
+        assert!(!landed_on("B550", "B55"));
+        assert!(!landed_on("AB55", "B55"));
+        assert!(!landed_on("", "B55"));
+    }
+
+    /// A refusal has to say whether the cursor moved or never left.
+    #[test]
+    fn a_refusal_says_the_cursor_never_moved_when_it_did_not() {
+        // The reported shape: reading B55 right after K55 in the same row.
+        let message = position_lost_message("B55", "K55", 3, Some("K55"));
+        assert!(message.contains("asked for \"B55\""), "{message}");
+        assert!(message.contains("reads \"K55\""), "{message}");
+        assert!(message.contains("3 attempts"), "{message}");
+        assert!(
+            message.contains("cursor never moved"),
+            "the whole point of the diagnostic: {message}"
+        );
+        assert!(
+            message.contains("did not land"),
+            "it must name the cause it points at: {message}"
+        );
+    }
+
+    /// And must NOT claim that when the cursor genuinely went elsewhere.
+    #[test]
+    fn a_refusal_distinguishes_a_cursor_that_actually_moved() {
+        // Landed on neither the requested cell nor the previous one.
+        let message = position_lost_message("B55", "Q12", 3, Some("K55"));
+        assert!(
+            !message.contains("cursor never moved"),
+            "this is the case where something DID move it: {message}"
+        );
+        assert!(
+            message.contains("moved somewhere neither read requested"),
+            "{message}"
+        );
+        assert!(message.contains("K55"), "the previous cell is still worth naming: {message}");
+    }
+
+    /// The first navigation of a reader has no previous cell to compare.
+    #[test]
+    fn a_refusal_on_the_first_read_says_there_is_nothing_to_compare() {
+        let message = position_lost_message("A2", "A1", 3, None);
+        assert!(message.contains("Nothing has been read yet"), "{message}");
+        assert!(
+            !message.contains("cursor never moved"),
+            "with no previous read, that claim is unsupported: {message}"
+        );
+    }
     /// The Name Box, exactly as measured in a live window.
     fn name_box() -> Rect {
         Rect {

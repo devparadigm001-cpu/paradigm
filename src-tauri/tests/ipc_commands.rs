@@ -214,6 +214,12 @@ const REGISTERED_COMMANDS: &[(&str, &str)] = &[
 /// must never happen is "Command X not found".
 #[test]
 fn every_registered_command_is_reachable_over_ipc() {
+    // This walks REGISTERED_COMMANDS, which includes start_record_session and
+    // stop_record_session -- so it installs real input hooks too, and has to
+    // serialise with the other recorder tests. Missing this was a genuinely
+    // intermittent failure: the suite passed, then failed, then passed again
+    // with no change, because the race only sometimes overlapped.
+    let _recorder = RECORDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (app, _dir) = mock_app();
     let webview = webview(&app);
 

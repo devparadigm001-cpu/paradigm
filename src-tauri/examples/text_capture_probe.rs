@@ -12066,6 +12066,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "scantime") {
         return scantime_mode().await;
     }
+    if std::env::args().any(|a| a == "navstress") {
+        return navstress_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -17170,4 +17173,231 @@ async fn scantime_mode() -> ExitCode {
     }
     println!("\n  doc: {doc_id}");
     ExitCode::SUCCESS
+}
+
+// ------------------------------------------------------ navstress mode ----
+// Does the bounded retry survive a transient miss WITHOUT masking a real one?
+//
+// Three questions, in order of how much they matter:
+//
+//   A) a genuinely unresolvable position must still FAIL, loudly, after the
+//      retries are spent -- the retry must change how long we wait, never what
+//      we accept. Driven with a reference to a sheet that does not exist.
+//   B) an ordinary read must still succeed, and cost the same as before, so
+//      the retry is not silently paying for itself on every cell.
+//   C) the throttling hypothesis: does backgrounding the Sheets window during
+//      a scan actually produce the reported PositionLost?
+//
+// (C) is the one that may not reproduce. A negative there is reported as
+// "did not reproduce", never as "disproved" -- the failure was intermittent in
+// real use and a handful of attempts cannot rule it out.
+// ---------------------------------------------------------------------------
+
+async fn navstress_mode() -> ExitCode {
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+    use paradigm_lib::source::{Advance, FieldRef, SourceReader};
+
+    println!("== navstress: does the retry help without hiding a real failure? ==\n");
+
+    let url = scratch_url();
+    if !url.contains("/spreadsheets/d/") {
+        eprintln!("set PARADIGM_SCRATCH_DOC -- this needs the seeded scan sheet");
+        return ExitCode::FAILURE;
+    }
+    let browser = "msedge";
+    if let Ok(mut c) = std::process::Command::new("cmd")
+        .args(["/C", "start", "", browser, "--new-window", url.as_str()])
+        .spawn()
+    {
+        let _ = c.wait();
+    }
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut found = None;
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if let Some(w) = sheets_window(&desktop).await {
+            found = Some(w);
+            break;
+        }
+    }
+    let Some((_, doc_id)) = found else {
+        eprintln!("no spreadsheet window");
+        return ExitCode::FAILURE;
+    };
+    println!("doc: {doc_id}\n");
+
+    let fields = vec![
+        FieldRef { name: "A".into(), locator: "A".into() },
+        FieldRef { name: "B".into(), locator: "B".into() },
+    ];
+
+    // ---- A) an unresolvable position must still fail --------------------
+    // A row past the end of the grid. Chosen over a non-existent SHEET name,
+    // which was tried first and turned out to break the element itself --
+    // "Failed to get control type" from `press_key`, an Unreadable rather than
+    // a PositionLost, so the retry path was never reached and the test proved
+    // nothing. An out-of-range row keeps the Name Box and formula bar valid and
+    // simply refuses to go there, which is exactly the condition under test.
+    // A column past the sheet's 26. Two earlier attempts are worth recording
+    // because both failed for the WRONG reason and would have "passed" a
+    // careless reading:
+    //
+    //   * a non-existent SHEET name -- `press_key` returned "Failed to get
+    //     control type", an Unreadable rather than a PositionLost, so the retry
+    //     path was never reached;
+    //   * row 9,999,999 -- same platform error, and it left the page wedged
+    //     badly enough that the NEXT reader could not open at all.
+    //
+    // A column just past the end is refused by Sheets without upsetting
+    // anything: the Name Box simply reverts to the current selection, which is
+    // exactly the mismatch the guard exists to catch.
+    println!("-- A) column AB on a 26-column sheet: must FAIL after the retries --");
+    let a_ok = {
+        let Some((window, _)) = sheets_window(&desktop).await else {
+            eprintln!("lost the window");
+            return ExitCode::FAILURE;
+        };
+        match SpreadsheetReader::open(
+            desktop.clone(),
+            &window,
+            doc_id.clone(),
+            None,
+            2,
+            1,
+            vec!["AB".to_string()],
+        )
+        .await
+        {
+            Ok(mut reader) => {
+                let started = std::time::Instant::now();
+                let outcome = reader.peek(&[FieldRef { name: "AB".into(), locator: "AB".into() }]);
+                let took = started.elapsed();
+                match outcome {
+                    Err(e) => {
+                        println!("   FAILED as required after {:.1}s", took.as_secs_f64());
+                        println!("   {e}");
+                        // It must fail for the RIGHT reason, and the message
+                        // must carry the diagnostic that makes the next real
+                        // occurrence self-explaining.
+                        let text = e.to_string();
+                        let named_attempts = text.contains("attempts");
+                        println!("   names the attempt count: {named_attempts}");
+                        named_attempts
+                    }
+                    Ok(v) => {
+                        println!("   ACCEPTED {v:?} -- the retry MASKED an unresolvable position");
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                println!("   reader would not open: {e}");
+                false
+            }
+        }
+    };
+
+    // ---- B) an ordinary read still works, at the same cost ---------------
+    println!("\n-- B) an ordinary read must still succeed --");
+    let Some((window, _)) = sheets_window(&desktop).await else {
+        eprintln!("lost the window");
+        return ExitCode::FAILURE;
+    };
+    let Ok(mut reader) = SpreadsheetReader::open(
+        desktop.clone(),
+        &window,
+        doc_id.clone(),
+        None,
+        2,
+        1,
+        vec!["A".to_string(), "B".to_string()],
+    )
+    .await
+    else {
+        eprintln!("reader failed");
+        return ExitCode::FAILURE;
+    };
+    let started = std::time::Instant::now();
+    let mut clean_rows = 0u64;
+    for _ in 0..4 {
+        match reader.peek(&fields) {
+            Ok(Advance::Record) => {
+                clean_rows += 1;
+                let _ = reader.advance();
+            }
+            Ok(other) => {
+                println!("   stopped: {other:?}");
+                break;
+            }
+            Err(e) => {
+                println!("   UNEXPECTED failure on a clean read: {e}");
+                break;
+            }
+        }
+    }
+    let b_took = started.elapsed();
+    println!(
+        "   {clean_rows} row(s) read cleanly in {:.2}s ({:.2}s/row)",
+        b_took.as_secs_f64(),
+        b_took.as_secs_f64() / clean_rows.max(1) as f64
+    );
+    let b_ok = clean_rows == 4;
+
+    // ---- C) the throttling hypothesis ------------------------------------
+    println!("\n-- C) backgrounding the sheet mid-scan --");
+    println!("   Bringing another window to the foreground between reads and");
+    println!("   watching for PositionLost. A negative here does NOT disprove");
+    println!("   throttling; the real failure was intermittent.");
+    let mut failures = 0;
+    let mut recovered = 0;
+    for round in 1..=6 {
+        // Steal the foreground. The app's own window is the honest choice: it
+        // is what actually takes focus during a real scan.
+        if let Some(app) = app_window(&desktop).await {
+            let _ = app.activate_window();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let started = std::time::Instant::now();
+        match reader.peek(&fields) {
+            Ok(_) => {
+                let took = started.elapsed();
+                // A read that took much longer than one settle needed a retry
+                // to get there -- which is the transient miss, survived.
+                if took.as_secs_f64() > 2.4 {
+                    recovered += 1;
+                    println!("   round {round}: slow ({:.2}s) but landed", took.as_secs_f64());
+                } else {
+                    println!("   round {round}: normal ({:.2}s)", took.as_secs_f64());
+                }
+                let _ = reader.advance();
+            }
+            Err(e) => {
+                failures += 1;
+                println!("   round {round}: FAILED -- {e}");
+            }
+        }
+    }
+
+    println!("\n== RESULT ==");
+    println!("  A) unresolvable position still refused : {a_ok}");
+    println!("  B) ordinary reads unaffected           : {b_ok}");
+    println!("  C) rounds needing a retry to land      : {recovered}");
+    println!("  C) rounds that failed outright         : {failures}");
+    if failures == 0 && recovered == 0 {
+        println!("\n  Throttling did NOT reproduce here. Not disproved -- the real");
+        println!("  occurrence was intermittent, and six rounds cannot rule it out.");
+    }
+    println!("\n  doc: {doc_id}");
+    if a_ok && b_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
