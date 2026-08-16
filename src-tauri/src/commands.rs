@@ -811,24 +811,62 @@ pub async fn check_for_new_records(
             .ok_or_else(|| "that playbook is not a templated workflow".to_string())?
     };
 
-    let desktop = terminator::Desktop::new(false, false)
-        .map_err(|e| format!("accessibility engine unavailable: {e}"))?;
-    let (mut reader, _writer) = run::surfaces::open_for(
-        &desktop,
-        &template,
-        source_row.unwrap_or(2),
-        header_row.unwrap_or(1),
-        // The scan never writes, so where the destination would start is
-        // irrelevant to it. Passed only because opening a writer is part of
-        // resolving the pair.
-        2,
-    )
-    .await?;
+    let first_row = source_row.unwrap_or(2);
+    let header = header_row.unwrap_or(1);
+    let columns: Vec<String> = template
+        .fields
+        .iter()
+        .map(|f| f.source_field.clone())
+        .collect();
 
-    let scan = {
-        let conn = state.db.lock().await;
-        run::batch::scan(&conn, &playbook_id, &template, reader.as_mut())
-            .map_err(|e| e.to_string())?
+    // A scan is one read-only question, so it is answered from one CSV export
+    // rather than one Name Box navigation per cell. Measured on the same sheet:
+    // 1.34s against 39.54s, producing IDENTICAL records, positions and ending.
+    // The gap widens with row count -- an export costs the same either way --
+    // and at SCAN_LIMIT=200 the per-cell path is ~391s.
+    //
+    // The run is deliberately NOT changed. It interleaves reads with writes and
+    // can pause on a human for minutes, so a snapshot taken at spawn would let
+    // it write values the source no longer holds. Only the scan is a question
+    // about one consistent moment.
+    let scan = match crate::source::csv_snapshot::exportable_doc_id(&template.source_id) {
+        Some(doc_id) => {
+            let body = crate::source::csv_snapshot::fetch_export(doc_id, "0")
+                .map_err(|e| format!("could not export the source: {e}"))?;
+            let mut reader = crate::source::csv_snapshot::CsvSnapshot::new(
+                template.source_id.clone(),
+                &body,
+                first_row,
+                header,
+                columns,
+            );
+            let conn = state.db.lock().await;
+            run::batch::scan(&conn, &playbook_id, &template, &mut reader)
+                .map_err(|e| e.to_string())?
+        }
+        // The export URL selects a sheet by gid, a number; a template names one
+        // by NAME, and mapping between them needs the document open -- the very
+        // cost this avoids. So a sheet-qualified source keeps the per-cell
+        // reader rather than exporting gid=0 and confidently answering about
+        // the wrong sheet.
+        None => {
+            let desktop = terminator::Desktop::new(false, false)
+                .map_err(|e| format!("accessibility engine unavailable: {e}"))?;
+            let (mut reader, _writer) = run::surfaces::open_for(
+                &desktop,
+                &template,
+                first_row,
+                header,
+                // The scan never writes, so where the destination would start
+                // is irrelevant to it. Passed only because opening a writer is
+                // part of resolving the pair.
+                2,
+            )
+            .await?;
+            let conn = state.db.lock().await;
+            run::batch::scan(&conn, &playbook_id, &template, reader.as_mut())
+                .map_err(|e| e.to_string())?
+        }
     };
 
     let (count, first_row, capped) = match &scan {

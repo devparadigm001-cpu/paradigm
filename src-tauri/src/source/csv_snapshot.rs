@@ -339,3 +339,99 @@ mod tests {
         assert_eq!(position.row_key, "2");
     }
 }
+
+/// Fetch a document's CSV export through the user's signed-in browser.
+///
+/// ## Why the browser, and why that is not a workaround
+///
+/// The export URL is not publicly readable -- a session-less request returns
+/// **401**. The browser holds the user's real Google session, so opening the URL
+/// in it is the whole of the authentication story: no OAuth, no stored
+/// credentials, nothing for this app to keep or leak.
+///
+/// Measured from a genuinely cold start -- every browser process killed, no tab,
+/// no window -- and the export still returned real CSV rather than a login page.
+/// The profile's saved sign-in survives having no window open, which is what
+/// makes this usable for an unattended scan rather than only when the user
+/// happens to have the sheet in front of them.
+///
+/// ## The file is removed, and only the one that appeared
+///
+/// The download lands in Downloads. This snapshots the folder first and deletes
+/// exactly what is new, rather than "the newest .csv" -- a user's own download
+/// arriving mid-scan must not be collateral. Tonight's probes, which had no
+/// cleanup, left 63 export files behind; that is the mistake this avoids.
+pub fn fetch_export(doc_id: &str, gid: &str) -> Result<String, SourceError> {
+    let unreachable = |m: String| SourceError::Unreachable(m);
+
+    let downloads = dirs_downloads()
+        .ok_or_else(|| unreachable("cannot locate the Downloads folder".into()))?;
+    let before = csv_files(&downloads);
+
+    let url =
+        format!("https://docs.google.com/spreadsheets/d/{doc_id}/export?format=csv&gid={gid}");
+    // NOT `cmd /C start`: the URL contains `&`, which cmd treats as a command
+    // separator -- measured twice in this repo, once silently dropping the gid
+    // so every export returned the default sheet while reporting success.
+    std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Start-Process",
+            "msedge",
+            "-ArgumentList",
+            &format!("'{url}'"),
+        ])
+        .status()
+        .map_err(|e| unreachable(format!("could not open the export URL: {e}")))?;
+
+    for _ in 0..45 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let now = csv_files(&downloads);
+        if let Some(fresh) = now.iter().find(|p| !before.contains(p)) {
+            let body = std::fs::read_to_string(fresh)
+                .map_err(|e| unreachable(format!("could not read the export: {e}")))?;
+            let _ = std::fs::remove_file(fresh);
+            return Ok(body);
+        }
+    }
+    Err(unreachable(
+        "the export never downloaded. The browser may be signed out, or the document may not \
+         be reachable by this account"
+            .into(),
+    ))
+}
+
+fn csv_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("csv"))
+        .collect()
+}
+
+fn dirs_downloads() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE").map(|home| std::path::Path::new(&home).join("Downloads"))
+}
+
+/// Can this source be scanned from a CSV export?
+///
+/// Only when the source names a document and no sheet within it. The export URL
+/// selects a sheet by **gid**, a number, while a template stores a sheet by
+/// NAME -- and there is no way to map one to the other without opening the
+/// document, which is the cost this exists to avoid.
+///
+/// So a qualified source (`<doc>!Sheet2`) returns `None` and the caller keeps
+/// the per-cell reader. Exporting gid=0 and hoping would read a different sheet
+/// than the workflow was built against, silently, and report a confident answer
+/// about the wrong data.
+pub fn exportable_doc_id(source_id: &str) -> Option<&str> {
+    let (sheet, doc) = crate::capture::grid::split_sheet_ref(source_id);
+    match sheet {
+        Some(_) => None,
+        None if doc.trim().is_empty() => None,
+        None => Some(doc),
+    }
+}
