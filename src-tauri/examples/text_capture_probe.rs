@@ -2307,6 +2307,826 @@ async fn gmailcleanup_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ------------------------------------------------------- gmailtree mode ----
+//
+// Discovery only. Gmail as a SOURCE application, asked the same questions that
+// decided the Sheets design:
+//
+//   a) is an individual email in the list a real, named element, or is the list
+//      canvas-like the way Sheets' grid turned out to be?
+//   b) once opened, are sender / subject / body / date distinct elements, or is
+//      the body one blob?
+//   c) is there a Gmail analogue of the Name Box / formula bar trap -- duplicate
+//      or misleading elements that would produce a silent WRONG read?
+//   d) is there a stable per-email identity, the equivalent of a row number,
+//      that "new since last run" could be built on?
+//
+// Reads only. It clicks exactly one thing -- an email row, to open it -- and
+// never Archive, Delete, Send or Compose.
+//
+// SIDE EFFECT, stated because it is real: opening an email marks it READ in the
+// user's actual mailbox. Nothing else about the mailbox is modified.
+
+/// Every element under `root`, breadth-first, with its depth. Bounded so a
+/// pathological tree cannot hang the probe the way the Notepad traversal did.
+fn collect_all(root: &UIElement, max_depth: usize, budget: usize) -> Vec<(usize, UIElement)> {
+    let mut out = Vec::new();
+    let mut queue = vec![(0usize, root.clone())];
+    while let Some((depth, el)) = queue.pop() {
+        if out.len() >= budget {
+            break;
+        }
+        out.push((depth, el.clone()));
+        if depth >= max_depth {
+            continue;
+        }
+        if let Ok(children) = el.children() {
+            for c in children.into_iter().rev() {
+                queue.push((depth + 1, c));
+            }
+        }
+    }
+    out
+}
+
+fn role_histogram(els: &[(usize, UIElement)]) -> Vec<(String, usize)> {
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
+    for (_, el) in els {
+        *counts.entry(el.attributes().role).or_default() += 1;
+    }
+    let mut v: Vec<(String, usize)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v
+}
+
+/// Truncate for display AND to keep real mailbox content out of long log lines.
+fn short(s: &str, n: usize) -> String {
+    let s = s.replace(['\r', '\n'], " ");
+    if s.chars().count() <= n {
+        s
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+/// The Gmail window, found two ways because the first one is not reliable.
+///
+/// Filtering `role:Window` by title is the obvious route and it FAILED here --
+/// see the printed diagnostic. So the fallback anchors on an element we already
+/// proved exists (the Compose button) and walks up to its top-level window,
+/// which cannot disagree with itself about which window Gmail is in.
+async fn gmail_window(desktop: &Desktop, anchor: &UIElement) -> Option<UIElement> {
+    match desktop
+        .locator("role:Window")
+        .all(Some(Duration::from_secs(10)), None)
+        .await
+    {
+        Ok(wins) => {
+            println!("-- role:Window enumeration returned {} window(s) --", wins.len());
+            for w in &wins {
+                let a = w.attributes();
+                println!(
+                    "     {:<10} {:?}",
+                    a.role,
+                    short(&a.name.unwrap_or_default(), 80)
+                );
+            }
+            if let Some(w) = wins.into_iter().find(|w| {
+                w.attributes().name.unwrap_or_default().contains("Gmail")
+            }) {
+                println!("  -> matched by title\n");
+                return Some(w);
+            }
+            println!("  -> NO window title contained 'Gmail'; walking up from Compose\n");
+        }
+        Err(e) => println!("-- role:Window enumeration failed: {e} --\n"),
+    }
+
+    // Fallback: climb from the Compose button to the top of the tree.
+    let mut cur = anchor.clone();
+    for _ in 0..40 {
+        match cur.parent() {
+            Ok(Some(p)) => {
+                let a = p.attributes();
+                if a.role == "Window" {
+                    println!(
+                        "  -> reached Window by parent walk: {:?}\n",
+                        short(&a.name.unwrap_or_default(), 90)
+                    );
+                    return Some(p);
+                }
+                cur = p;
+            }
+            _ => break,
+        }
+    }
+    Some(cur)
+}
+
+async fn gmailtree_mode() -> ExitCode {
+    println!("== Gmail accessibility tree: discovery ==\n");
+    println!("Reads only. Clicks ONE email row to open it. Never archives,");
+    println!("deletes, sends or composes.");
+    println!("SIDE EFFECT: the email opened is marked read.\n");
+
+    // `here` measures whatever view is already on screen. Without it the probe
+    // navigates to the inbox, which discards a search/label view the caller set
+    // up deliberately -- and re-opening an UNREAD message when an already-read
+    // one answers the same question costs a real mutation for nothing.
+    let stay = std::env::args().any(|a| a == "here");
+    if stay {
+        println!("'here': measuring the view already on screen, no navigation.\n");
+    } else {
+        for browser in browser_order() {
+            if let Ok(mut c) = std::process::Command::new("cmd")
+                .args(["/C", "start", "", browser, "https://mail.google.com/"])
+                .spawn()
+            {
+                let _ = c.wait();
+                break;
+            }
+        }
+        println!("waiting 20s for Gmail to load...");
+        tokio::time::sleep(Duration::from_secs(20)).await;
+    }
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // GUARD: a login or consent page must abort rather than be measured as if
+    // it were a mailbox.
+    let compose = match desktop
+        .locator("role:Button|name:Compose")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!(
+                "no Compose button found. Gmail may not be loaded or signed in.\n\
+                 Aborting rather than dumping an unknown page."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("Compose found -- this is a loaded mailbox.\n");
+
+    let Some(window) = gmail_window(&desktop, &compose).await else {
+        eprintln!("could not find a window whose title contains 'Gmail'");
+        return ExitCode::FAILURE;
+    };
+    let title = window.attributes().name.unwrap_or_default();
+    println!("window: {:?}\n", short(&title, 90));
+
+    // ================================================== PHASE 1: list view ==
+    println!("=========== PHASE 1: INBOX LIST VIEW ===========\n");
+
+    let els = collect_all(&window, 30, 4000);
+    println!("accessible nodes under the Gmail window: {}\n", els.len());
+
+    println!("-- role histogram --");
+    for (role, n) in role_histogram(&els) {
+        println!("  {n:>5}  {role}");
+    }
+
+    // Q(a): is a message row a real, named element?
+    println!("\n-- candidate message-row roles --");
+    for role in [
+        "DataItem", "ListItem", "Row", "TreeItem", "Table", "Grid", "DataGrid", "List",
+    ] {
+        let n = els
+            .iter()
+            .filter(|(_, e)| e.attributes().role == role)
+            .count();
+        println!("  {role:<10} {n}");
+    }
+
+    println!("\n-- first 12 rows, whatever role they turn out to be --");
+    let rows: Vec<&(usize, UIElement)> = els
+        .iter()
+        .filter(|(_, e)| {
+            let r = e.attributes().role;
+            r == "DataItem" || r == "ListItem" || r == "Row" || r == "TreeItem"
+        })
+        .collect();
+    println!("  {} row-like element(s) total", rows.len());
+    for (i, (depth, el)) in rows.iter().take(12).enumerate() {
+        let a = el.attributes();
+        println!(
+            "  [{i:>2}] d={depth} {:<9} name={:?}",
+            a.role,
+            short(&a.name.unwrap_or_default(), 100)
+        );
+        // Q(d): does anything on the row mark unread / selected / processed?
+        println!(
+            "        selected={:?} toggled={:?} focused={:?} value={:?}",
+            el.is_selected().ok(),
+            el.is_toggled().ok(),
+            el.is_focused().ok(),
+            short(&a.value.unwrap_or_default(), 40)
+        );
+    }
+
+    // Q(a) continued: what does ONE message row decompose into?
+    println!("\n-- full subtree of the first composite row --");
+    if let Some((_, first)) = rows.iter().find(|(d, e)| {
+        *d == rows.first().map(|r| r.0).unwrap_or(0)
+            && !e.attributes().name.unwrap_or_default().is_empty()
+    }) {
+        for (d, el) in collect_all(first, 6, 80) {
+            let a = el.attributes();
+            let b = el.bounds().ok();
+            println!(
+                "  {:indent$}{:<9} name={:?}{}",
+                "",
+                a.role,
+                short(&a.name.unwrap_or_default(), 70),
+                b.map(|(x, y, w, h)| format!(
+                    "  bounds=({:.0},{:.0},{:.0},{:.0})",
+                    x, y, w, h
+                ))
+                .unwrap_or_default(),
+                indent = d * 2
+            );
+        }
+    }
+
+    // Q(d): is "unread" actually exposed, and does it agree with the tab count?
+    println!("\n-- unread signal --");
+    let named: Vec<String> = els
+        .iter()
+        .map(|(_, e)| e.attributes().name.unwrap_or_default())
+        .collect();
+    let unread_rows = named.iter().filter(|n| n.starts_with("unread,")).count();
+    println!("  element names beginning \"unread,\" : {unread_rows}");
+    println!("  window title says                  : {:?}", short(&title, 45));
+    println!("  (the title's count is the whole mailbox; the tree holds only");
+    println!("   what is rendered, so these are NOT expected to be equal)");
+
+    // Q(c): duplicate names -- the Name Box / formula bar failure shape.
+    println!("\n-- duplicate names (the silent-wrong-read risk) --");
+    let mut dupes: std::collections::BTreeMap<&String, usize> = Default::default();
+    for n in &named {
+        if !n.trim().is_empty() {
+            *dupes.entry(n).or_default() += 1;
+        }
+    }
+    let mut repeated: Vec<(&&String, &usize)> =
+        dupes.iter().filter(|(_, c)| **c > 1).collect();
+    repeated.sort_by(|a, b| b.1.cmp(a.1));
+    println!(
+        "  {} distinct name(s) appear more than once",
+        repeated.len()
+    );
+    for (name, count) in repeated.iter().take(12) {
+        println!("     x{count:<3} {:?}", short(name, 78));
+    }
+
+    println!("\n-- bounded tree dump (depth 12) --");
+    let mut budget = 200usize;
+    dump_tree(&window, 0, 12, &mut budget);
+
+    // ================================================ PHASE 2: opened email ==
+    println!("\n\n=========== PHASE 2: ONE OPENED EMAIL ===========\n");
+
+    // Click the first row that carries a real composed name. Opening is the
+    // only mutation this probe performs.
+    let target = rows.iter().find(|(_, e)| {
+        let n = e.attributes().name.unwrap_or_default();
+        n.contains(" , ") && n.len() > 30
+    });
+    let Some((_, row)) = target else {
+        println!("no composite row found to open; stopping after phase 1");
+        return ExitCode::SUCCESS;
+    };
+    let row_name = row.attributes().name.unwrap_or_default();
+    println!("opening: {:?}\n", short(&row_name, 100));
+
+    // The row itself reported "Element not visible" on a first attempt. Two
+    // plausible causes, both handled rather than guessed at: the window was not
+    // foreground, and the row DataItem is a wrapper whose real click target is
+    // the subject Hyperlink -- which is what a user actually clicks.
+    if let Err(e) = window.activate_window() {
+        println!("  activate_window failed: {}", first_line(&e.to_string()));
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Re-resolve the row from a FRESH enumeration. The handles above were taken
+    // before the histogram and dumps ran; Gmail re-renders its list constantly,
+    // and a stale handle reports "not visible" rather than failing loudly.
+    let fresh = collect_all(&window, 30, 4000);
+    let target_fresh = fresh
+        .iter()
+        .find(|(_, e)| e.attributes().name.unwrap_or_default() == row_name)
+        .map(|(_, e)| e.clone());
+    let row_now = target_fresh.as_ref().unwrap_or(row);
+    println!(
+        "  re-resolved from a fresh tree: {}",
+        target_fresh.is_some()
+    );
+
+    let link = collect_all(row_now, 6, 80)
+        .into_iter()
+        .find(|(_, e)| e.attributes().role == "Hyperlink")
+        .map(|(_, e)| e);
+    let click_target = link.as_ref().unwrap_or(row_now);
+    println!(
+        "  click target role: {}  visible={:?}",
+        click_target.attributes().role,
+        click_target.is_visible().ok()
+    );
+
+    let mut opened_ok = false;
+    match click_target.click() {
+        Ok(_) => {
+            println!("  click() OK");
+            opened_ok = true;
+        }
+        Err(e) => println!("  click() failed: {}", first_line(&e.to_string())),
+    }
+    if !opened_ok {
+        match click_target.invoke() {
+            Ok(_) => {
+                println!("  invoke() OK");
+                opened_ok = true;
+            }
+            Err(e) => println!("  invoke() failed: {}", first_line(&e.to_string())),
+        }
+    }
+    if !opened_ok {
+        println!("could not open any email; stopping after phase 1");
+        return ExitCode::SUCCESS;
+    }
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let Some(window2) = gmail_window(&desktop, &compose).await else {
+        println!("lost the window after opening");
+        return ExitCode::SUCCESS;
+    };
+    let opened = collect_all(&window2, 30, 4000);
+    println!("accessible nodes with the email open: {}\n", opened.len());
+
+    println!("-- role histogram (opened) --");
+    for (role, n) in role_histogram(&opened) {
+        println!("  {n:>5}  {role}");
+    }
+
+    // Q(b): are sender / subject / body / date distinct, readable elements?
+    println!("\n-- Text / Heading / Link elements, in tree order --");
+    let mut shown = 0;
+    for (d, el) in &opened {
+        let a = el.attributes();
+        let role = a.role.clone();
+        if role != "Text" && role != "Heading" && role != "Hyperlink" && role != "Document" {
+            continue;
+        }
+        let name = a.name.unwrap_or_default();
+        let value = a.value.unwrap_or_default();
+        let text = el.text(0).unwrap_or_default();
+        if name.trim().is_empty() && value.trim().is_empty() && text.trim().is_empty() {
+            continue;
+        }
+        println!(
+            "  d={d:<3} {role:<10} name={:?}",
+            short(&name, 62)
+        );
+        if !text.trim().is_empty() && text != name {
+            println!("           text(0)={:?} ({} chars)", short(&text, 62), text.len());
+        }
+        shown += 1;
+        if shown >= 45 {
+            println!("  ... (truncated)");
+            break;
+        }
+    }
+
+    // The body-blob question, answered by size rather than by eye.
+    println!("\n-- biggest text payloads (is the body one blob?) --");
+    let mut sized: Vec<(usize, String, String)> = opened
+        .iter()
+        .filter_map(|(_, e)| {
+            let t = e.text(0).unwrap_or_default();
+            if t.trim().is_empty() {
+                None
+            } else {
+                Some((t.len(), e.attributes().role, t))
+            }
+        })
+        .collect();
+    sized.sort_by(|a, b| b.0.cmp(&a.0));
+    for (len, role, t) in sized.iter().take(8) {
+        println!("  {len:>7} chars  {role:<10} {:?}", short(t, 60));
+    }
+
+    println!("\n-- bounded tree dump, opened email (depth 14) --");
+    let mut budget2 = 220usize;
+    dump_tree(&window2, 0, 14, &mut budget2);
+
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------- gmailcapture mode ----
+//
+// Item 4 of the Gmail brief: drive the real task -- take sender and subject off
+// real emails and put them into a scratch spreadsheet -- with a REAL
+// CaptureSession running, and report exactly what Record Mode ends up holding.
+//
+// The Sheets half of this is already understood (`grid_type`, Name Box entry,
+// `{Tab}` commit). What is NEW here is the Gmail half: when a user interacts
+// with a message list, does capture record something that names a message, or
+// does it record an anonymous `pane` the way a click inside Sheets did?
+//
+// Writes to columns D/E of the scratch document and clears them afterwards.
+async fn gmailcapture_mode() -> ExitCode {
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::DestinationWriter;
+
+    let scratch = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "1g3lvtsYyGc_aIqoiPBKJRlsSjkk4i2AAg72VPFvPm3Q".to_string());
+
+    println!("== Gmail -> spreadsheet, with Record Mode running ==\n");
+    println!("scratch document: {scratch}");
+    println!("writes D1:E2 only, and clears them at the end.\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // ---- read two real emails out of the list, before any capture ----------
+    let compose = match desktop
+        .locator("role:Button|name:Compose")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("Gmail is not loaded/signed in. Aborting.");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(gmail) = gmail_window(&desktop, &compose).await else {
+        eprintln!("no Gmail window");
+        return ExitCode::FAILURE;
+    };
+
+    // A row is a DataItem whose name has the composed "sender , subject , date"
+    // shape. Its CHILDREN carry the fields separately -- that is what we read,
+    // rather than splitting the composed string.
+    let els = collect_all(&gmail, 30, 4000);
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (_, el) in &els {
+        let name = el.attributes().name.unwrap_or_default();
+        if el.attributes().role != "DataItem" || !name.contains(" , ") || name.len() < 30 {
+            continue;
+        }
+        let kids: Vec<(usize, UIElement)> = collect_all(el, 3, 40);
+        // Field order in the row: [checkbox] [star] [sender] [subject] [..] [date]
+        //
+        // Two exclusions here are the whole point, and getting them wrong is
+        // the Gmail equivalent of reading the Name Box instead of the formula
+        // bar. `collect_all` yields the row ITSELF at depth 0, and the
+        // selection checkbox repeats the row's full composed name -- so a naive
+        // "take the first DataItem" reads
+        //   "unread, Edikted , SAVE 60-80% , 10:30 AM , The Most Popular…"
+        // as if it were the sender. It looks like data, it lands in the sheet,
+        // and it is wrong. Measured: that is exactly what the first run of this
+        // probe wrote into D1/E1.
+        let texts: Vec<String> = kids
+            .iter()
+            .filter(|(d, _)| *d > 0)
+            .filter(|(_, k)| k.attributes().role == "DataItem")
+            .map(|(_, k)| k.attributes().name.unwrap_or_default())
+            .filter(|n| {
+                !n.trim().is_empty()
+                    && n != &name
+                    && n != "Not starred"
+                    && n != "Starred"
+                    && !n.starts_with("unread,")
+                    && n.trim() != "\u{a0}"
+            })
+            .collect();
+        if texts.len() >= 2 {
+            let sender = texts[0].clone();
+            let subject = texts[1]
+                .split('\u{a0}')
+                .next()
+                .unwrap_or(&texts[1])
+                .trim()
+                .to_string();
+            if pairs.iter().all(|(s, _)| *s != sender) {
+                pairs.push((sender, subject));
+            }
+        }
+        if pairs.len() == 2 {
+            break;
+        }
+    }
+    if pairs.len() < 2 {
+        eprintln!("could not read two distinct rows out of the list");
+        return ExitCode::FAILURE;
+    }
+    println!("-- read from the Gmail list (no capture yet) --");
+    for (i, (s, subj)) in pairs.iter().enumerate() {
+        println!("  [{i}] sender={:?}", short(s, 50));
+        println!("      subject={:?}", short(subj, 70));
+    }
+    println!("  (a correct read here is per-FIELD; the composed row name is a");
+    println!("   different, wrong-looking-plausible value -- see the comment)");
+
+    // ---- open the scratch spreadsheet --------------------------------------
+    for browser in browser_order() {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "start",
+                "",
+                browser,
+                &format!("https://docs.google.com/spreadsheets/d/{scratch}/edit"),
+            ])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("\nwaiting 18s for the sheet...");
+    tokio::time::sleep(Duration::from_secs(18)).await;
+
+    let mut sheet_window = None;
+    for _ in 0..6 {
+        if let Some(w) = window_for_doc(&desktop, &scratch).await {
+            sheet_window = Some(w);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+    }
+    let Some(sheet_window) = sheet_window else {
+        eprintln!("could not find the spreadsheet window");
+        return ExitCode::FAILURE;
+    };
+    let _ = sheet_window.activate_window();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!(
+        "sheet window: {:?}",
+        short(&sheet_window.attributes().name.unwrap_or_default(), 70)
+    );
+
+    let mut writer = match SpreadsheetWriter::open(
+        desktop.clone(),
+        &sheet_window,
+        scratch.clone(),
+        None,
+        1,
+    )
+    .await
+    {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("could not open the writer: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // ---- capture ON, then do the task --------------------------------------
+    let session = match CaptureSession::start_session(
+        "gmail-capture-probe",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("\n-- capture running; driving the task --");
+
+    for (i, (sender, subject)) in pairs.iter().enumerate() {
+        for (col, value) in [("D", sender), ("E", subject)] {
+            match writer.write(col, value) {
+                Ok(_) => println!("  wrote {col} at {}", writer.position()),
+                Err(e) => println!("  {col} FAILED: {}", first_line(&e.to_string())),
+            }
+        }
+        if i + 1 < pairs.len() {
+            let _ = writer.advance(1);
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n================ WHAT RECORD MODE CAPTURED ================");
+    println!(
+        "{} action(s), {} unmapped event(s), {} paste(s) observed\n",
+        report.actions.len(),
+        report.unmapped_events,
+        report.pastes_observed
+    );
+    for a in &report.actions {
+        println!(
+            "  {:<9} role={:<12} name={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-")
+        );
+        if let Some(p) = &a.payload {
+            println!("            payload={:?}", short(p, 70));
+        }
+    }
+
+    // ---- ground truth, and cleanup -----------------------------------------
+    println!("\n-- ground truth from the export --");
+    match download_csv("msedge", &scratch, "0").await {
+        Some(csv) => {
+            for row in 1..=2 {
+                println!(
+                    "  row {row}: D={:?} E={:?}",
+                    csv_at(&csv, 4, row).unwrap_or_default(),
+                    csv_at(&csv, 5, row).unwrap_or_default()
+                );
+            }
+        }
+        None => println!("  could not export"),
+    }
+
+    println!("\n-- clearing D1:E2 --");
+    let _ = sheet_window.activate_window();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for row in 1..=2u64 {
+        for col in ["D", "E"] {
+            let cell = format!("{col}{row}");
+            if goto_sheet_via_namebox(&desktop, &cell).await.is_none() {
+                println!("  could not select {cell}");
+                continue;
+            }
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            if let Ok(el) = desktop.focused_element() {
+                let _ = el.press_key("{Delete}");
+            }
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    match download_csv("msedge", &scratch, "0").await {
+        Some(csv) => {
+            for row in 1..=2 {
+                println!(
+                    "  row {row} now: D={:?} E={:?}",
+                    csv_at(&csv, 4, row).unwrap_or_default(),
+                    csv_at(&csv, 5, row).unwrap_or_default()
+                );
+            }
+        }
+        None => println!("  could not re-export to confirm the clear"),
+    }
+
+    ExitCode::SUCCESS
+}
+
+// ----------------------------------------------------- gmailopened mode ----
+//
+// Pure read. Attaches to whatever Gmail is showing RIGHT NOW and enumerates it
+// completely -- no clicking, nothing marked read. Exists because `gmailtree`
+// caps its listing at 45 elements, and "I did not print it" and "it is not
+// there" are the two things this project keeps having to tell apart.
+async fn gmailopened_mode() -> ExitCode {
+    println!("== Gmail, whatever is on screen now: full enumeration ==");
+    println!("Reads only. Clicks nothing. Marks nothing read.\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let compose = match desktop
+        .locator("role:Button|name:Compose")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("no Compose button; Gmail is not loaded. Aborting.");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(window) = gmail_window(&desktop, &compose).await else {
+        eprintln!("no Gmail window");
+        return ExitCode::FAILURE;
+    };
+    println!(
+        "window: {:?}\n",
+        short(&window.attributes().name.unwrap_or_default(), 100)
+    );
+
+    let els = collect_all(&window, 30, 4000);
+    println!("nodes: {}\n", els.len());
+
+    println!("-- EVERY named element (role, depth, name) --");
+    for (d, el) in &els {
+        let a = el.attributes();
+        let name = a.name.unwrap_or_default();
+        if name.trim().is_empty() {
+            continue;
+        }
+        println!("  d={d:<3} {:<10} {:?}", a.role, short(&name, 110));
+    }
+
+    println!("\n-- anything that looks like a DATE --");
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut found = 0;
+    for (d, el) in &els {
+        let a = el.attributes();
+        let name = a.name.unwrap_or_default();
+        let looks_dateish = name.contains("AM")
+            || name.contains("PM")
+            || months.iter().any(|m| name.contains(m))
+            || name.contains("2026");
+        if looks_dateish && !name.trim().is_empty() {
+            println!("  d={d:<3} {:<10} {:?}", a.role, short(&name, 100));
+            found += 1;
+        }
+    }
+    if found == 0 {
+        println!("  NONE");
+    }
+
+    // The identity question, asked exhaustively rather than through one filter:
+    // print EVERY accessor on every descendant of the first few message rows.
+    // If a stable per-message handle exists in the list, it is in here.
+    println!("\n-- first 3 message rows: every descendant, every accessor --");
+    let rows: Vec<&(usize, UIElement)> = els
+        .iter()
+        .filter(|(_, e)| {
+            let n = e.attributes().name.unwrap_or_default();
+            e.attributes().role == "DataItem" && n.contains(" , ") && n.len() > 30
+        })
+        .collect();
+    for (i, (_, row)) in rows.iter().take(3).enumerate() {
+        println!("  --- row {i} ---");
+        for (d, el) in collect_all(row, 6, 60) {
+            let a = el.attributes();
+            let t = el.text(0).unwrap_or_default();
+            let id = el.id().unwrap_or_default();
+            println!(
+                "    {:indent$}{:<10} name={:?}",
+                "",
+                a.role,
+                short(&a.name.unwrap_or_default(), 46),
+                indent = d * 2
+            );
+            if !t.trim().is_empty() || !id.trim().is_empty() {
+                println!(
+                    "    {:indent$}   text={:?} id={:?}",
+                    "",
+                    short(&t, 60),
+                    short(&id, 24),
+                    indent = d * 2
+                );
+            }
+        }
+    }
+
+    println!("\n-- where does the message id live? --");
+    for (d, el) in &els {
+        let a = el.attributes();
+        let t = el.text(0).unwrap_or_default();
+        let n = a.name.unwrap_or_default();
+        if t.contains("#inbox/") || n.contains("#inbox/") {
+            println!(
+                "  d={d:<3} {:<10} name={:?}\n           text={:?}",
+                a.role,
+                short(&n, 60),
+                short(&t, 90)
+            );
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
 // ----------------------------------------------------- gmailpicker mode ----
 //
 // Answers one question from docs/known-issues/dynamic-contact-picker-replay-fails.md:
@@ -12256,6 +13076,15 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "gmailcleanup") {
         return gmailcleanup_mode().await;
+    }
+    if std::env::args().any(|a| a == "gmailtree") {
+        return gmailtree_mode().await;
+    }
+    if std::env::args().any(|a| a == "gmailopened") {
+        return gmailopened_mode().await;
+    }
+    if std::env::args().any(|a| a == "gmailcapture") {
+        return gmailcapture_mode().await;
     }
     if std::env::args().any(|a| a == "gmailpicker") {
         return gmailpicker_mode().await;
