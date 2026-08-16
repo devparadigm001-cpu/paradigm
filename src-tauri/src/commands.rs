@@ -1067,9 +1067,13 @@ pub async fn preview_workflow_run(
         let conn = state.db.lock().await;
         run::processed_count(&conn, &playbook_id, &template.source_id).unwrap_or(0)
     };
-    // Filled while the destination reader is open: the mapped columns that
-    // already hold something at the row a run would start writing at.
-    let mut occupied: Vec<String> = Vec::new();
+    // What reading the destination's starting row established. Starts as
+    // Unreadable and is only ever downgraded to Empty/Occupied by an actual
+    // successful read -- so every path that fails to read leaves it saying so,
+    // rather than a failure resolving to "empty, all clear".
+    let mut destination_check = run::preview::DestinationCheck::Unreadable(
+        "the destination could not be opened for reading".to_string(),
+    );
     let destination_shape = {
         // A second reader on the destination, purely to read its header row.
         // Reading is non-destructive, and `SourceShape` is the only thing that
@@ -1099,15 +1103,33 @@ pub async fn preview_workflow_run(
                         // it was opened with `destination_row` as its first
                         // row. Anything non-blank here is something a fresh
                         // workflow would write over rather than after.
-                        occupied = r
-                            .shape_at(destination_row)
-                            .map(|s| s.columns.into_iter().map(|c| c.locator).collect())
-                            .unwrap_or_default();
+                        //
+                        // A read ERROR stays Unreadable. It is the one outcome
+                        // that establishes nothing, and collapsing it into an
+                        // empty list is how this check silently stopped
+                        // protecting anyone.
+                        destination_check = match r.shape_at(destination_row) {
+                            Ok(shape) => {
+                                let occupied: Vec<String> =
+                                    shape.columns.into_iter().map(|c| c.locator).collect();
+                                if occupied.is_empty() {
+                                    run::preview::DestinationCheck::Empty
+                                } else {
+                                    run::preview::DestinationCheck::Occupied(occupied)
+                                }
+                            }
+                            Err(e) => run::preview::DestinationCheck::Unreadable(e.to_string()),
+                        };
                         r.shape().unwrap_or(crate::source::SourceShape {
                             columns: vec![],
                         })
                     }
-                    Err(_) => crate::source::SourceShape { columns: vec![] },
+                    Err(e) => {
+                        destination_check = run::preview::DestinationCheck::Unreadable(format!(
+                            "could not open the destination to read it: {e}"
+                        ));
+                        crate::source::SourceShape { columns: vec![] }
+                    }
                 }
             }
             None => crate::source::SourceShape { columns: vec![] },
@@ -1251,7 +1273,7 @@ pub async fn preview_workflow_run(
                 overwrite_warning: run::preview::overwrite_warning(
                     processed_so_far,
                     preview.destination_row(),
-                    &occupied,
+                    &destination_check,
                 ),
             };
 

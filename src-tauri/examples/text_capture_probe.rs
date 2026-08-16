@@ -18548,6 +18548,14 @@ async fn overwritecheck_mode() -> ExitCode {
         let screen = app_text(&desktop).await.join(" | ");
         let warned = screen.contains("will start writing at row")
             && screen.contains("already contains data");
+        // The fix under test: an unreadable destination is its OWN state now.
+        // Silence is only evidence of an empty destination if this did not
+        // fire -- otherwise a "no warning" result is the false negative again.
+        let unverified = screen.contains("Could not verify whether the destination");
+        println!("  read verified : {}", !unverified);
+        if unverified {
+            println!("  !! the destination could not be read, so silence proves nothing here");
+        }
         println!("  warning shown : {warned}   (expected {expect_warning})");
         if warned {
             if let Some(line) = app_text(&desktop)
@@ -18558,7 +18566,9 @@ async fn overwritecheck_mode() -> ExitCode {
                 println!("  message: {line}");
             }
         }
-        results.push((name, warned == expect_warning, warned));
+        // A pass requires the warning to match expectation AND the read to have
+        // actually happened.
+        results.push((name, warned == expect_warning && !unverified, warned));
 
         let _ = click_app_button(&desktop, "Cancel").await;
         tokio::time::sleep(Duration::from_secs(2)).await;

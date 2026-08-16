@@ -624,35 +624,67 @@ mod tests {
 ///
 /// Only the pair is suspicious: nothing recorded as done, yet something already
 /// written where this run is about to start.
+/// What reading the destination's starting row actually established.
+///
+/// Three states, not two, and the third is the point. An earlier version
+/// returned a bare `Vec<String>` of occupied cells and resolved a failed read
+/// to an empty vector — so when the destination could not be read at all, the
+/// warning silently did not fire. A safety check that treats "I could not look"
+/// as "nothing to worry about" is worse than no check, because it is trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DestinationCheck {
+    /// Read succeeded; the starting row is blank in every mapped column.
+    Empty,
+    /// Read succeeded; these mapped columns already hold data.
+    Occupied(Vec<String>),
+    /// The destination could not be read, and nothing is known about it.
+    Unreadable(String),
+}
+
 pub fn overwrite_warning(
     processed: usize,
     destination_row: u64,
-    occupied: &[String],
+    check: &DestinationCheck,
 ) -> Option<String> {
-    if processed > 0 || occupied.is_empty() {
+    // An established workflow resumes PAST its own output, so occupied cells
+    // there are expected and an unreadable destination is not this warning's
+    // business. Scoping to an empty ledger keeps the alert meaningful.
+    if processed > 0 {
         return None;
     }
-    let cells = occupied
-        .iter()
-        .map(|c| format!("{c}{destination_row}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!(
-        "This workflow has no record of processing anything, so it will start writing at row \
-         {destination_row} — but {cells} already contains data. If this workflow was recorded \
-         again, it starts over and will write OVER what is there rather than after it. Check \
-         the destination before confirming."
-    ))
+    match check {
+        DestinationCheck::Empty => None,
+        DestinationCheck::Occupied(occupied) if occupied.is_empty() => None,
+        DestinationCheck::Occupied(occupied) => {
+            let cells = occupied
+                .iter()
+                .map(|c| format!("{c}{destination_row}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!(
+                "This workflow has no record of processing anything, so it will start writing \
+                 at row {destination_row} — but {cells} already contains data. If this workflow \
+                 was recorded again, it starts over and will write OVER what is there rather \
+                 than after it. Check the destination before confirming."
+            ))
+        }
+        DestinationCheck::Unreadable(why) => Some(format!(
+            "Could not verify whether the destination has existing data at row \
+             {destination_row}: {why}. This workflow has no record of processing anything, so \
+             if that row is not empty it will be written OVER rather than appended to. Check \
+             the destination yourself before confirming."
+        )),
+    }
 }
 
 #[cfg(test)]
 mod overwrite_tests {
-    use super::overwrite_warning;
+    use super::{overwrite_warning, DestinationCheck};
 
     /// The measured scenario: nothing in the ledger, data already at the target.
     #[test]
     fn an_empty_ledger_over_occupied_cells_warns() {
-        let warning = overwrite_warning(0, 2, &["A".into(), "B".into()])
+        let warning = overwrite_warning(0, 2, &DestinationCheck::Occupied(vec!["A".into(), "B".into()]))
             .expect("this is the case the warning exists for");
         assert!(warning.contains("A2, B2"), "it must name the cells: {warning}");
         assert!(warning.contains("row 2"));
@@ -667,14 +699,75 @@ mod overwrite_tests {
     /// every first run and train the user to ignore it.
     #[test]
     fn a_fresh_workflow_with_an_empty_destination_is_silent() {
-        assert_eq!(overwrite_warning(0, 2, &[]), None);
+        assert_eq!(overwrite_warning(0, 2, &DestinationCheck::Empty), None);
     }
 
     /// And a workflow that HAS processed rows is expected to have filled its
     /// destination; it resumes past that, so occupied cells are not a signal.
     #[test]
     fn an_established_workflow_is_silent_even_over_occupied_cells() {
-        assert_eq!(overwrite_warning(5, 7, &["A".into()]), None);
-        assert_eq!(overwrite_warning(1, 3, &["A".into(), "B".into()]), None);
+        assert_eq!(
+            overwrite_warning(5, 7, &DestinationCheck::Occupied(vec!["A".into()])),
+            None
+        );
+        assert_eq!(
+            overwrite_warning(1, 3, &DestinationCheck::Occupied(vec!["A".into(), "B".into()])),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod unreadable_destination_tests {
+    use super::{overwrite_warning, DestinationCheck};
+
+    /// The false negative this exists to prevent.
+    ///
+    /// A destination that could not be read must NOT resolve to "empty, all
+    /// clear". It is the one outcome where the check has established nothing,
+    /// and the user is the only one who can settle it.
+    #[test]
+    fn an_unreadable_destination_is_never_treated_as_safe() {
+        let warning = overwrite_warning(
+            0,
+            2,
+            &DestinationCheck::Unreadable("no Name Box on the destination".into()),
+        )
+        .expect("an unverified destination must not be silent");
+        assert!(warning.contains("Could not verify"), "{warning}");
+        assert!(warning.contains("row 2"), "{warning}");
+        assert!(
+            warning.contains("no Name Box on the destination"),
+            "the reason has to travel with it: {warning}"
+        );
+        assert!(
+            warning.contains("OVER"),
+            "it must still say what is at stake: {warning}"
+        );
+    }
+
+    /// It is distinguishable from the confirmed-overwrite message, because the
+    /// two call for different responses: one is "this WILL overwrite", the
+    /// other is "nobody knows, go and look".
+    #[test]
+    fn the_two_warnings_do_not_read_the_same() {
+        let confirmed =
+            overwrite_warning(0, 2, &DestinationCheck::Occupied(vec!["A".into()])).unwrap();
+        let unknown =
+            overwrite_warning(0, 2, &DestinationCheck::Unreadable("window vanished".into()))
+                .unwrap();
+        assert_ne!(confirmed, unknown);
+        assert!(confirmed.contains("already contains data"));
+        assert!(!unknown.contains("already contains data"));
+    }
+
+    /// An established workflow is out of scope for both: it resumes past its
+    /// own output, so neither occupied cells nor a failed read imply overwrite.
+    #[test]
+    fn an_established_workflow_is_silent_even_when_unreadable() {
+        assert_eq!(
+            overwrite_warning(3, 5, &DestinationCheck::Unreadable("whatever".into())),
+            None
+        );
     }
 }
