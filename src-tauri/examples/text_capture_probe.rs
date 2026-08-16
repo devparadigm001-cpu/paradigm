@@ -12093,6 +12093,12 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "overwritecheck") {
         return overwritecheck_mode().await;
     }
+    if std::env::args().any(|a| a == "destcheck") {
+        return destcheck_mode().await;
+    }
+    if std::env::args().any(|a| a == "nameboxcount") {
+        return nameboxcount_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -18585,4 +18591,178 @@ async fn overwritecheck_mode() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// destcheck -- when the preview reads the destination, WHAT does it read?
+///
+/// The overwrite warning stayed silent against a destination that demonstrably
+/// holds data, with the read reported as successful. A successful read that
+/// finds nothing means navigation VERIFIED and the cell was genuinely blank --
+/// so the question is not "did it fail" but "what was it looking at".
+///
+/// Three candidates, and this separates them:
+///
+///   1. wrong DOCUMENT   -- window_for resolved a different spreadsheet;
+///   2. right document, wrong SHEET -- a bare reference like "A2" navigates
+///      within whatever sheet is active, and `run::spreadsheet`'s own docs
+///      record that nothing in the tree confirms which tab a cell is on;
+///   3. right document, right sheet, genuinely blank.
+///
+/// Reproduces the preview's exact resolution path rather than a similar one.
+async fn destcheck_mode() -> ExitCode {
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+
+    let doc = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "1g3lvtsYyGc_aIqoiPBKJRlsSjkk4i2AAg72VPFvPm3Q".to_string());
+    let row: u64 = std::env::args()
+        .nth(3)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(2);
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("== resolving destination {doc}, reading row {row} ==\n");
+
+    // Exactly what the preview calls.
+    let Some(window) = paradigm_lib::run::surfaces::window_for(&desktop, &doc).await else {
+        println!("window_for: NOT FOUND -- the preview would report it unreadable");
+        return ExitCode::SUCCESS;
+    };
+
+    let address = address_of(&desktop, &window).await;
+    println!("window_for resolved a window:");
+    println!("  title  : {:?}", window.name().unwrap_or_default().chars().take(60).collect::<String>());
+    println!("  address: {address:?}");
+
+    let right_document = address.contains(&doc);
+    let gid = gid_in(&address).unwrap_or_else(|| "<none>".into());
+    println!("\n  1) is it the RIGHT DOCUMENT? {right_document}");
+    println!("  2) which SHEET is active?     gid {gid}");
+
+    // Same read, but with the window brought to the front first. The preview
+    // does NOT do this -- it resolves a window and reads it where it sits,
+    // which for a destination is almost always behind the app.
+    if std::env::args().any(|a| a == "activate") {
+        println!("
+  (activating the window first)");
+        let _ = window.activate_window();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // What the reader sees, through the same call the preview makes.
+    match SpreadsheetReader::open(
+        desktop.clone(),
+        &window,
+        doc.clone(),
+        None,
+        row,
+        1,
+        vec!["A".to_string(), "B".to_string()],
+    )
+    .await
+    {
+        Ok(mut r) => match r.shape_at(row) {
+            Ok(shape) => {
+                let occupied: Vec<String> =
+                    shape.columns.iter().map(|c| c.locator.clone()).collect();
+                println!("\n  3) shape_at({row}) -> occupied {occupied:?}");
+                for c in &shape.columns {
+                    println!("        {}{row} = {:?}", c.locator, c.label);
+                }
+                if occupied.is_empty() {
+                    println!("        (nothing -- this is the silent case)");
+                }
+            }
+            Err(e) => println!("\n  3) shape_at({row}) FAILED: {e}"),
+        },
+        Err(e) => println!("\n  3) reader would not open: {e}"),
+    }
+
+    // Ground truth for the same cells, independent of the accessibility tree.
+    println!("\n-- CSV ground truth for gid {gid} --");
+    match download_csv("msedge", &doc, if gid == "<none>" { "0" } else { &gid }).await {
+        Some(csv) => {
+            for col in 1..=2usize {
+                println!(
+                    "  {}{row} = {:?}",
+                    if col == 1 { "A" } else { "B" },
+                    csv_at(&csv, col, row as usize).unwrap_or_default()
+                );
+            }
+        }
+        None => println!("  could not export to compare"),
+    }
+    ExitCode::SUCCESS
+}
+
+/// nameboxcount -- how many Name Boxes does one browser window expose?
+///
+/// `SpreadsheetReader::open` takes the FIRST `name:Name box` inside a window
+/// and then picks the formula bar geometrically to its right. Both assume the
+/// window contains exactly one spreadsheet. A window with several Sheets TABS
+/// may keep more than one alive in the tree, in which case the reader can pair
+/// a Name Box and a formula bar belonging to a tab nobody is looking at --
+/// navigation verifies, the read comes back blank, and nothing reports a fault.
+async fn nameboxcount_mode() -> ExitCode {
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let windows = desktop
+        .locator("role:Window")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .unwrap_or_default();
+
+    for w in &windows {
+        let title = w.name().unwrap_or_default();
+        if !title.contains("Edge") && !title.contains("Chrome") {
+            continue;
+        }
+        let address = address_of(&desktop, w).await;
+        let boxes = desktop
+            .locator("name:Name box")
+            .within(w.clone())
+            .all(Some(Duration::from_secs(6)), None)
+            .await
+            .unwrap_or_default();
+        let edits = desktop
+            .locator("role:Edit")
+            .within(w.clone())
+            .all(Some(Duration::from_secs(6)), None)
+            .await
+            .unwrap_or_default();
+        println!("\nwindow : {:?}", title.chars().take(64).collect::<String>());
+        println!("  address    : {:?}", address.chars().take(90).collect::<String>());
+        println!("  Name boxes : {}", boxes.len());
+        println!("  role:Edit  : {}", edits.len());
+        for (i, b) in boxes.iter().enumerate() {
+            let value = b
+                .children()
+                .ok()
+                .and_then(|c| c.into_iter().find(|e| e.role() == "Edit"))
+                .and_then(|e| e.text(0).ok())
+                .unwrap_or_default();
+            let bounds = b
+                .bounds()
+                .map(|(x, y, _, _)| format!("{x:.0},{y:.0}"))
+                .unwrap_or_default();
+            println!("     #{i} at {bounds} reads {:?}", value.trim());
+        }
+        if boxes.len() > 1 {
+            println!("  ^^ MORE THAN ONE. The reader takes the first and cannot tell");
+            println!("     which tab it belongs to.");
+        }
+    }
+    ExitCode::SUCCESS
 }
