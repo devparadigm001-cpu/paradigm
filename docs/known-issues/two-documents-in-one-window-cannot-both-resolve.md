@@ -155,10 +155,65 @@ intrusion than a run that asks them to bring it forward.
 
 If it is ever built, the shape that avoids the intrusion is not tab-walking at
 all — it is removing the need to resolve a window, the way the scan already
-did. `check_for_new_records` reads its source from a CSV export and resolves no
-windows, so **Check for new is already immune**. A destination writer cannot
-work that way (writing needs the live grid), but a *reader* on the run path
-could, which would halve the exposure.
+did. That direction has a name and a section of its own below.
+
+## Named direction: a CSV-backed source reader on the RUN path
+
+**Status:** not built, not scheduled. Recorded because it is the only approach
+found that removes this problem rather than working around it — and because the
+obvious version of it is wrong in a way worth writing down before someone
+builds it.
+
+`open_for` resolves **two** windows, and each is a chance to hit this. The scan
+already proved one of them is unnecessary: `check_for_new_records` reads its
+source from a CSV export, resolves no windows at all, and was verified
+answering correctly with **every browser process closed**. Check for new is
+therefore already immune.
+
+The run is not. It resolves a source window *and* a destination window, so it
+carries twice the exposure and gains nothing from what the scan learned.
+
+* **The destination cannot work this way.** Writing needs the live grid — the
+  Name Box to address a cell, the formula bar to read it back. An export is a
+  read-only copy. That half of `open_for` is irreducible.
+* **The source could.** A run's reads are reads. Serving them without resolving
+  a window would remove one of the two failure points, and with it every case
+  where the source happens to sit behind another tab.
+
+### Why the obvious version is wrong
+
+`source::csv_snapshot`'s own module docs argue the run must keep reading
+**live**, and that reasoning still stands: a run interleaves reads with writes,
+pauses for §4.5 corrections, and can sit waiting on a human for minutes. A
+snapshot taken once at spawn would let it write values the source no longer
+holds — silently, with the drift check reading the same stale copy and finding
+nothing wrong.
+
+So this is **not** a matter of swapping the reader in. It needs an answer to
+freshness, and there are two shapes:
+
+1. **Re-fetch per record.** An export is ~2.0s; a two-column record read is
+   ~2.0s of Name Box navigation. The cost is roughly a wash, and the whole win
+   is that no window has to be resolved. This is the honest candidate.
+2. **A snapshot with a bounded age**, re-fetched when stale and whenever the run
+   resumes from a pause. Cheaper, but it introduces a window during which the
+   run acts on a copy, and that window has to be justified against §4.5 rather
+   than chosen for convenience.
+
+Neither is a refactor. Both are a decision about how fresh a run's view of its
+source must be — precisely the question the scan never had to answer, because a
+scan is one question asked at one moment.
+
+### What it would and would not fix
+
+| | today | with a CSV source reader |
+|---|---|---|
+| Check for new | immune | immune |
+| Run — source in a background tab | fails | fixed |
+| Run — destination in a background tab | fails | **still fails** |
+
+Halving the exposure is worth having. It does not close this issue, and should
+not be presented as doing so.
 
 ## Part A, shipped 2026-08-16: the message no longer lies
 
