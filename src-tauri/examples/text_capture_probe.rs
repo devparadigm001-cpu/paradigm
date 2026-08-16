@@ -12117,6 +12117,18 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "runcsvspike") {
         return runcsvspike_mode().await;
     }
+    if std::env::args().any(|a| a == "groupdump") {
+        return groupdump_mode().await;
+    }
+    if std::env::args().any(|a| a == "pathduel") {
+        return pathduel_mode().await;
+    }
+    if std::env::args().any(|a| a == "settletest") {
+        return settletest_mode().await;
+    }
+    if std::env::args().any(|a| a == "waketest") {
+        return waketest_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -19490,6 +19502,376 @@ async fn runcsvspike_mode() -> ExitCode {
             }
         }
         Err(e) => println!("   writer would not open: {e}"),
+    }
+    ExitCode::SUCCESS
+}
+
+/// groupdump -- what is actually inside each "Name box" group?
+///
+/// The reader excludes the Edit children of EVERY `name:Name box` element. That
+/// is only safe if such a group contains the Name Box and nothing else. If the
+/// group is really a toolbar holding the Name Box AND the formula bar, the
+/// exclusion removes the very element it needs -- which would explain why the
+/// writer (no exclusion) reads fine where the reader cannot.
+async fn groupdump_mode() -> ExitCode {
+    let doc = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs".to_string());
+    let desktop = Desktop::new(false, false).expect("desktop");
+    let Some(window) = paradigm_lib::run::surfaces::window_for(&desktop, &doc).await else {
+        eprintln!("no window showing {doc}");
+        return ExitCode::FAILURE;
+    };
+    let _ = window.activate_window();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let groups = desktop
+        .locator("name:Name box")
+        .within(window.clone())
+        .all(Some(Duration::from_secs(6)), None)
+        .await
+        .unwrap_or_default();
+    println!("{} element(s) named \"Name box\":\n", groups.len());
+
+    for (gi, g) in groups.iter().enumerate() {
+        let (gx, gy, gw, gh) = g.bounds().unwrap_or((0.0, 0.0, 0.0, 0.0));
+        println!(
+            "  group #{gi}: role={:?} bounds={gx:.0},{gy:.0} {gw:.0}x{gh:.0}",
+            g.role()
+        );
+        let children = g.children().unwrap_or_default();
+        println!("    {} child(ren)", children.len());
+        for (ci, c) in children.iter().enumerate() {
+            let (x, y, w, h) = c.bounds().unwrap_or((0.0, 0.0, 0.0, 0.0));
+            let text = c.text(0).unwrap_or_default();
+            println!(
+                "      #{ci} role={:<10} {x:>7.0},{y:>5.0} {w:>6.0}x{h:<5.0} {:?}",
+                c.role(),
+                text.chars().take(40).collect::<String>()
+            );
+        }
+        println!();
+    }
+    println!("  Anything here that is WIDE (600px+) is the formula bar, not a");
+    println!("  Name Box -- and the reader is currently excluding it.");
+    ExitCode::SUCCESS
+}
+
+/// pathduel -- writer read vs reader read, alternating, same state.
+///
+/// The contradiction: `SpreadsheetWriter` verified a formula-bar read where
+/// `SpreadsheetReader` could not, moments apart. Two candidate explanations
+/// were already ruled out by direct inspection -- the Name Box exclusion does
+/// not remove the formula bar (a "Name box" group holds only the 75x20 Edit and
+/// a button), and both paths navigate identically.
+///
+/// What remains untested is whether the writer's success depended on having
+/// just TYPED into the cell. So this compares the two WITHOUT any write:
+/// `DestinationWriter::shape` reads the header row through the writer's own
+/// `read_back`, which is the same formula-bar read, with nothing typed first.
+///
+/// Alternated and repeated, because the last two conclusions about this
+/// mechanism were each drawn from a single observation and each turned out
+/// wrong.
+async fn pathduel_mode() -> ExitCode {
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::DestinationWriter;
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+    use paradigm_lib::source::SourceReader;
+
+    let doc = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs".to_string());
+    let trials: usize = std::env::args()
+        .nth(3)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(4);
+    let columns = vec!["A".to_string(), "B".to_string()];
+
+    let desktop = Desktop::new(false, false).expect("desktop");
+    println!("== pathduel on {doc}, header row 1, {trials} alternating trial(s) ==");
+    println!("   neither path writes anything; both read the header row\n");
+
+    let mut writer_ok = 0;
+    let mut reader_ok = 0;
+
+    for trial in 1..=trials {
+        // ---- writer path ----
+        let w_result = match paradigm_lib::run::surfaces::window_for(&desktop, &doc).await {
+            Some(window) => {
+                match SpreadsheetWriter::open(
+                    desktop.clone(),
+                    &window,
+                    doc.clone(),
+                    None,
+                    1,
+                )
+                .await
+                {
+                    Ok(mut w) => match w.shape(&columns, 1) {
+                        Ok(shape) => {
+                            let labels: Vec<String> =
+                                shape.columns.iter().map(|c| c.label.clone()).collect();
+                            if labels.is_empty() {
+                                "read nothing".to_string()
+                            } else {
+                                format!("read {labels:?}")
+                            }
+                        }
+                        Err(e) => format!("shape failed: {e}"),
+                    },
+                    Err(e) => format!("open failed: {e}"),
+                }
+            }
+            None => "no window".to_string(),
+        };
+        if w_result.starts_with("read [") {
+            writer_ok += 1;
+        }
+        println!("  trial {trial} WRITER: {}", w_result.chars().take(90).collect::<String>());
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // ---- reader path, immediately after ----
+        let r_result = match paradigm_lib::run::surfaces::window_for(&desktop, &doc).await {
+            Some(window) => {
+                match SpreadsheetReader::open(
+                    desktop.clone(),
+                    &window,
+                    doc.clone(),
+                    None,
+                    2,
+                    1,
+                    columns.clone(),
+                )
+                .await
+                {
+                    Ok(mut r) => match r.shape() {
+                        Ok(shape) => {
+                            let labels: Vec<String> =
+                                shape.columns.iter().map(|c| c.label.clone()).collect();
+                            if labels.is_empty() {
+                                "read nothing".to_string()
+                            } else {
+                                format!("read {labels:?}")
+                            }
+                        }
+                        Err(e) => format!("shape failed: {e}"),
+                    },
+                    Err(e) => format!("open failed: {e}"),
+                }
+            }
+            None => "no window".to_string(),
+        };
+        if r_result.starts_with("read [") {
+            reader_ok += 1;
+        }
+        println!("  trial {trial} READER: {}", r_result.chars().take(90).collect::<String>());
+        println!();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    println!("== RESULT ==");
+    println!("  writer read the header : {writer_ok}/{trials}");
+    println!("  reader read the header : {reader_ok}/{trials}");
+    if writer_ok > reader_ok {
+        println!("\n  The writer succeeds where the reader does not, with NOTHING typed --");
+        println!("  so the difference is the selection logic, not prior interaction.");
+    } else if writer_ok == reader_ok {
+        println!("\n  Both behave the same here. The earlier contradiction was NOT the");
+        println!("  two paths differing -- something else varied between those runs.");
+    }
+    ExitCode::SUCCESS
+}
+
+/// settletest -- does a freshly-opened second document break reads TEMPORARILY?
+///
+/// `pathduel` found both paths reading fine, 4/4, in the same two-document
+/// state that produced 0/4 earlier. The paths are not the difference. What
+/// differs between those sessions is AGE: the failing runs opened windows
+/// programmatically and read within ~18s, while the passing ones used windows
+/// that had been open for many minutes.
+///
+/// So the hypothesis is no longer "two documents break the formula bar" but
+/// "opening a second document disrupts the first's accessibility tree, and it
+/// recovers". This opens two documents fresh and then reads on a schedule until
+/// it works or time runs out, which distinguishes a permanent limitation from a
+/// settling period -- and, if it settles, measures how long it needs.
+async fn settletest_mode() -> ExitCode {
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+    use paradigm_lib::source::SourceReader;
+
+    let first = "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs";
+    let second = "1d2LLTBv-Fu56cnLpinSVQC59JMRf2816AsWIBvIM8eQ";
+    let columns = vec!["A".to_string(), "B".to_string()];
+
+    let _ = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force",
+        ])
+        .status();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    for doc in [first, second] {
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Start-Process",
+                "msedge",
+                "-ArgumentList",
+                &format!("'--new-window','https://docs.google.com/spreadsheets/d/{doc}/edit'"),
+            ])
+            .status();
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+
+    let desktop = Desktop::new(false, false).expect("desktop");
+    let opened = std::time::Instant::now();
+    println!("== both documents opened fresh; reading {first} on a schedule ==\n");
+
+    let mut first_success: Option<f64> = None;
+    for attempt in 1..=10 {
+        let elapsed = opened.elapsed().as_secs_f64();
+        let outcome = match paradigm_lib::run::surfaces::window_for(&desktop, first).await {
+            Some(window) => match SpreadsheetReader::open(
+                desktop.clone(),
+                &window,
+                first.to_string(),
+                None,
+                2,
+                1,
+                columns.clone(),
+            )
+            .await
+            {
+                Ok(mut r) => match r.shape() {
+                    Ok(s) if !s.columns.is_empty() => {
+                        let labels: Vec<String> =
+                            s.columns.iter().map(|c| c.label.clone()).collect();
+                        format!("READ {labels:?}")
+                    }
+                    Ok(_) => "read nothing".to_string(),
+                    Err(e) => format!("shape failed: {}", first_line(&e.to_string())),
+                },
+                Err(e) => format!("open refused: {}", first_line(&e.to_string())),
+            },
+            None => "no window".to_string(),
+        };
+        let good = outcome.starts_with("READ");
+        if good && first_success.is_none() {
+            first_success = Some(elapsed);
+        }
+        println!("  +{elapsed:5.0}s  attempt {attempt:2}: {}", outcome.chars().take(80).collect::<String>());
+        if good && attempt >= 2 && first_success.is_some() {
+            // Confirm it stays working rather than flickering.
+            if attempt as f64 - 1.0 > 0.0 && elapsed - first_success.unwrap() > 25.0 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(20)).await;
+    }
+
+    println!("\n== RESULT ==");
+    match first_success {
+        Some(t) => {
+            println!("  first successful read at +{t:.0}s after the second document opened.");
+            println!("  So this is a SETTLING PERIOD, not a permanent limitation.");
+        }
+        None => println!("  never read successfully within the window tested."),
+    }
+    ExitCode::SUCCESS
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").chars().take(70).collect()
+}
+
+/// waketest -- does WRITING to a document wake its accessibility tree?
+///
+/// The last difference standing. `pathduel` read fine in a two-document state
+/// where a write had happened earlier; `settletest` failed for 204s in a
+/// freshly-opened two-document state where nothing had been typed. Navigation
+/// alone does not wake it -- settletest navigated ~20 times while failing.
+///
+/// Reader, then a real write, then reader again, on the same document.
+async fn waketest_mode() -> ExitCode {
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::DestinationWriter;
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+    use paradigm_lib::source::SourceReader;
+
+    let doc = "1d2LLTBv-Fu56cnLpinSVQC59JMRf2816AsWIBvIM8eQ";
+    let columns = vec!["A".to_string(), "B".to_string()];
+    let desktop = Desktop::new(false, false).expect("desktop");
+
+    let try_read = |label: &'static str| {
+        let desktop = desktop.clone();
+        let columns = columns.clone();
+        async move {
+            let outcome = match paradigm_lib::run::surfaces::window_for(&desktop, doc).await {
+                Some(w) => match SpreadsheetReader::open(
+                    desktop.clone(), &w, doc.to_string(), None, 2, 1, columns,
+                )
+                .await
+                {
+                    Ok(mut r) => match r.shape() {
+                        Ok(s) if !s.columns.is_empty() => format!(
+                            "READ {:?}",
+                            s.columns.iter().map(|c| c.label.clone()).collect::<Vec<_>>()
+                        ),
+                        Ok(_) => "read nothing".to_string(),
+                        Err(e) => format!("shape failed: {}", first_line(&e.to_string())),
+                    },
+                    Err(e) => format!("open refused: {}", first_line(&e.to_string())),
+                },
+                None => "no window".to_string(),
+            };
+            println!("  {label}: {}", outcome.chars().take(75).collect::<String>());
+            outcome.starts_with("READ")
+        }
+    };
+
+    println!("== waketest on {doc} ==\n");
+    let before = try_read("reader BEFORE any write").await;
+
+    println!("\n  writing A1 to provoke the page...");
+    let wrote = match paradigm_lib::run::surfaces::window_for(&desktop, doc).await {
+        Some(w) => match SpreadsheetWriter::open(desktop.clone(), &w, doc.to_string(), None, 1).await
+        {
+            Ok(mut wr) => match wr.write("A", "WAKE") {
+                Ok(()) => {
+                    println!("  write succeeded (its read-back verified)");
+                    true
+                }
+                Err(e) => {
+                    println!("  write refused: {}", first_line(&e.to_string()));
+                    false
+                }
+            },
+            Err(e) => {
+                println!("  writer would not open: {}", first_line(&e.to_string()));
+                false
+            }
+        },
+        None => false,
+    };
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!();
+    let after = try_read("reader AFTER the write ").await;
+
+    println!("\n== RESULT ==");
+    println!("  before write : {before}");
+    println!("  write landed : {wrote}");
+    println!("  after write  : {after}");
+    if !before && after {
+        println!("\n  WRITING WAKES IT. The tree exposes cell contents only after the");
+        println!("  page has been genuinely typed into -- navigation is not enough.");
+    } else if before == after {
+        println!("\n  No change. Writing is not the difference either.");
     }
     ExitCode::SUCCESS
 }
