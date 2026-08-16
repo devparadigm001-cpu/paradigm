@@ -71,6 +71,7 @@
 //! carries no values at all -- see `workflow_processed_rows` in migration
 //! 20260813000004.
 
+pub mod csv_snapshot;
 pub mod spreadsheet;
 
 use std::collections::BTreeMap;

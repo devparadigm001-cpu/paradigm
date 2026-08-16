@@ -12078,6 +12078,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "clearcell") {
         return clearcell_mode().await;
     }
+    if std::env::args().any(|a| a == "csvreader") {
+        return csvreader_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -17954,5 +17957,230 @@ async fn clearcell_mode() -> ExitCode {
             eprintln!("could not export to confirm");
             ExitCode::FAILURE
         }
+    }
+}
+
+// ------------------------------------------------------ csvreader mode ----
+// Does the CSV snapshot reader agree with the per-cell reader, exactly?
+//
+// Correctness first. "Faster" is worthless if the two disagree about which rows
+// are records, where they are, or what they hold -- a scan that is wrong
+// quickly is worse than one that is slow and right.
+//
+// Walks the SAME live sheet twice with the SAME fields:
+//   * `SpreadsheetReader` -- Name Box per cell, the current mechanism;
+//   * `CsvSnapshot` over a browser-fetched export.
+// and compares the full sequence of (row_key, values...) plus the terminating
+// Advance. Then reports timing, and checks the fetch left nothing behind.
+// -------------------------------------------------------------------------
+
+/// Fetch an export and clean up after it.
+///
+/// Returns the body, and leaves no file in Downloads. The Downloads pileup this
+/// avoids is not hypothetical -- tonight already produced ten stray scratch
+/// spreadsheets from a probe that created rather than reused, and a scan that
+/// dropped a CSV on every "Check for new" would be the same mistake with a
+/// higher frequency.
+async fn fetch_export_clean(browser: &str, doc_id: &str, gid: &str) -> (Option<String>, usize) {
+    let before: Vec<std::path::PathBuf> = dirs_downloads()
+        .map(|d| {
+            std::fs::read_dir(d)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("csv"))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let body = download_csv(browser, doc_id, gid).await;
+
+    // Delete exactly what appeared, not "the newest csv" -- a user's own file
+    // landing in Downloads mid-scan must not be collateral.
+    let mut removed = 0;
+    if let Some(dir) = dirs_downloads() {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("csv") {
+                continue;
+            }
+            if !before.contains(&path) {
+                if std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    (body, removed)
+}
+
+async fn csvreader_mode() -> ExitCode {
+    use paradigm_lib::source::csv_snapshot::CsvSnapshot;
+    use paradigm_lib::source::spreadsheet::SpreadsheetReader;
+    use paradigm_lib::source::{Advance, FieldRef, SourceReader};
+
+    println!("== csvreader: does the snapshot agree with the per-cell reader? ==\n");
+
+    let url = scratch_url();
+    let Some(doc_id) = url
+        .split("/d/")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .map(str::to_string)
+    else {
+        eprintln!("set PARADIGM_SCRATCH_DOC to the sheet under test");
+        return ExitCode::FAILURE;
+    };
+    let browser = "msedge";
+    println!("doc: {doc_id}\n");
+
+    let fields = vec![
+        FieldRef { name: "A".into(), locator: "A".into() },
+        FieldRef { name: "B".into(), locator: "B".into() },
+    ];
+    let columns = vec!["A".to_string(), "B".to_string()];
+
+    // A walk, as a comparable value: every record in order, then how it ended.
+    async fn walk<R: SourceReader>(reader: &mut R, fields: &[FieldRef]) -> (Vec<String>, String) {
+        let mut seen = Vec::new();
+        for _ in 0..60 {
+            match reader.peek(fields) {
+                Ok(Advance::Record) => match reader.read(fields) {
+                    Ok(record) => {
+                        let mut cells: Vec<String> = fields
+                            .iter()
+                            .map(|f| record.fields.get(&f.name).cloned().unwrap_or_default())
+                            .collect();
+                        cells.insert(0, record.position.row_key.clone());
+                        seen.push(cells.join("|"));
+                        if reader.advance().is_err() {
+                            return (seen, "advance failed".into());
+                        }
+                    }
+                    Err(e) => return (seen, format!("read failed: {e}")),
+                },
+                Ok(other) => return (seen, format!("{other:?}")),
+                Err(e) => return (seen, format!("peek failed: {e}")),
+            }
+        }
+        (seen, "ran to the cap".into())
+    }
+
+    // ---- the CSV snapshot ---------------------------------------------------
+    println!("-- CSV snapshot --");
+    let csv_started = std::time::Instant::now();
+    let (body, removed) = fetch_export_clean(browser, &doc_id, "0").await;
+    let Some(body) = body else {
+        eprintln!("   export failed");
+        return ExitCode::FAILURE;
+    };
+    let mut snap = CsvSnapshot::new(doc_id.clone(), &body, 2, 1, columns.clone());
+    let (csv_seen, csv_end) = walk(&mut snap, &fields).await;
+    let csv_took = csv_started.elapsed();
+    println!(
+        "   {} record(s) in {:.2}s, ended: {csv_end}",
+        csv_seen.len(),
+        csv_took.as_secs_f64()
+    );
+    println!("   downloaded file(s) removed: {removed}");
+
+    // ---- the per-cell reader ------------------------------------------------
+    println!("\n-- per-cell Name Box reader --");
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut window = None;
+    for _ in 0..6 {
+        if let Some(w) = sheets_window(&desktop).await {
+            window = Some(w);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+    }
+    let Some((window, _)) = window else {
+        eprintln!("   no spreadsheet window -- open the sheet to compare against");
+        return ExitCode::FAILURE;
+    };
+    let cell_started = std::time::Instant::now();
+    let Ok(mut live) = SpreadsheetReader::open(
+        desktop.clone(),
+        &window,
+        doc_id.clone(),
+        None,
+        2,
+        1,
+        columns.clone(),
+    )
+    .await
+    else {
+        eprintln!("   reader failed to open");
+        return ExitCode::FAILURE;
+    };
+    let (cell_seen, cell_end) = walk(&mut live, &fields).await;
+    let cell_took = cell_started.elapsed();
+    println!(
+        "   {} record(s) in {:.2}s, ended: {cell_end}",
+        cell_seen.len(),
+        cell_took.as_secs_f64()
+    );
+
+    // ---- the comparison -----------------------------------------------------
+    println!("\n-- do they agree? --");
+    let same_records = csv_seen == cell_seen;
+    let same_ending = csv_end == cell_end;
+    if same_records {
+        println!("   records: IDENTICAL ({} each)", csv_seen.len());
+        for line in &csv_seen {
+            println!("      {line}");
+        }
+    } else {
+        println!("   records: DIFFER");
+        let max = csv_seen.len().max(cell_seen.len());
+        for i in 0..max {
+            let a = csv_seen.get(i).cloned().unwrap_or_else(|| "<none>".into());
+            let b = cell_seen.get(i).cloned().unwrap_or_else(|| "<none>".into());
+            println!("      {} csv={a:?}  cell={b:?}", if a == b { " " } else { "!" });
+        }
+    }
+    println!(
+        "   ending : csv={csv_end:?} cell={cell_end:?}  {}",
+        if same_ending { "same" } else { "DIFFER" }
+    );
+
+    // ---- cleanup check ------------------------------------------------------
+    println!("\n-- cleanup --");
+    let leftover = dirs_downloads()
+        .map(|d| {
+            std::fs::read_dir(d)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| {
+                    e.path().extension().and_then(|x| x.to_str()) == Some("csv")
+                        && e.file_name().to_string_lossy().contains(" - ")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    println!("   export-shaped .csv files left in Downloads: {leftover}");
+
+    println!("\n== RESULT ==");
+    println!("  records identical : {same_records}");
+    println!("  ending identical  : {same_ending}");
+    println!(
+        "  csv {:.2}s vs per-cell {:.2}s  ({:.1}x)",
+        csv_took.as_secs_f64(),
+        cell_took.as_secs_f64(),
+        cell_took.as_secs_f64() / csv_took.as_secs_f64().max(0.001)
+    );
+    if same_records && same_ending {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
