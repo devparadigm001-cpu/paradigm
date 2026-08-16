@@ -92,12 +92,14 @@ pub async fn open_for(
     let (source_doc, source_sheet) = split_surface_id(&template.source_id);
     let (destination_doc, destination_sheet) = split_surface_id(&template.destination_id);
 
-    let source_window = window_for(desktop, source_doc)
-        .await
-        .ok_or_else(|| format!("no open window is showing the source document {source_doc}"))?;
-    let destination_window = window_for(desktop, destination_doc).await.ok_or_else(|| {
-        format!("no open window is showing the destination document {destination_doc}")
-    })?;
+    let source_window = match window_for(desktop, source_doc).await {
+        Some(w) => w,
+        None => return Err(not_found(desktop, "source", source_doc).await),
+    };
+    let destination_window = match window_for(desktop, destination_doc).await {
+        Some(w) => w,
+        None => return Err(not_found(desktop, "destination", destination_doc).await),
+    };
 
     let scan_columns: Vec<String> = template
         .fields
@@ -264,5 +266,118 @@ mod tests {
     fn a_degenerate_id_is_not_split() {
         assert_eq!(split_surface_id("abc!"), ("abc!", None));
         assert_eq!(split_surface_id("!Sheet2"), ("!Sheet2", None));
+    }
+}
+
+/// Does any window announce that it is holding background tabs?
+///
+/// Browsers title a multi-tab window "<active page> and N more pages", so the
+/// title says how many pages are hidden behind the one being reported. That is
+/// the only signal available: [`address_of`] reads a window's single address
+/// bar, which shows the ACTIVE tab, so a document in any other tab is
+/// unreachable to matching no matter how plainly it is open.
+///
+/// Pure, so the phrase-matching is tested rather than asserted.
+pub fn background_tabs_in(titles: &[String]) -> bool {
+    titles.iter().any(|t| {
+        let t = t.to_lowercase();
+        t.contains(" more page") || t.contains(" more tab")
+    })
+}
+
+/// Explain a document that could not be resolved, without overstating.
+///
+/// The old message was one sentence -- "no open window is showing the
+/// destination document" -- and it was measured false in the ordinary case: a
+/// user had both documents open, in tabs of one window, and the destination was
+/// simply not frontmost. See
+/// `docs/known-issues/two-documents-in-one-window-cannot-both-resolve.md`,
+/// where a nine-tab window resolved its active tab and hid the other eight.
+///
+/// So the message now depends on what can actually be established:
+///
+/// * background tabs detected -- say it MAY be behind one, and say what to do;
+/// * none detected -- the original claim, which is now the case it fits;
+/// * titles unreadable -- say that too, rather than picking one.
+///
+/// Deliberately hedged in the first case. The title says a window has hidden
+/// pages; it does not say WHICH document is in them, and claiming the
+/// destination is definitely there would replace one confident wrong answer
+/// with another.
+async fn not_found(desktop: &Desktop, role: &str, document: &str) -> String {
+    let titles: Vec<String> = match desktop
+        .locator("role:Window")
+        .within(desktop.root())
+        .all(Some(std::time::Duration::from_secs(5)), Some(3))
+        .await
+    {
+        Ok(windows) => windows.iter().filter_map(|w| w.name()).collect(),
+        Err(e) => {
+            return format!(
+                "could not find a window showing the {role} document {document}, and could not \
+                 read the open windows to say why: {e}"
+            )
+        }
+    };
+
+    if titles.is_empty() {
+        return format!(
+            "could not find a window showing the {role} document {document}. No window titles \
+             could be read, so whether it is open at all is unknown"
+        );
+    }
+
+    if background_tabs_in(&titles) {
+        format!(
+            "could not reach the {role} document {document}. It MAY be open in a background \
+             tab -- a window here reports having more pages behind the one it is showing, and \
+             only the front tab of a window can be found. Bring that document to the front, or \
+             give it its own window, and try again"
+        )
+    } else {
+        format!("no open window is showing the {role} document {document}")
+    }
+}
+
+#[cfg(test)]
+mod not_found_tests {
+    use super::background_tabs_in;
+
+    fn titles(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The real title that produced the false error, verbatim.
+    #[test]
+    fn a_window_announcing_more_pages_is_detected() {
+        assert!(background_tabs_in(&titles(&[
+            "Untitled spreadsheet - Google Sheets and 8 more pages - Personal - Microsoft Edge",
+        ])));
+        // Singular, and the Chrome phrasing.
+        assert!(background_tabs_in(&titles(&["Something and 1 more page - Google Chrome"])));
+        assert!(background_tabs_in(&titles(&["Something and 3 more tabs"])));
+    }
+
+    /// Only one window needs to have them for the hedge to be warranted.
+    #[test]
+    fn one_window_among_many_is_enough() {
+        assert!(background_tabs_in(&titles(&[
+            "Paradigm",
+            "Untitled spreadsheet - Google Sheets - Personal - Microsoft Edge",
+            "Example Domain and 11 more pages - Personal - Microsoft Edge",
+        ])));
+    }
+
+    /// And when nothing suggests hidden tabs, the original blunt message is the
+    /// correct one -- hedging every failure would make the hedge meaningless.
+    #[test]
+    fn single_tab_windows_do_not_trigger_the_hedge() {
+        assert!(!background_tabs_in(&titles(&[
+            "Paradigm",
+            "Untitled spreadsheet - Google Sheets - Personal - Microsoft Edge",
+        ])));
+        assert!(!background_tabs_in(&titles(&[])));
+        // "more" alone must not be enough -- a document can be named anything.
+        assert!(!background_tabs_in(&titles(&["Read more about pages.docx"])));
     }
 }

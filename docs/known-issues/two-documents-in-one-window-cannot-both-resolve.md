@@ -117,3 +117,70 @@ tabs. That is enough to replace a false statement with a true one:
 Scanning. Since `check_for_new_records` reads the source from a CSV export it
 resolves no windows at all, so **Check for new is immune**. The run still opens
 both surfaces and is fully exposed.
+
+## Part B, measured 2026-08-16: a real fix is a redesign, not a patch
+
+The message is now honest (see below), but the underlying matching still cannot
+see a background tab. Before recommending a deeper fix, the question was
+whether the accessibility tree exposes any way to tell what a NON-frontmost tab
+holds. Measured with `text_capture_probe tabprobe` against a window of 12 tabs:
+
+```
+== window: "Example Domain and 11 more pages - Personal - Microsoft Edge"
+   role:TabItem name="Untitled spreadsheet - Google Sheets"
+   role:TabItem name="Untitled spreadsheet - Google Sheets"
+```
+
+**Tabs are named after the page, and carry no URL.** No `value`, no
+`description`, nothing holding a document id. And every Google Sheets tab has
+the *same* name — which is precisely the ambiguity that made matching use the
+URL rather than the title in the first place (see
+`replay-window-selector-ambiguity.md`).
+
+So identifying a background tab requires **activating** it and reading the
+address bar. That means, per candidate tab:
+
+* stealing focus and changing what the user is looking at, mid-run;
+* one activation plus a settle each — the same per-step cost that made scanning
+  slow, now paid per tab rather than per cell;
+* leaving the browser on a different tab than the user left it on, or restoring
+  it and hoping that lands;
+* and doing all of it *while a run is in progress*, which §4.10's "does not lock
+  the window" is directly about.
+
+**Recommendation: keep the honest message, defer the deeper fix.** Not because
+it is hard, but because every available mechanism is worse than the problem: a
+run that rearranges the user's browser to find a document is a bigger
+intrusion than a run that asks them to bring it forward.
+
+If it is ever built, the shape that avoids the intrusion is not tab-walking at
+all — it is removing the need to resolve a window, the way the scan already
+did. `check_for_new_records` reads its source from a CSV export and resolves no
+windows, so **Check for new is already immune**. A destination writer cannot
+work that way (writing needs the live grid), but a *reader* on the run path
+could, which would halve the exposure.
+
+## Part A, shipped 2026-08-16: the message no longer lies
+
+`open_for` now inspects window titles when matching fails. A window titled
+"… and N more pages" is announcing hidden tabs, and that is enough to stop
+asserting something false:
+
+> could not reach the source document `1ko7z65…`. It MAY be open in a
+> background tab — a window here reports having more pages behind the one it is
+> showing, and only the front tab of a window can be found. Bring that document
+> to the front, or give it its own window, and try again
+
+Verified by reproducing the exact scenario — the document open in a background
+tab among eleven — and running the real `open_for` against the stored template:
+
+```
+mentions a background tab : true
+asserts it is not open    : false
+```
+
+Deliberately hedged with "MAY". The title says a window has hidden pages; it
+does not say which document is in them. Claiming the document is definitely
+there would replace one confident wrong answer with another. When no window
+reports extra pages, the original blunt message still appears — it is correct
+in that case, and hedging every failure would make the hedge meaningless.

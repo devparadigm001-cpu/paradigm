@@ -12084,6 +12084,12 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "tabcheck") {
         return tabcheck_mode().await;
     }
+    if std::env::args().any(|a| a == "tabprobe") {
+        return tabprobe_mode().await;
+    }
+    if std::env::args().any(|a| a == "surfacecheck") {
+        return surfacecheck_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -18248,6 +18254,169 @@ async fn tabcheck_mode() -> ExitCode {
             "  {id}\n     window_for would {}",
             if found { "FIND it" } else { "NOT find it" }
         );
+    }
+    ExitCode::SUCCESS
+}
+
+/// tabprobe -- can a BACKGROUND tab's document be identified without
+/// bringing it to the front?
+///
+/// That is the whole of Part B. `address_of` reads one address bar per window,
+/// showing the active tab, so a real fix needs some other surface that names
+/// what a non-frontmost tab holds. This dumps every tab-ish element in every
+/// browser window with every property that might carry a URL, and reports
+/// whether any of them identifies a document by id.
+async fn tabprobe_mode() -> ExitCode {
+    let wanted: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| {
+            a.len() >= 40
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .collect();
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let windows = desktop
+        .locator("role:Window")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .unwrap_or_default();
+
+    let mut any_url = false;
+    for w in &windows {
+        let title = w.name().unwrap_or_default();
+        if !title.contains("Edge") && !title.contains("Chrome") {
+            continue;
+        }
+        println!("\n== window: {:?}", title.chars().take(70).collect::<String>());
+
+        for role in ["role:Tab", "role:TabItem", "role:Button", "role:ListItem"] {
+            let found = desktop
+                .locator(role)
+                .within(w.clone())
+                .all(Some(Duration::from_secs(5)), None)
+                .await
+                .unwrap_or_default();
+            let mut shown = 0;
+            for el in &found {
+                let name = el.name().unwrap_or_default();
+                // Tab strip entries are named after the PAGE, so a spreadsheet
+                // tab is named "Untitled spreadsheet" -- which is exactly the
+                // ambiguity that made matching use the URL in the first place.
+                if !name.contains("spreadsheet") && !name.contains("Sheets") {
+                    continue;
+                }
+                shown += 1;
+                if shown > 12 {
+                    break;
+                }
+                // Every property that could plausibly hold a URL.
+                let value = el.text(0).unwrap_or_default();
+                let attrs = el.attributes();
+                println!("   {role} name={:?}", name.chars().take(50).collect::<String>());
+                if !value.trim().is_empty() {
+                    println!("      value      : {:?}", value.chars().take(90).collect::<String>());
+                }
+                if let Some(d) = &attrs.description {
+                    println!("      description: {:?}", d.chars().take(90).collect::<String>());
+                }
+                let blob = format!("{name} {value} {:?}", attrs.description);
+                if blob.contains("/d/") || blob.contains("docs.google.com") {
+                    any_url = true;
+                    println!("      ^^ CARRIES A URL");
+                }
+                for id in &wanted {
+                    if blob.contains(id.as_str()) {
+                        any_url = true;
+                        println!("      ^^ IDENTIFIES {id}");
+                    }
+                }
+            }
+        }
+    }
+
+    println!("\n== VERDICT ==");
+    if any_url {
+        println!("  A tab element exposes a document id WITHOUT activation.");
+        println!("  A real fix can match on that -- no tab cycling needed.");
+    } else {
+        println!("  No tab element exposes a URL or document id. Tabs are named");
+        println!("  after the PAGE ('Untitled spreadsheet'), which is precisely the");
+        println!("  ambiguity that made matching use the address bar to begin with.");
+        println!("  A real fix therefore has to ACTIVATE tabs to read their address,");
+        println!("  which is a redesign, not a patch.");
+    }
+    ExitCode::SUCCESS
+}
+
+/// surfacecheck -- run the real `open_for` and print what it says.
+///
+/// Exercises the exact error path a user meets when a document is open but not
+/// frontmost, using the stored template rather than a fabricated one, so the
+/// message under test is the message that ships.
+async fn surfacecheck_mode() -> ExitCode {
+    let data_dir = std::env::var("PARADIGM_DATA_DIR").unwrap_or_else(|_| {
+        let base = std::env::var("APPDATA").expect("APPDATA");
+        std::path::Path::new(&base)
+            .join("com.amitj.paradigm")
+            .to_string_lossy()
+            .to_string()
+    });
+    let (db_path, key_path) = paradigm_lib::db::paths_in(std::path::Path::new(&data_dir));
+    let conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("db: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let playbook_id: String = match conn.query_row(
+        "SELECT playbook_id FROM workflow_templates LIMIT 1",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("no templated playbook to test with: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Ok(Some(template)) = paradigm_lib::compile::store::load_template(&conn, &playbook_id)
+    else {
+        eprintln!("could not load the template");
+        return ExitCode::FAILURE;
+    };
+    println!("playbook : {playbook_id}");
+    println!("source   : {}", template.source_id);
+    println!("dest     : {}\n", template.destination_id);
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match paradigm_lib::run::surfaces::open_for(&desktop, &template, 2, 1, 2).await {
+        Ok(_) => {
+            println!("open_for SUCCEEDED -- both documents resolved.");
+            println!("(to see the message, put one of them behind another tab)");
+        }
+        Err(e) => {
+            println!("open_for failed with:\n\n  {e}\n");
+            let honest = e.contains("background tab");
+            let false_claim = e.contains("no open window is showing");
+            println!("  mentions a background tab : {honest}");
+            println!("  asserts it is not open    : {false_claim}");
+        }
     }
     ExitCode::SUCCESS
 }
