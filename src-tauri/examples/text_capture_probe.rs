@@ -12081,6 +12081,9 @@ async fn main() -> ExitCode {
     if std::env::args().any(|a| a == "csvreader") {
         return csvreader_mode().await;
     }
+    if std::env::args().any(|a| a == "tabcheck") {
+        return tabcheck_mode().await;
+    }
     if std::env::args().any(|a| a == "renamedoc") {
         return renamedoc_mode().await;
     }
@@ -18183,4 +18186,68 @@ async fn csvreader_mode() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// tabcheck -- what can `window_for` actually see?
+///
+/// `run::surfaces::window_for` matches a document by scanning each top-level
+/// window's ADDRESS BAR. A browser window has one address bar and it reports
+/// the ACTIVE tab, so a document sitting in a background tab is invisible to
+/// that scan even though it is genuinely open. This prints every window's
+/// address bar and then answers, per document id, exactly what `window_for`
+/// would answer -- so "the document is open" and "the matcher can find it" stop
+/// being the same claim.
+async fn tabcheck_mode() -> ExitCode {
+    let ids: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| {
+            a.len() >= 40
+                && a.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+        .collect();
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no desktop: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("== every top-level window, and what its address bar reports ==\n");
+    let windows = desktop
+        .locator("role:Window")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), Some(3))
+        .await
+        .unwrap_or_default();
+    let mut addressed = 0;
+    for w in &windows {
+        let title = w.name().unwrap_or_default();
+        let address = address_of(&desktop, w).await;
+        if address.is_empty() {
+            continue;
+        }
+        addressed += 1;
+        println!("  window : {:?}", title.chars().take(70).collect::<String>());
+        println!("  address: {:?}\n", address.chars().take(110).collect::<String>());
+    }
+    println!("{} of {} window(s) expose an address bar\n", addressed, windows.len());
+
+    for id in &ids {
+        // The same question `window_for` asks, asked the same way.
+        let mut found = false;
+        for w in &windows {
+            if address_of(&desktop, w).await.contains(id) {
+                found = true;
+                break;
+            }
+        }
+        println!(
+            "  {id}\n     window_for would {}",
+            if found { "FIND it" } else { "NOT find it" }
+        );
+    }
+    ExitCode::SUCCESS
 }
