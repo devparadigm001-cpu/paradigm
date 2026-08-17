@@ -248,20 +248,55 @@ pub fn detect(
     let source_steps = steps(&source_records);
 
     let uniform = |v: &[i64]| v.windows(2).all(|w| w[0] == w[1]);
-    if !uniform(&destination_steps) || !uniform(&source_steps) {
+
+    // The DESTINATION must still advance uniformly. This is not the same
+    // question as the source's, and §7.1 did not decide it: an irregular
+    // destination means writes landing at scattered positions, which is a
+    // different claim from "the user skipped a source record". Where the next
+    // write LANDS has to be predictable, or a run cannot place it.
+    if !uniform(&destination_steps) {
         return Detection::InconsistentAdvance {
             source_steps,
             destination_steps,
         };
     }
 
-    let source_step = source_steps.first().copied().unwrap_or(0);
-    // §2: the source must have MEASURABLY advanced. A still source is
-    // inconclusive, not proof of a constant value -- and it is the difference
-    // between "copy each order in turn" and "type the same thing three times".
-    if source_step == 0 {
+    // The SOURCE's advancement is now distinctness, not difference.
+    //
+    // Per the planning document's §7.1: a skipped record is still evidence of
+    // a genuinely repetitive task. What makes a recording a pattern is the same
+    // relationship recurring across DISTINCT records; the distance between them
+    // is an artifact of the substrate, and requiring it to be uniform imports a
+    // spreadsheet assumption into what is meant to be a general mechanism.
+    //
+    // `prove_advance` is the general form of the old `source_step == 0` check.
+    // That check existed to separate "copy each order in turn" from "type the
+    // same thing three times", and that distinction is about each repetition
+    // drawing from a DIFFERENT record -- not about how far apart they are. On
+    // row numbers the two rules agree exactly; the general one also works on
+    // identities that have no difference operator at all.
+    let source_keys: Vec<crate::identity::RecordKey> = source_records
+        .iter()
+        .map(|r| crate::identity::RecordKey::declared("row", r.to_string()))
+        .collect();
+    if !crate::identity::prove_advance(&source_keys).advanced() {
         return Detection::SourceDidNotAdvance;
     }
+
+    // A step still has to be reported, because `CompiledTemplate` and the run
+    // loop consume one. A uniform walk keeps exactly the step it always had, so
+    // nothing that previously produced a `Pattern` changes.
+    //
+    // A non-uniform walk reports 1 -- deliberately the smallest step, so the
+    // run VISITS every record and lets the ledger decide which to process,
+    // rather than striding over records it never checks. See §8.1: a step
+    // greater than 1 skips `is_processed` on the records it steps over, and a
+    // recording with gaps is precisely the case where those records matter.
+    let source_step = if uniform(&source_steps) {
+        source_steps.first().copied().unwrap_or(0)
+    } else {
+        1
+    };
 
     Detection::Pattern(Pattern {
         fields,
@@ -484,6 +519,77 @@ mod tests {
             Detection::InconsistentMapping { .. } => {}
             other => panic!("expected InconsistentMapping, got {other:?}"),
         }
+    }
+
+    /// The §7.1 cutover, as the exact scenario that motivated it: the user
+    /// processed source rows 2, 3 and 4, deliberately skipped 5, and used 6 as
+    /// the fourth example. Destination stays regular at 2, 3, 4, 5.
+    ///
+    /// This returned `InconsistentAdvance { source_steps: [1, 1, 2] }` before
+    /// the cutover, so the recording could never be confirmed or saved.
+    #[test]
+    fn a_skipped_source_record_is_still_valid_advancement() {
+        let obs = vec![
+            w(0, ("C", 2), ("B", 2)),
+            w(1, ("C", 3), ("B", 3)),
+            w(2, ("C", 4), ("B", 4)),
+            w(3, ("C", 6), ("B", 5)),
+        ];
+        match detect(&obs, SRC, DST) {
+            Detection::Pattern(p) => {
+                assert_eq!(p.examples, 4);
+                assert_eq!(p.destination_step, 1);
+                // 1, not 2: the run must visit every record so the ledger can
+                // decide about the skipped one. See §8.1.
+                assert_eq!(p.source_step, 1);
+            }
+            other => panic!("expected a Pattern, got {other:?}"),
+        }
+    }
+
+    /// A uniform walk must be completely unaffected -- same step, same
+    /// examples. Nothing that already produced a `Pattern` may change.
+    #[test]
+    fn a_uniform_walk_keeps_exactly_the_step_it_always_had() {
+        let obs = vec![
+            w(0, ("C", 2), ("B", 2)),
+            w(1, ("C", 4), ("B", 3)),
+            w(2, ("C", 6), ("B", 4)),
+        ];
+        match detect(&obs, SRC, DST) {
+            Detection::Pattern(p) => {
+                assert_eq!(p.source_step, 2, "a step-2 source must stay step 2");
+                assert_eq!(p.destination_step, 1);
+                assert_eq!(p.examples, 3);
+            }
+            other => panic!("expected a Pattern, got {other:?}"),
+        }
+    }
+
+    /// The still-source rule survives the rewrite. Distinctness must reject
+    /// what `source_step == 0` used to reject -- this is the same case as
+    /// `a_source_that_never_moves_is_inconclusive_not_a_pattern`, kept here as
+    /// well because it is now enforced by a different mechanism.
+    #[test]
+    fn distinctness_still_rejects_a_source_that_repeats_one_record() {
+        let obs = vec![
+            w(0, ("C", 7), ("B", 2)),
+            w(1, ("C", 7), ("B", 3)),
+            w(2, ("C", 7), ("B", 4)),
+        ];
+        assert_eq!(detect(&obs, SRC, DST), Detection::SourceDidNotAdvance);
+    }
+
+    /// A partially-still source is still not advancement: two of the three
+    /// examples came from the same record.
+    #[test]
+    fn a_source_that_repeats_one_record_among_others_is_rejected() {
+        let obs = vec![
+            w(0, ("C", 2), ("B", 2)),
+            w(1, ("C", 3), ("B", 3)),
+            w(2, ("C", 3), ("B", 4)),
+        ];
+        assert_eq!(detect(&obs, SRC, DST), Detection::SourceDidNotAdvance);
     }
 
     #[test]
