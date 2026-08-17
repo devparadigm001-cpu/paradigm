@@ -2730,6 +2730,184 @@ async fn gmailtree_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// -------------------------------------------------------- skiptest mode ----
+//
+// The open design question: if a recording SKIPS a record, is that record
+// picked up later or lost forever?
+//
+// Scenario asked for: examples at source rows 2, 3, 4, 6 -- row 5 never
+// touched. Two independent halves, both run against the REAL shipping code
+// rather than reasoned about:
+//
+//   A. `detect::detect` -- does that recording become a confirmable pattern?
+//   B. `run::batch::scan` over a real encrypted ledger -- if such a pattern
+//      DID exist, would the scan later offer row 5?
+//
+// Observes only. Touches no live document and no real database.
+async fn skiptest_mode() -> ExitCode {
+    use paradigm_lib::detect::{detect, Cell, Detection, Observation, SourceRef};
+
+    println!("== skipped-record behaviour, against the real code ==\n");
+
+    const SRC: &str = "doc-source";
+    const DST: &str = "doc-destination";
+
+    // One record = one write, source cell C<row> -> destination cell B<row>.
+    let obs = |seq: usize, src_row: i64, dst_row: i64| Observation {
+        seq,
+        surface: DST.to_string(),
+        destination: Cell {
+            field: "B".into(),
+            record: dst_row,
+        },
+        source: Some(SourceRef {
+            surface: SRC.to_string(),
+            cell: Cell {
+                field: "C".into(),
+                record: src_row,
+            },
+        }),
+    };
+
+    // ---------------- PART A: does it detect? ----------------
+    println!("-- PART A: detect::detect on the real recording shapes --\n");
+
+    println!("  control -- no skip, source rows 2,3,4,5 -> destination 2,3,4,5");
+    let control = vec![
+        obs(1, 2, 2),
+        obs(2, 3, 3),
+        obs(3, 4, 4),
+        obs(4, 5, 5),
+    ];
+    let control_result = detect(&control, SRC, DST);
+    match &control_result {
+        Detection::Pattern(p) => println!(
+            "     => Pattern  source_step={} destination_step={} examples={}",
+            p.source_step, p.destination_step, p.examples
+        ),
+        other => println!("     => {other:?}"),
+    }
+
+    println!("\n  the asked-for case -- source rows 2,3,4,6 (5 skipped) -> destination 2,3,4,5");
+    let skipped = vec![
+        obs(1, 2, 2),
+        obs(2, 3, 3),
+        obs(3, 4, 4),
+        obs(4, 6, 5),
+    ];
+    let skipped_result = detect(&skipped, SRC, DST);
+    match &skipped_result {
+        Detection::Pattern(p) => println!(
+            "     => Pattern  source_step={} destination_step={} examples={}",
+            p.source_step, p.destination_step, p.examples
+        ),
+        other => println!("     => {other:?}"),
+    }
+
+    println!("\n  variant -- only the first THREE are used (2,3,4), 6 never recorded");
+    let three = vec![obs(1, 2, 2), obs(2, 3, 3), obs(3, 4, 4)];
+    match detect(&three, SRC, DST) {
+        Detection::Pattern(p) => println!(
+            "     => Pattern  source_step={} destination_step={} examples={}",
+            p.source_step, p.destination_step, p.examples
+        ),
+        other => println!("     => {other:?}"),
+    }
+
+    // ---------------- PART B: would a scan find row 5? ----------------
+    println!("\n-- PART B: run::batch::scan over a real ledger --\n");
+
+    let dir = std::env::temp_dir().join(format!("paradigm-skiptest-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let (db_path, key_path) = paradigm_lib::db::paths_in(&dir);
+    let conn = match paradigm_lib::db::open(&db_path, &key_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("  could not open a scratch database: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A source with rows 2..8 all holding data -- row 5 among them.
+    let body = "Ref,Customer\n\
+                2,Alpha\n\
+                3,Bravo\n\
+                4,Charlie\n\
+                5,Delta\n\
+                6,Echo\n\
+                7,Foxtrot\n\
+                8,Golf\n";
+
+    let template = paradigm_lib::compile::CompiledTemplate {
+        source_id: SRC.to_string(),
+        destination_id: DST.to_string(),
+        source_step: 1,
+        destination_step: 1,
+        examples: 3,
+        fields: vec![paradigm_lib::detect::FieldMapping {
+            source_field: "B".into(),
+            destination_field: "B".into(),
+        }],
+    };
+
+    // A playbook row has to exist for the ledger's foreign key.
+    let playbook_id = {
+        let mut stream = paradigm_lib::capture::CapturedStream::new(
+            paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
+        );
+        stream.admit(paradigm_lib::capture::ActionCandidate {
+            kind: paradigm_lib::capture::ActionKind::Click,
+            identifiers: vec!["probe".into()],
+            process_name: None,
+            element_role: Some("Button".into()),
+            element_name: Some("Next".into()),
+            payload: None,
+            detail: None,
+            timestamp_ms: 0,
+        });
+        let pb = paradigm_lib::compile::compile(
+            stream.actions(),
+            "SKIPTEST",
+            &paradigm_lib::compile::ReversibilityPolicy::placeholder(),
+            &paradigm_lib::labeling::RedactionPolicy::placeholder(),
+        )
+        .with_template(template.clone());
+        let mut c = paradigm_lib::db::open(&db_path, &key_path).expect("db");
+        paradigm_lib::compile::store::store(&mut c, &pb).expect("store");
+        pb.id
+    };
+
+    // Mark exactly what the recording touched: 2, 3, 4 and 6. NOT 5.
+    for row in [2u64, 3, 4, 6] {
+        let position = paradigm_lib::source::SourcePosition {
+            source_id: SRC.to_string(),
+            row_key: row.to_string(),
+        };
+        paradigm_lib::run::mark_processed(&conn, &playbook_id, &position).expect("mark");
+    }
+    println!("  ledger now holds source rows: 2, 3, 4, 6   (5 deliberately absent)");
+
+    let mut reader = paradigm_lib::source::csv_snapshot::CsvSnapshot::new(
+        SRC.to_string(),
+        body,
+        2,
+        1,
+        vec!["B".to_string()],
+    );
+    match paradigm_lib::run::batch::scan(&conn, &playbook_id, &template, &mut reader) {
+        Ok(scan) => println!("  scan result: {scan:?}"),
+        Err(e) => println!("  scan failed: {e}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    println!("\n-- what this means --");
+    println!("  A decides whether the user can ever SAVE the skipping pattern.");
+    println!("  B decides what would happen to row 5 if they could.");
+
+    ExitCode::SUCCESS
+}
+
 // -------------------------------------------------------- pagetree mode ----
 //
 // Generic, site-agnostic version of amzntree/gmailopened: dump whatever page is
@@ -13903,6 +14081,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "gmailcapture") {
         return gmailcapture_mode().await;
+    }
+    if std::env::args().any(|a| a == "skiptest") {
+        return skiptest_mode().await;
     }
     if std::env::args().any(|a| a == "pagetree") {
         return pagetree_mode().await;
