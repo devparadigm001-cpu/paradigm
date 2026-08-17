@@ -2730,6 +2730,269 @@ async fn gmailtree_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// -------------------------------------------------------- pagetree mode ----
+//
+// Generic, site-agnostic version of amzntree/gmailopened: dump whatever page is
+// in front, find repeated "card" structures around a marker string, and report
+// the traps this project keeps finding -- duplicate names, shared ids, and
+// label/value pairs that are separate elements with nothing tying them together.
+//
+//   pagetree <title-substring> [marker]
+//
+// Reads only. Clicks nothing, types nothing, mutates nothing.
+async fn pagetree_mode() -> ExitCode {
+    let want_title = std::env::args().nth(2).unwrap_or_default();
+    let marker = std::env::args().nth(3).unwrap_or_default();
+
+    println!("== page accessibility dump ==\n");
+    println!("expecting a window whose title contains {want_title:?}");
+    if !marker.is_empty() {
+        println!("card marker: {marker:?}");
+    }
+    println!("Reads only.\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let anchor = match desktop
+        .locator("role:Document")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no Document element found ({e}). Aborting.");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut window = anchor.clone();
+    for _ in 0..40 {
+        match window.parent() {
+            Ok(Some(p)) => {
+                let is_window = p.attributes().role == "Window";
+                window = p;
+                if is_window {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let title = window.attributes().name.unwrap_or_default();
+    println!("window: {:?}", short(&title, 100));
+    if !want_title.is_empty() && !title.contains(&want_title) {
+        eprintln!(
+            "\nfront window does not match {want_title:?}. Aborting rather than\n\
+             reporting on whatever else happens to be in front."
+        );
+        return ExitCode::FAILURE;
+    }
+    println!();
+
+    let els = collect_all(&window, 30, 6000);
+    println!("accessible nodes: {}\n", els.len());
+
+    println!("-- role histogram --");
+    for (role, n) in role_histogram(&els) {
+        println!("  {n:>5}  {role}");
+    }
+
+    // Cards, found from the marker upwards.
+    if !marker.is_empty() {
+        let hits: Vec<&(usize, UIElement)> = els
+            .iter()
+            .filter(|(_, e)| {
+                e.attributes()
+                    .name
+                    .unwrap_or_default()
+                    .contains(&marker)
+            })
+            .collect();
+        println!("\n-- elements whose name contains {marker:?}: {} --", hits.len());
+        for (d, el) in hits.iter().take(10) {
+            println!(
+                "  d={d:<3} {:<10} {:?}",
+                el.attributes().role,
+                short(&el.attributes().name.unwrap_or_default(), 60)
+            );
+        }
+
+        // Walk up from the first few markers to a container holding the rest of
+        // the card, defined structurally: >= 6 descendants with names.
+        println!("\n-- card containers, from the marker upwards --");
+        let mut cards: Vec<UIElement> = Vec::new();
+        for (_, hit) in hits.iter() {
+            let mut cur = (*hit).clone();
+            for hop in 0..8 {
+                let Ok(Some(parent)) = cur.parent() else { break };
+                cur = parent;
+                let named = collect_all(&cur, 8, 120)
+                    .iter()
+                    .filter(|(_, e)| !e.attributes().name.unwrap_or_default().trim().is_empty())
+                    .count();
+                if named >= 6 {
+                    let id = cur.id().unwrap_or_default();
+                    if !cards
+                        .iter()
+                        .any(|c| c.id().unwrap_or_default() == id && !id.is_empty())
+                    {
+                        println!(
+                            "  {} hop(s) up: {:<9} id={:?} named-descendants={named}",
+                            hop + 1,
+                            cur.attributes().role,
+                            short(&id, 12)
+                        );
+                        cards.push(cur.clone());
+                    }
+                    break;
+                }
+            }
+            if cards.len() >= 3 {
+                break;
+            }
+        }
+
+        println!("\n-- full contents of the first 3 cards, every accessor --");
+        for (i, c) in cards.iter().take(3).enumerate() {
+            println!("  ===== card {i} =====");
+            for (d, el) in collect_all(c, 8, 160) {
+                let a = el.attributes();
+                let name = a.name.unwrap_or_default();
+                let text = el.text(0).unwrap_or_default();
+                let id = el.id().unwrap_or_default();
+                if name.trim().is_empty() && text.trim().is_empty() {
+                    continue;
+                }
+                println!(
+                    "    {:indent$}{:<10} name={:?}",
+                    "",
+                    a.role,
+                    short(&name, 56),
+                    indent = d * 2
+                );
+                if !text.trim().is_empty() && text != name {
+                    println!(
+                        "    {:indent$}   text={:?}",
+                        "",
+                        short(&text, 80),
+                        indent = d * 2
+                    );
+                }
+                if !id.trim().is_empty() {
+                    println!("    {:indent$}   id={id}", "", indent = d * 2);
+                }
+            }
+        }
+    }
+
+    // parent() and children() disagreed about this page's structure, so they are
+    // compared directly rather than one being trusted. Walking UP from a marker
+    // found an intermediate Group; walking DOWN from the Document did not show
+    // one. Both cannot be right, and which is right decides whether a per-record
+    // container exists at all.
+    if !marker.is_empty() {
+        println!("\n-- parent chain vs child descent (they disagreed) --");
+        if let Some((_, hit)) = els.iter().find(|(_, e)| {
+            e.attributes().name.unwrap_or_default().contains(&marker)
+        }) {
+            println!("  UP from {:?}:", short(&hit.attributes().name.unwrap_or_default(), 30));
+            let mut cur = hit.clone();
+            for hop in 1..=5 {
+                let Ok(Some(p)) = cur.parent() else { break };
+                let kids = p.children().map(|c| c.len()).unwrap_or(0);
+                println!(
+                    "    hop {hop}: {:<9} id={:?} name={:?} children={kids}",
+                    p.attributes().role,
+                    short(&p.id().unwrap_or_default(), 12),
+                    short(&p.attributes().name.unwrap_or_default(), 30)
+                );
+                cur = p;
+            }
+
+            println!("  DOWN from the Document:");
+            if let Ok(doc) = desktop
+                .locator("role:Document")
+                .first(Some(Duration::from_secs(5)))
+                .await
+            {
+                fn descend(el: &UIElement, depth: usize, max: usize) {
+                    if depth > max {
+                        return;
+                    }
+                    let Ok(kids) = el.children() else { return };
+                    for k in kids {
+                        let a = k.attributes();
+                        let n = k.children().map(|c| c.len()).unwrap_or(0);
+                        println!(
+                            "    {:indent$}{:<9} id={:?} name={:?} children={n}",
+                            "",
+                            a.role,
+                            short(&k.id().unwrap_or_default(), 12),
+                            short(&a.name.unwrap_or_default(), 30),
+                            indent = depth * 2
+                        );
+                        if n > 0 && depth < max {
+                            descend(&k, depth + 1, max);
+                        }
+                    }
+                }
+                descend(&doc, 0, 2);
+            }
+        }
+    }
+
+    // The card heuristic can silently under-report -- it did on first run,
+    // finding 1 container for 7 markers. A plain hierarchical dump is the
+    // control: it shows the real nesting rather than what the heuristic found.
+    println!("\n-- plain tree dump, in hierarchy order (depth 22) --");
+    let mut budget = 200usize;
+    dump_tree(&window, 0, 22, &mut budget);
+
+    println!("\n-- duplicate names --");
+    let named: Vec<String> = els
+        .iter()
+        .map(|(_, e)| e.attributes().name.unwrap_or_default())
+        .filter(|n| !n.trim().is_empty())
+        .collect();
+    let mut dupes: std::collections::BTreeMap<&String, usize> = Default::default();
+    for n in &named {
+        *dupes.entry(n).or_default() += 1;
+    }
+    let mut repeated: Vec<(&&String, &usize)> = dupes.iter().filter(|(_, c)| **c > 1).collect();
+    repeated.sort_by(|a, b| b.1.cmp(a.1));
+    println!("  {} distinct name(s) appear more than once", repeated.len());
+    for (name, count) in repeated.iter().take(16) {
+        println!("     x{count:<3} {:?}", short(name, 70));
+    }
+
+    // Shared ids across DIFFERENT names -- the Gmail "601850 is every row's
+    // star" trap, which looks like a stable identity and is not one.
+    println!("\n-- ids shared by elements with different names --");
+    let mut by_id: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        Default::default();
+    for (_, el) in &els {
+        let id = el.id().unwrap_or_default();
+        let n = el.attributes().name.unwrap_or_default();
+        if !id.trim().is_empty() && !n.trim().is_empty() {
+            by_id.entry(id).or_default().insert(n);
+        }
+    }
+    let mut shared: Vec<(&String, &std::collections::BTreeSet<String>)> =
+        by_id.iter().filter(|(_, names)| names.len() > 1).collect();
+    shared.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    println!("  {} id(s) map to more than one distinct name", shared.len());
+    for (id, names) in shared.iter().take(8) {
+        let sample: Vec<String> = names.iter().take(3).map(|n| short(n, 30)).collect();
+        println!("     id={id} -> {} names, e.g. {sample:?}", names.len());
+    }
+
+    ExitCode::SUCCESS
+}
+
 // -------------------------------------------------------- amzntree mode ----
 //
 // Third source shape, after a canvas grid (Sheets) and a message list (Gmail):
@@ -13640,6 +13903,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "gmailcapture") {
         return gmailcapture_mode().await;
+    }
+    if std::env::args().any(|a| a == "pagetree") {
+        return pagetree_mode().await;
     }
     if std::env::args().any(|a| a == "amzntree") {
         return amzntree_mode().await;
