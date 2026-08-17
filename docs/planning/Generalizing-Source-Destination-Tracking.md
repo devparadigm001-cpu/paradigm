@@ -103,3 +103,102 @@ structural from content elements). That's real design and investigation
 work for the next session — this document exists to make sure the direction
 and its supporting evidence aren't lost, the same way every other real
 decision in this project has been written down rather than left in chat.
+
+---
+
+## 7. Decisions taken after this document was first written
+
+### 7.1 A non-uniform walk is valid advancement (decided 2026-08-17)
+
+**Previously undecided.** Sections 1–6 above never addressed what should
+happen when a recording's examples are not evenly spaced — when a user
+processes some records, skips one, and carries on.
+
+**Decision: a non-uniform walk counts as valid pattern advancement, and is
+not grounds to reject the pattern.**
+
+**Reasoning.** A skipped record is still evidence of a genuinely repetitive
+task. The framing this rests on is §2 above — "if the same
+source-element-to-destination-element relationship repeats a few times,
+that's the pattern" — and the Foundation design's §1, "recognize the pattern
+and continue it." Neither is a claim about *spacing*. What makes a recording
+a pattern is that the same relationship recurs across distinct records; the
+distance between those records is an artifact of the substrate, not part of
+the evidence. Uniform spacing is a property grids happen to have, and
+requiring it imports a spreadsheet assumption into the general mechanism —
+exactly what §1 forbids.
+
+*(A note for whoever reads this next: the decision as given cited "Section
+1.2". No §1.2 exists in this document or in the Foundation design; the
+supporting framing is §2 here and §1 there, cited above. Recorded so the
+reference does not send someone hunting for a section that was never
+written.)*
+
+**What the current code actually does, measured rather than assumed**
+(`text_capture_probe skiptest`, run against the real `detect::detect` and a
+real encrypted ledger):
+
+```
+control      2,3,4,5 -> 2,3,4,5   => Pattern  source_step=1 examples=4
+skipping     2,3,4,6 -> 2,3,4,5   => InconsistentAdvance
+                                       source_steps: [1, 1, 2]
+                                       destination_steps: [1, 1, 1]
+first three  2,3,4   -> 2,3,4     => Pattern  source_step=1 examples=3
+```
+
+So today the skipping recording is **rejected at confirmation** and can never
+be saved. The rejection is specifically the gap — the same recording without
+the skip detects cleanly, and its first three examples alone detect cleanly.
+
+**The skipped record is not lost by the ledger.** With rows 2, 3, 4 and 6
+marked processed and a source holding rows 2–8, `run::batch::scan` returns:
+
+```
+Found { count: 3, first_row: "5" }
+```
+
+Row 5 is the *first* record offered. Both `scan` and the run loop walk record
+by record calling `is_processed` on each position; neither extrapolates from
+`first_row + processed × step`. The step arithmetic governs only whether a
+recording is **accepted** and where destination rows **land** — never what
+counts as unprocessed.
+
+**Status.** The new mechanism already implements this decision:
+`identity::prove_advance` replaces difference with distinctness, and
+`an_uneven_walk_still_counts_as_advancing` pins rows 2, 5, 9 as advancing.
+`detect::detect` is **unchanged** and still rejects — consistent with the
+agreed sequencing, where the new mechanism lands behind its own tests and the
+cutover happens last with a live re-verification as the acceptance gate.
+
+## 8. Tracked open items
+
+### 8.1 A run with a step greater than 1 never checks intermediate records
+
+**Found during the §7.1 investigation. Distinct from that decision, and not
+resolved.**
+
+`run::advance_source` advances the reader `source_step` times between records.
+With `source_step = 1` the run visits every record and calls `is_processed` on
+each. With `source_step > 1` it steps *over* the intermediate records without
+ever calling `is_processed` on them — so those records are invisible to a run,
+no matter what the ledger says about them.
+
+A `scan` starting from the top **does** see them, because it walks one record
+at a time. So the two paths disagree about which records exist:
+
+| | visits every record | honours the ledger per record |
+|---|---|---|
+| `batch::scan` | yes | yes |
+| run loop, `source_step = 1` | yes | yes |
+| run loop, `source_step > 1` | **no** | only for records it lands on |
+
+That is a real inconsistency between "what a scan offers" and "what a run
+will process", and it is reachable today by any template whose detected step
+is greater than 1.
+
+Not yet resolved, and deliberately not bundled with §7.1 — that decision is
+about which recordings are *accepted*, this is about which records a run
+*reaches*. Fixing one does not fix the other. Worth noting that the general
+mechanism removes the notion of a numeric step entirely, so this may dissolve
+rather than need a separate fix — but that is an expectation, not a result,
+and it should be verified rather than assumed at cutover.
