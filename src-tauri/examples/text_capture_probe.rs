@@ -2730,6 +2730,561 @@ async fn gmailtree_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// -------------------------------------------------------- amzntree mode ----
+//
+// Third source shape, after a canvas grid (Sheets) and a message list (Gmail):
+// a card/list product-results page. Same questions:
+//
+//   a) is a listing a real, named element?
+//   b) are name / price / rating separately readable within a listing?
+//   c) is there a Name-Box-style or duplicate-name-style trap?
+//   d) is there a stable identity -- a product id, a position, a URL?
+//
+// Reads only. Clicks nothing at all.
+
+/// Does this string look like a price? Deliberately narrow: a currency symbol
+/// with digits after it. Used to FIND listings, so a loose rule would pull in
+/// half the page and make the structure look messier than it is.
+fn looks_like_price(s: &str) -> bool {
+    let s = s.trim();
+    let Some(rest) = s.strip_prefix('$') else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && rest.len() <= 12
+}
+
+async fn amzntree_mode() -> ExitCode {
+    let term = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "wireless mouse".to_string());
+    let url = format!("https://www.amazon.com/s?k={}", term.replace(' ', "+"));
+
+    println!("== Amazon search results: accessibility discovery ==\n");
+    println!("term: {term:?}");
+    println!("Reads only. Clicks nothing.\n");
+
+    let stay = std::env::args().any(|a| a == "here");
+    if stay {
+        println!("'here': measuring what is already on screen.\n");
+    } else {
+        for browser in browser_order() {
+            if let Ok(mut c) = std::process::Command::new("cmd")
+                .args(["/C", "start", "", browser, &url])
+                .spawn()
+            {
+                let _ = c.wait();
+                break;
+            }
+        }
+        println!("waiting 18s for the results page...");
+        tokio::time::sleep(Duration::from_secs(18)).await;
+    }
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Anchor on a known element and climb, which is what actually worked for
+    // Gmail -- desktop-wide role:Window enumeration is rejected by the library.
+    let anchor = match desktop
+        .locator("role:Document")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no Document element found ({e}). Aborting.");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut window = anchor.clone();
+    for _ in 0..40 {
+        match window.parent() {
+            Ok(Some(p)) => {
+                let is_window = p.attributes().role == "Window";
+                window = p;
+                if is_window {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let title = window.attributes().name.unwrap_or_default();
+    println!("window: {:?}\n", short(&title, 100));
+
+    let els = collect_all(&window, 30, 6000);
+    println!("accessible nodes: {}\n", els.len());
+
+    // GUARD. A bot-check or "no results" page must abort rather than be
+    // measured as if it were a listing page -- that is the whole reason this
+    // check exists, and it is checked by CONTENT, not by the URL.
+    let prices: Vec<&(usize, UIElement)> = els
+        .iter()
+        .filter(|(_, e)| looks_like_price(&e.attributes().name.unwrap_or_default()))
+        .collect();
+    println!("price-shaped element names: {}", prices.len());
+    let bot_check = els.iter().any(|(_, e)| {
+        let n = e.attributes().name.unwrap_or_default().to_lowercase();
+        n.contains("enter the characters you see")
+            || n.contains("are you a robot")
+            || n.contains("automated access")
+    });
+    if bot_check {
+        eprintln!("\nBOT-CHECK PAGE DETECTED. Aborting rather than measuring it.");
+        return ExitCode::FAILURE;
+    }
+    if prices.len() < 3 {
+        eprintln!(
+            "\nfewer than 3 price-shaped elements -- this does not look like a\n\
+             loaded results page. Aborting rather than reporting on an unknown page."
+        );
+        return ExitCode::FAILURE;
+    }
+    println!("looks like a real results page.\n");
+
+    println!("-- role histogram --");
+    for (role, n) in role_histogram(&els) {
+        println!("  {n:>5}  {role}");
+    }
+
+    println!("\n-- candidate listing-container roles --");
+    for role in [
+        "ListItem", "DataItem", "Group", "Article", "List", "Table", "Row",
+    ] {
+        let n = els
+            .iter()
+            .filter(|(_, e)| e.attributes().role == role)
+            .count();
+        println!("  {role:<10} {n}");
+    }
+
+    // (a) Find the listing container by walking UP from a price until the
+    // subtree also holds a long-named Hyperlink (the product title). That is a
+    // structural definition of "a listing" rather than a guess at a role.
+    println!("\n-- locating listing containers, from price upwards --");
+    let mut containers: Vec<UIElement> = Vec::new();
+    for (_, price_el) in prices.iter().take(24) {
+        let mut cur = (*price_el).clone();
+        for hop in 0..8 {
+            let Ok(Some(parent)) = cur.parent() else { break };
+            cur = parent;
+            let sub = collect_all(&cur, 6, 120);
+            let has_title = sub.iter().any(|(_, e)| {
+                e.attributes().role == "Hyperlink"
+                    && e.attributes().name.unwrap_or_default().len() > 40
+            });
+            if has_title {
+                let id = cur.id().unwrap_or_default();
+                if !containers
+                    .iter()
+                    .any(|c| c.id().unwrap_or_default() == id && !id.is_empty())
+                {
+                    println!(
+                        "  found at {} hop(s) up: {:<9} id={:?} name={:?}",
+                        hop + 1,
+                        cur.attributes().role,
+                        short(&id, 12),
+                        short(&cur.attributes().name.unwrap_or_default(), 44)
+                    );
+                    containers.push(cur.clone());
+                }
+                break;
+            }
+        }
+        if containers.len() >= 3 {
+            break;
+        }
+    }
+    println!("  {} distinct container(s) identified", containers.len());
+
+    // (b) + (d): everything inside a listing, every accessor.
+    println!("\n-- full contents of the first 3 listings, every accessor --");
+    for (i, c) in containers.iter().take(3).enumerate() {
+        println!("  ===== listing {i} =====");
+        for (d, el) in collect_all(c, 8, 140) {
+            let a = el.attributes();
+            let name = a.name.unwrap_or_default();
+            let text = el.text(0).unwrap_or_default();
+            let id = el.id().unwrap_or_default();
+            if name.trim().is_empty() && text.trim().is_empty() {
+                continue;
+            }
+            println!(
+                "    {:indent$}{:<10} name={:?}",
+                "",
+                a.role,
+                short(&name, 58),
+                indent = d * 2
+            );
+            if !text.trim().is_empty() && text != name {
+                println!(
+                    "    {:indent$}   text={:?}",
+                    "",
+                    short(&text, 88),
+                    indent = d * 2
+                );
+            }
+            if !id.trim().is_empty() {
+                println!("    {:indent$}   id={id}", "", indent = d * 2);
+            }
+        }
+    }
+
+    // (c) duplicate names.
+    println!("\n-- duplicate names --");
+    let named: Vec<String> = els
+        .iter()
+        .map(|(_, e)| e.attributes().name.unwrap_or_default())
+        .filter(|n| !n.trim().is_empty())
+        .collect();
+    let mut dupes: std::collections::BTreeMap<&String, usize> = Default::default();
+    for n in &named {
+        *dupes.entry(n).or_default() += 1;
+    }
+    let mut repeated: Vec<(&&String, &usize)> = dupes.iter().filter(|(_, c)| **c > 1).collect();
+    repeated.sort_by(|a, b| b.1.cmp(a.1));
+    println!("  {} distinct name(s) appear more than once", repeated.len());
+    for (name, count) in repeated.iter().take(14) {
+        println!("     x{count:<3} {:?}", short(name, 74));
+    }
+
+    // (d) identity: does any element carry a product URL / id?
+    println!("\n-- identity signals: elements whose text is a URL --");
+    let mut with_url = 0;
+    for (d, el) in &els {
+        let t = el.text(0).unwrap_or_default();
+        if t.starts_with("http") {
+            if with_url < 14 {
+                println!(
+                    "  d={d:<3} {:<10} {:?}",
+                    el.attributes().role,
+                    short(&t, 96)
+                );
+            }
+            with_url += 1;
+        }
+    }
+    println!("  {with_url} element(s) expose a URL through text()");
+
+    println!("\n-- anything looking like an ASIN (10 chars, B0…) --");
+    let mut asins = 0;
+    for (d, el) in &els {
+        let t = el.text(0).unwrap_or_default();
+        let n = el.attributes().name.unwrap_or_default();
+        for hay in [&t, &n] {
+            if let Some(pos) = hay.find("/dp/") {
+                let asin: String = hay[pos + 4..].chars().take(10).collect();
+                if asins < 10 {
+                    println!("  d={d:<3} {:<10} asin={asin:?}", el.attributes().role);
+                }
+                asins += 1;
+                break;
+            }
+        }
+    }
+    println!("  {asins} element(s) carry a /dp/<id> product path");
+
+    ExitCode::SUCCESS
+}
+
+// ----------------------------------------------------- amzncapture mode ----
+//
+// Item 5: take name and price off real listings, put them in a scratch sheet
+// with a real CaptureSession running, and report what Record Mode holds.
+// Also quantifies ASIN coverage, which is the identity question.
+//
+// Writes D1:E3 of the scratch document and clears them again.
+async fn amzncapture_mode() -> ExitCode {
+    use paradigm_lib::run::spreadsheet::SpreadsheetWriter;
+    use paradigm_lib::run::DestinationWriter;
+
+    let scratch = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "1g3lvtsYyGc_aIqoiPBKJRlsSjkk4i2AAg72VPFvPm3Q".to_string());
+
+    println!("== Amazon -> spreadsheet, with Record Mode running ==\n");
+    println!("scratch document: {scratch}");
+    println!("writes D1:E3 only, and clears them at the end.\n");
+
+    let desktop = match Desktop::new_default() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("accessibility engine unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let anchor = match desktop
+        .locator("role:Document")
+        .first(Some(Duration::from_secs(15)))
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no Document element ({e}). Is the results page open? Aborting.");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut window = anchor.clone();
+    for _ in 0..40 {
+        match window.parent() {
+            Ok(Some(p)) => {
+                let is_window = p.attributes().role == "Window";
+                window = p;
+                if is_window {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let title = window.attributes().name.unwrap_or_default();
+    if !title.contains("Amazon") {
+        eprintln!("front window is not Amazon ({title:?}). Aborting.");
+        return ExitCode::FAILURE;
+    }
+
+    let els = collect_all(&window, 30, 6000);
+    let prices: Vec<&(usize, UIElement)> = els
+        .iter()
+        .filter(|(_, e)| looks_like_price(&e.attributes().name.unwrap_or_default()))
+        .collect();
+    if prices.len() < 3 {
+        eprintln!("not a loaded results page (fewer than 3 prices). Aborting.");
+        return ExitCode::FAILURE;
+    }
+
+    // Same structural definition of "a listing" as amzntree.
+    let mut containers: Vec<UIElement> = Vec::new();
+    for (_, price_el) in prices.iter().take(40) {
+        let mut cur = (*price_el).clone();
+        for _ in 0..8 {
+            let Ok(Some(parent)) = cur.parent() else { break };
+            cur = parent;
+            let sub = collect_all(&cur, 6, 120);
+            if sub.iter().any(|(_, e)| {
+                e.attributes().role == "Hyperlink"
+                    && e.attributes().name.unwrap_or_default().len() > 40
+            }) {
+                let id = cur.id().unwrap_or_default();
+                if !containers
+                    .iter()
+                    .any(|c| c.id().unwrap_or_default() == id && !id.is_empty())
+                {
+                    containers.push(cur.clone());
+                }
+                break;
+            }
+        }
+        if containers.len() >= 3 {
+            break;
+        }
+    }
+    if containers.len() < 3 {
+        eprintln!("could not identify 3 listings. Aborting.");
+        return ExitCode::FAILURE;
+    }
+
+    println!("-- extracted from the page (no capture yet) --");
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for (i, c) in containers.iter().take(3).enumerate() {
+        let sub = collect_all(c, 8, 140);
+
+        // Title: the longest Hyperlink name in the listing.
+        let title = sub
+            .iter()
+            .filter(|(_, e)| e.attributes().role == "Hyperlink")
+            .map(|(_, e)| e.attributes().name.unwrap_or_default())
+            .filter(|n| n.len() > 40)
+            .max_by_key(|n| n.len())
+            .unwrap_or_default();
+
+        // EVERY price-shaped string, not just the first -- the ambiguity is
+        // the finding, so it must be visible rather than resolved silently.
+        let all_prices: Vec<String> = sub
+            .iter()
+            .map(|(_, e)| e.attributes().name.unwrap_or_default())
+            .filter(|n| {
+                looks_like_price(n) || (n.contains('$') && n.len() < 40 && n.contains("List"))
+            })
+            .collect();
+
+        // Identity: any /dp/<ASIN> among the listing's link URLs.
+        let asin = sub
+            .iter()
+            .filter_map(|(_, e)| {
+                let t = e.text(0).unwrap_or_default();
+                t.find("/dp/")
+                    .map(|p| t[p + 4..].chars().take(10).collect::<String>())
+            })
+            .next();
+
+        println!("  [{i}] title={:?}", short(&title, 62));
+        println!("      price-shaped strings found: {all_prices:?}");
+        println!(
+            "      asin={}",
+            asin.clone().unwrap_or_else(|| "NONE (sponsored?)".into())
+        );
+
+        let price = all_prices.first().cloned().unwrap_or_default();
+        rows.push((title, price));
+    }
+
+    // ---- open the scratch sheet --------------------------------------------
+    for browser in browser_order() {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "start",
+                "",
+                browser,
+                &format!("https://docs.google.com/spreadsheets/d/{scratch}/edit"),
+            ])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    println!("\nwaiting 18s for the sheet...");
+    tokio::time::sleep(Duration::from_secs(18)).await;
+
+    let mut sheet_window = None;
+    for _ in 0..6 {
+        if let Some(w) = window_for_doc(&desktop, &scratch).await {
+            sheet_window = Some(w);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+    }
+    let Some(sheet_window) = sheet_window else {
+        eprintln!("could not find the spreadsheet window");
+        return ExitCode::FAILURE;
+    };
+    let _ = sheet_window.activate_window();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut writer =
+        match SpreadsheetWriter::open(desktop.clone(), &sheet_window, scratch.clone(), None, 1)
+            .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("could not open the writer: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    let session = match CaptureSession::start_session(
+        "amzn-capture-probe",
+        ExclusionList::from_patterns(["!never-matches!"]),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("could not start capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("\n-- capture running; driving the task --");
+
+    for (i, (name, price)) in rows.iter().enumerate() {
+        for (col, value) in [("D", name), ("E", price)] {
+            match writer.write(col, value) {
+                Ok(_) => println!("  wrote {col} at {}", writer.position()),
+                Err(e) => println!("  {col} FAILED: {}", first_line(&e.to_string())),
+            }
+        }
+        if i + 1 < rows.len() {
+            let _ = writer.advance(1);
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let report = match session.stop_session().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not stop capture: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("\n============ WHAT RECORD MODE CAPTURED ============");
+    println!(
+        "{} action(s), {} unmapped event(s), {} paste(s) observed\n",
+        report.actions.len(),
+        report.unmapped_events,
+        report.pastes_observed
+    );
+    for a in &report.actions {
+        println!(
+            "  {:<9} role={:<12} name={:?}",
+            a.kind.as_str(),
+            a.element_role.as_deref().unwrap_or("-"),
+            a.element_name.as_deref().unwrap_or("-")
+        );
+        if let Some(p) = &a.payload {
+            println!("            payload={:?}", short(p, 66));
+        }
+    }
+
+    println!("\n-- ground truth from the export --");
+    match download_csv("msedge", &scratch, "0").await {
+        Some(csv) => {
+            for row in 1..=3 {
+                println!(
+                    "  row {row}: D={:?}\n           E={:?}",
+                    short(&csv_at(&csv, 4, row).unwrap_or_default(), 60),
+                    csv_at(&csv, 5, row).unwrap_or_default()
+                );
+            }
+        }
+        None => println!("  could not export"),
+    }
+
+    println!("\n-- clearing D1:E3 --");
+    let _ = sheet_window.activate_window();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for row in 1..=3u64 {
+        for col in ["D", "E"] {
+            let cell = format!("{col}{row}");
+            if goto_sheet_via_namebox(&desktop, &cell).await.is_none() {
+                println!("  could not select {cell}");
+                continue;
+            }
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            if let Ok(el) = desktop.focused_element() {
+                let _ = el.press_key("{Delete}");
+            }
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    match download_csv("msedge", &scratch, "0").await {
+        Some(csv) => {
+            for row in 1..=3 {
+                println!(
+                    "  row {row} now: D={:?} E={:?}",
+                    csv_at(&csv, 4, row).unwrap_or_default(),
+                    csv_at(&csv, 5, row).unwrap_or_default()
+                );
+            }
+        }
+        None => println!("  could not re-export to confirm the clear"),
+    }
+
+    ExitCode::SUCCESS
+}
+
 // ---------------------------------------------------- gmailcapture mode ----
 //
 // Item 4 of the Gmail brief: drive the real task -- take sender and subject off
@@ -13085,6 +13640,12 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "gmailcapture") {
         return gmailcapture_mode().await;
+    }
+    if std::env::args().any(|a| a == "amzntree") {
+        return amzntree_mode().await;
+    }
+    if std::env::args().any(|a| a == "amzncapture") {
+        return amzncapture_mode().await;
     }
     if std::env::args().any(|a| a == "gmailpicker") {
         return gmailpicker_mode().await;
