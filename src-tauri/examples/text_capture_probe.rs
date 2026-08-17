@@ -2796,16 +2796,10 @@ async fn skiprun_mode() -> ExitCode {
     let obs = |seq: usize, s: i64, d: i64| Observation {
         seq,
         surface: "DST".into(),
-        destination: Cell {
-            field: "A".into(),
-            record: d,
-        },
+        destination: Cell::at_row("A", d),
         source: Some(SourceRef {
             surface: "SRC".into(),
-            cell: Cell {
-                field: "A".into(),
-                record: s,
-            },
+            cell: Cell::at_row("A", s),
         }),
     };
     let recording = vec![obs(1, 2, 2), obs(2, 3, 3), obs(3, 4, 4), obs(4, 6, 5)];
@@ -3073,16 +3067,10 @@ async fn skiptest_mode() -> ExitCode {
     let obs = |seq: usize, src_row: i64, dst_row: i64| Observation {
         seq,
         surface: DST.to_string(),
-        destination: Cell {
-            field: "B".into(),
-            record: dst_row,
-        },
+        destination: Cell::at_row("B", dst_row),
         source: Some(SourceRef {
             surface: SRC.to_string(),
-            cell: Cell {
-                field: "C".into(),
-                record: src_row,
-            },
+            cell: Cell::at_row("C", src_row),
         }),
     };
 

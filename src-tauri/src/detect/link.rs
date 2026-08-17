@@ -34,7 +34,9 @@ fn surface_and_cell(document: &str, reference: &str) -> Option<(String, Cell)> {
         Some(s) => format!("{document}!{s}"),
         None => document.to_string(),
     };
-    Some((surface, Cell { field, record }))
+    // `at_row` stores the row under the `"row"` scheme. Exactly the same number,
+    // in the general representation -- the spreadsheet case is unchanged.
+    Some((surface, Cell::at_row(field, record)))
 }
 
 /// Translate capture's links into detection's observations.
@@ -115,19 +117,13 @@ mod tests {
         assert_eq!(obs[0].surface, "Invoices");
         assert_eq!(
             obs[0].destination,
-            Cell {
-                field: "B".into(),
-                record: 2
-            }
+            Cell::at_row("B", 2)
         );
         let source = obs[0].source.as_ref().expect("source");
         assert_eq!(source.surface, "Orders");
         assert_eq!(
             source.cell,
-            Cell {
-                field: "C".into(),
-                record: 5
-            }
+            Cell::at_row("C", 5)
         );
     }
 
@@ -138,7 +134,7 @@ mod tests {
         let obs = observations(&[link(1, "Book", "Sheet2!C5", "Book", "Sheet1!B2")]);
         assert_eq!(obs[0].surface, "Book!Sheet1");
         assert_eq!(obs[0].destination.field, "B");
-        assert_eq!(obs[0].destination.record, 2);
+        assert_eq!(obs[0].destination.record.numeric(), Some(2));
         assert_eq!(obs[0].source.as_ref().unwrap().surface, "Book!Sheet2");
         assert_eq!(obs[0].source.as_ref().unwrap().cell.field, "C");
     }

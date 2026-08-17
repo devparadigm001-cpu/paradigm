@@ -110,7 +110,7 @@ impl DesignatedIdentityField {
 /// record with no identity has no key, and representing that as a key would let
 /// it flow into the ledger looking like the others. It is
 /// [`IdentityResolution::Unavailable`] instead, which callers must handle.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RecordKey {
     /// Tier 1: the source publishes a non-content identifier of its own.
     /// Amazon's `/dp/<ASIN>`; a spreadsheet row number. Structural and durable,
@@ -142,6 +142,31 @@ impl RecordKey {
             field: designated.field().to_string(),
             hex: digest::to_hex(&bytes),
         })
+    }
+
+    /// The scheme this key was declared under, if it is a Tier 1 key.
+    pub fn scheme(&self) -> Option<&str> {
+        match self {
+            RecordKey::Declared { scheme, .. } => Some(scheme),
+            RecordKey::Digest { .. } => None,
+        }
+    }
+
+    /// This key as a number, when it happens to be one.
+    ///
+    /// Exists for the one thing identities genuinely cannot do: arithmetic. A
+    /// spreadsheet destination still needs a numeric step, because a run has to
+    /// compute where the next write lands. Sources do not -- their advancement
+    /// is [`prove_advance`], which needs no ordering.
+    ///
+    /// Returns `None` for anything that is not a plain integer, including every
+    /// digest, so a caller that needs arithmetic finds out rather than being
+    /// handed a fabricated number.
+    pub fn numeric(&self) -> Option<i64> {
+        match self {
+            RecordKey::Declared { value, .. } => value.parse().ok(),
+            RecordKey::Digest { .. } => None,
+        }
     }
 
     /// The string stored in `workflow_processed_rows.row_key`.

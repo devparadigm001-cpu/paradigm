@@ -57,11 +57,31 @@ use std::collections::{BTreeMap, BTreeSet};
 /// A position in a source or destination, in the general terms §4 asks for: a
 /// field, and which record it belongs to.
 ///
-/// For a spreadsheet, `field` is a column (`"B"`) and `record` is a row (`2`).
+/// For a spreadsheet, `field` is a column (`"B"`) and `record` is the row,
+/// carried as `Declared { scheme: "row", value: "2" }`. That representation is
+/// exact -- a row number survives the widening unchanged, so the spreadsheet
+/// case behaves identically -- while leaving room for a record identified by
+/// something that is not a number at all, which is what a dashboard, an inbox
+/// or a listing page provides.
+///
+/// See `docs/planning/Generalizing-Source-Destination-Tracking.md` §1: the
+/// end-state is one general mechanism that happens to handle spreadsheets, not
+/// a spreadsheet mechanism with exceptions.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Cell {
     pub field: String,
-    pub record: i64,
+    pub record: crate::identity::RecordKey,
+}
+
+impl Cell {
+    /// A spreadsheet-shaped position. The row is stored as a declared identity
+    /// under the `"row"` scheme rather than as a bare integer.
+    pub fn at_row(field: impl Into<String>, row: i64) -> Self {
+        Self {
+            field: field.into(),
+            record: crate::identity::RecordKey::declared("row", row.to_string()),
+        }
+    }
 }
 
 /// Where a written value came from.
@@ -177,9 +197,12 @@ pub fn detect(
     }
 
     // 3. Group into records.
-    let mut records: BTreeMap<i64, Vec<&Observation>> = BTreeMap::new();
+    let mut records: BTreeMap<crate::identity::RecordKey, Vec<&Observation>> = BTreeMap::new();
     for o in settled.values() {
-        records.entry(o.destination.record).or_default().push(o);
+        records
+            .entry(o.destination.record.clone())
+            .or_default()
+            .push(o);
     }
 
     // 4. Rule of 3.
@@ -206,12 +229,13 @@ pub fn detect(
         m
     };
 
-    let mut by_signature: BTreeMap<Vec<FieldMapping>, Vec<i64>> = BTreeMap::new();
+    let mut by_signature: BTreeMap<Vec<FieldMapping>, Vec<crate::identity::RecordKey>> =
+        BTreeMap::new();
     for (record, writes) in &records {
         by_signature
             .entry(signature(writes))
             .or_default()
-            .push(*record);
+            .push(record.clone());
     }
 
     if by_signature.len() > 1 {
@@ -233,19 +257,42 @@ pub fn detect(
     let (fields, record_indices) = by_signature.into_iter().next().expect("one signature");
 
     // 6. Advancement, both sides.
-    let destination_steps = steps(&record_indices);
+    //
+    // Steps are computed only from records that ARE numbers. A destination
+    // still needs arithmetic -- a run has to compute where the next write
+    // lands -- so a destination whose records carry no number cannot yield a
+    // step, and that is reported rather than invented.
+    let destination_numeric: Vec<i64> = record_indices.iter().filter_map(|k| k.numeric()).collect();
+    let destination_is_numeric = destination_numeric.len() == record_indices.len();
+    let destination_steps = if destination_is_numeric {
+        steps(&destination_numeric)
+    } else {
+        Vec::new()
+    };
 
-    let mut source_records: Vec<i64> = records
+    // The source's records, in the order their destinations appear. Kept as
+    // identities: the source's advancement rule is distinctness, which needs no
+    // ordering, so nothing here has to be a number.
+    let source_keys: Vec<crate::identity::RecordKey> = records
         .values()
         .filter_map(|writes| {
             writes
                 .iter()
-                .filter_map(|o| o.source.as_ref().map(|s| s.cell.record))
+                .filter_map(|o| o.source.as_ref().map(|s| s.cell.record.clone()))
                 .min()
         })
         .collect();
+
+    // Only for reporting and for the step below -- never for the accept/reject
+    // decision, which is `prove_advance`.
+    let mut source_records: Vec<i64> = source_keys.iter().filter_map(|k| k.numeric()).collect();
+    let source_is_numeric = source_records.len() == source_keys.len();
     source_records.sort_unstable();
-    let source_steps = steps(&source_records);
+    let source_steps = if source_is_numeric {
+        steps(&source_records)
+    } else {
+        Vec::new()
+    };
 
     let uniform = |v: &[i64]| v.windows(2).all(|w| w[0] == w[1]);
 
@@ -254,7 +301,12 @@ pub fn detect(
     // destination means writes landing at scattered positions, which is a
     // different claim from "the user skipped a source record". Where the next
     // write LANDS has to be predictable, or a run cannot place it.
-    if !uniform(&destination_steps) {
+    //
+    // A destination with no numeric records cannot satisfy that at all -- there
+    // is no arithmetic to be uniform -- so it is refused here rather than
+    // handed a fabricated step. Writing to a non-numeric destination is a
+    // separate piece of work; a source that is not a spreadsheet is not.
+    if !destination_is_numeric || !uniform(&destination_steps) {
         return Detection::InconsistentAdvance {
             source_steps,
             destination_steps,
@@ -274,11 +326,9 @@ pub fn detect(
     // same thing three times", and that distinction is about each repetition
     // drawing from a DIFFERENT record -- not about how far apart they are. On
     // row numbers the two rules agree exactly; the general one also works on
-    // identities that have no difference operator at all.
-    let source_keys: Vec<crate::identity::RecordKey> = source_records
-        .iter()
-        .map(|r| crate::identity::RecordKey::declared("row", r.to_string()))
-        .collect();
+    // identities that have no difference operator at all -- which is now the
+    // real case rather than a hypothetical, since `source_keys` comes straight
+    // off the observations instead of being rebuilt from row numbers.
     if !crate::identity::prove_advance(&source_keys).advanced() {
         return Detection::SourceDidNotAdvance;
     }
@@ -292,7 +342,11 @@ pub fn detect(
     // rather than striding over records it never checks. See §8.1: a step
     // greater than 1 skips `is_processed` on the records it steps over, and a
     // recording with gaps is precisely the case where those records matter.
-    let source_step = if uniform(&source_steps) {
+    //
+    // A source whose records are not numbers at all also reports 1, for the
+    // same reason and more strongly: there is no step to preserve, and the run
+    // must walk every record so the ledger decides.
+    let source_step = if source_is_numeric && uniform(&source_steps) {
         source_steps.first().copied().unwrap_or(0)
     } else {
         1
@@ -329,10 +383,10 @@ mod tests {
     const DST: &str = "shipping";
 
     fn cell(field: &str, record: i64) -> Cell {
-        Cell {
-            field: field.to_string(),
-            record,
-        }
+        // Every existing test still speaks in row numbers. `at_row` is the same
+        // number in the general representation, which is exactly the claim the
+        // spreadsheet case has to keep satisfying.
+        Cell::at_row(field, record)
     }
 
     /// A write from `src_field`/`src_record` into `dst_field`/`dst_record`.
