@@ -70,6 +70,7 @@
 //! half; [`RecordKey`] is the second.
 
 pub mod digest;
+pub mod tree;
 
 use std::collections::HashSet;
 
