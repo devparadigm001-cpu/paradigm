@@ -163,60 +163,107 @@ impl RecordView {
     }
 }
 
+/// Where one element sits: which record it belongs to, and what addressed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Located {
+    /// Ordinal of the record within the page, in document order.
+    pub record: usize,
+    /// The structural element that addressed this one, if any. `None` for
+    /// content with no label beside it.
+    pub label: Option<String>,
+}
+
+/// Locate a single element by id, using exactly the rule [`records`] uses.
+///
+/// This is what capture needs: at the moment of a copy, which record and which
+/// field did the user act on? It deliberately shares the walk with [`records`]
+/// so the two can never disagree about where an element belongs.
+///
+/// Only content elements can be located. A structural element is a label, and a
+/// label is not a position -- addressing one would mean "the user copied the
+/// word PRODUCT", which is not a record reference.
+pub fn locate(nodes: &[TreeNode], id: &str) -> Option<Located> {
+    let mut found = None;
+    walk(nodes, |node, assignment| {
+        if node.id == id && found.is_none() {
+            if let Assignment::Content { record, label } = assignment {
+                found = Some(Located {
+                    record: *record,
+                    label: label.clone(),
+                });
+            }
+        }
+    });
+    found
+}
+
+/// What the walk decided about one node.
+enum Assignment {
+    Structural,
+    Content {
+        record: usize,
+        label: Option<String>,
+    },
+}
+
+/// The single traversal both [`records`] and [`locate`] are built on.
+fn walk(nodes: &[TreeNode], mut visit: impl FnMut(&TreeNode, &Assignment)) {
+    let kinds = classify(nodes);
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unlabelled_seen = 0usize;
+    let mut pending: Option<(String, usize)> = None;
+
+    for node in nodes.iter().filter(|n| !n.name.trim().is_empty()) {
+        match kinds.get(&node.id) {
+            Some(Kind::Structural) => {
+                let k = seen.entry(node.id.clone()).or_insert(0);
+                let index = *k;
+                *k += 1;
+                pending = Some((node.name.clone(), index));
+                visit(node, &Assignment::Structural);
+            }
+            Some(Kind::Content) => {
+                let assignment = match pending.take() {
+                    Some((label, index)) => Assignment::Content {
+                        record: index,
+                        label: Some(label),
+                    },
+                    None => {
+                        let index = unlabelled_seen;
+                        unlabelled_seen += 1;
+                        Assignment::Content {
+                            record: index,
+                            label: None,
+                        }
+                    }
+                };
+                visit(node, &assignment);
+            }
+            None => {}
+        }
+    }
+}
+
 /// Reconstruct records from a document-order tree.
 ///
 /// No container detection, no role assumptions, no per-application knowledge --
 /// see the module docs for why containers cannot be relied on.
 pub fn records(nodes: &[TreeNode]) -> Vec<RecordView> {
-    let kinds = classify(nodes);
-    let kind_of = |n: &TreeNode| kinds.get(&n.id).copied();
-
-    // How many times each structural id has been seen so far. The k-th
-    // occurrence of a structural element belongs to record k.
-    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-    let mut unlabelled_seen = 0usize;
     let mut out: Vec<RecordView> = Vec::new();
-
-    let ensure = |out: &mut Vec<RecordView>, k: usize| {
-        while out.len() <= k {
-            out.push(RecordView::default());
-        }
-    };
-
-    // The most recent structural node, waiting for the content that follows it.
-    let mut pending: Option<(String, usize)> = None;
-
-    for node in nodes.iter().filter(|n| !n.name.trim().is_empty()) {
-        match kind_of(node) {
-            Some(Kind::Structural) => {
-                let k = seen.entry(node.id.clone()).or_insert(0);
-                let index = *k;
-                *k += 1;
-                // A structural node immediately following another one means the
-                // first addressed nothing. Dropping it is correct: a label with
-                // no value is not a field, and inventing an empty one would put
-                // a fabricated field into a record.
-                pending = Some((node.name.clone(), index));
+    walk(nodes, |node, assignment| {
+        if let Assignment::Content { record, label } = assignment {
+            while out.len() <= *record {
+                out.push(RecordView::default());
             }
-            Some(Kind::Content) => match pending.take() {
-                Some((label, index)) => {
-                    ensure(&mut out, index);
-                    out[index].fields.push(Field {
-                        label,
-                        value: node.name.clone(),
-                    });
-                }
-                None => {
-                    let index = unlabelled_seen;
-                    unlabelled_seen += 1;
-                    ensure(&mut out, index);
-                    out[index].unlabelled.push(node.name.clone());
-                }
-            },
-            None => {}
+            match label {
+                Some(label) => out[*record].fields.push(Field {
+                    label: label.clone(),
+                    value: node.name.clone(),
+                }),
+                None => out[*record].unlabelled.push(node.name.clone()),
+            }
         }
-    }
-
+    });
     out
 }
 
@@ -411,6 +458,43 @@ mod tests {
         assert!(records(&tree).iter().all(|r| r.fields.is_empty()));
         // Not a bug to be fixed here: the spreadsheet path reads the CSV export
         // instead, which produces records directly.
+    }
+
+    /// `locate` is what capture asks at the moment of a copy: which record and
+    /// which field did the user act on? It must agree with `records`, which is
+    /// why both are built on one traversal.
+    #[test]
+    fn locate_finds_the_record_and_label_of_a_value() {
+        let tree = flat_card_tree();
+        // A value in the second record, addressed by a label.
+        let found = locate(&tree, "825412").expect("located");
+        assert_eq!(found.record, 1);
+        assert_eq!(found.label.as_deref(), Some("PRODUCT"));
+
+        // A value in the third record.
+        let found = locate(&tree, "127685").expect("located");
+        assert_eq!(found.record, 2);
+        assert_eq!(found.label.as_deref(), Some("QUANTITY"));
+    }
+
+    #[test]
+    fn locate_reports_no_label_for_unlabelled_content() {
+        let found = locate(&flat_card_tree(), "456893").expect("located");
+        assert_eq!(found.record, 1);
+        assert_eq!(found.label, None);
+    }
+
+    /// A label is not a position. Copying the word that addresses a field is not
+    /// a reference to a record, and pretending otherwise would put a fabricated
+    /// example into a Rule-of-3 count.
+    #[test]
+    fn locate_refuses_a_structural_element() {
+        assert_eq!(locate(&flat_card_tree(), "168734"), None);
+    }
+
+    #[test]
+    fn locate_returns_none_for_an_unknown_id() {
+        assert_eq!(locate(&flat_card_tree(), "does-not-exist"), None);
     }
 
     #[test]

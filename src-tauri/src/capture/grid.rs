@@ -347,7 +347,52 @@ impl GridCellWatcher {
         let mut cell = None;
         let mut document = None;
         collect_position(&root, 0, &mut budget, &mut cell, &mut document);
-        Some((document?, cell?))
+        if let (Some(document), Some(cell)) = (document.clone(), cell.clone()) {
+            return Some((document, cell));
+        }
+
+        // No Name Box, or no /d/ document id -- so this is not a spreadsheet.
+        // Fall back to element identity. Everything above is untouched: this
+        // runs only where the existing path found nothing, so a spreadsheet
+        // never reaches it.
+        self.read_element_position(&root, &focused)
+    }
+
+    /// A position for a page that has no Name Box, expressed generally.
+    ///
+    /// The general rule lives in [`crate::identity::tree`] and is shared with
+    /// everything else that reconstructs records; this only gathers the tree and
+    /// asks where the focused element sits.
+    ///
+    /// **Carries no content.** The returned pair is a page identity and a
+    /// `record ordinal + field label` -- the same kind of information a cell
+    /// reference carries. The value the user copied is never read, which is the
+    /// invariant `a_link_carries_positions_and_never_a_value` enforces.
+    ///
+    /// The ordinal is a position *within this recording*, and that is all
+    /// detection needs: it has to know the examples referred to DIFFERENT
+    /// records, not which records they were. A durable identity is a separate
+    /// question, resolved against the live page at run time, where a Tier 1 key
+    /// or a user-designated Tier 2 field is available. Storing an ordinal as
+    /// though it were an identity would be the silent-wrong-target failure this
+    /// project keeps finding.
+    fn read_element_position(
+        &mut self,
+        root: &UIElement,
+        focused: &UIElement,
+    ) -> Option<(String, String)> {
+        let page = page_identity(root)?;
+
+        let mut nodes = Vec::new();
+        let mut budget = 3000usize;
+        collect_nodes(root, &mut budget, &mut nodes);
+
+        let focused_id = focused.id().unwrap_or_default();
+        if focused_id.trim().is_empty() {
+            return None;
+        }
+        let located = crate::identity::tree::locate(&nodes, &focused_id)?;
+        Some((page, encode_element_ref(located.record, located.label.as_deref())))
     }
 
     /// A key went down. Samples the editor, and emits when an edit finishes.
@@ -517,6 +562,86 @@ impl GridCellWatcher {
 /// the Name Box, and the document id from the browser's address bar.
 ///
 /// Bounded and depth-limited. It stops descending a branch once both are found,
+/// Marks a position as an element reference rather than a cell reference.
+///
+/// Chosen so it cannot be confused with one: `parse_cell_ref` requires letters
+/// followed by digits, and this contains a `/`, so a cell reference can never
+/// decode as an element reference or the reverse.
+pub const ELEMENT_REF_PREFIX: &str = "el/";
+
+/// `el/<record ordinal>/<field label>`.
+///
+/// A label is schema, not data -- the same kind of thing a column letter is --
+/// so including it keeps the resulting mapping legible to a user without
+/// carrying what was copied. Content with no label beside it encodes an empty
+/// field rather than inventing one.
+pub fn encode_element_ref(record: usize, label: Option<&str>) -> String {
+    format!("{ELEMENT_REF_PREFIX}{record}/{}", label.unwrap_or_default())
+}
+
+/// The inverse. `None` for anything that is not an element reference.
+pub fn decode_element_ref(reference: &str) -> Option<(usize, String)> {
+    let rest = reference.trim().strip_prefix(ELEMENT_REF_PREFIX)?;
+    let (ordinal, label) = rest.split_once('/')?;
+    Some((ordinal.parse().ok()?, label.to_string()))
+}
+
+/// Something stable that names the page, for a window with no `/d/` document id.
+///
+/// The address bar is the general answer: every page has a URL, and two pages
+/// in one application are two different surfaces exactly as two spreadsheets
+/// are. Falls back to the window title only when there is no address bar at all.
+fn page_identity(root: &UIElement) -> Option<String> {
+    let mut budget = 3000usize;
+    let mut url = None;
+    collect_page_identity(root, 0, &mut budget, &mut url);
+    url.or_else(|| {
+        let title = root.name().unwrap_or_default();
+        (!title.trim().is_empty()).then_some(title)
+    })
+}
+
+fn collect_page_identity(el: &UIElement, depth: usize, budget: &mut usize, url: &mut Option<String>) {
+    if depth > 14 || *budget == 0 || url.is_some() {
+        return;
+    }
+    *budget -= 1;
+    if el.name().unwrap_or_default().trim() == "Address and search bar" {
+        let text = el.text(0).unwrap_or_default();
+        if !text.trim().is_empty() {
+            *url = Some(text.trim().to_string());
+            return;
+        }
+    }
+    if let Ok(children) = el.children() {
+        for c in &children {
+            collect_page_identity(c, depth + 1, budget, url);
+        }
+    }
+}
+
+/// Flatten a window into the document-order node list the general rule takes.
+fn collect_nodes(
+    el: &UIElement,
+    budget: &mut usize,
+    out: &mut Vec<crate::identity::tree::TreeNode>,
+) {
+    if *budget == 0 {
+        return;
+    }
+    *budget -= 1;
+    out.push(crate::identity::tree::TreeNode::new(
+        el.id().unwrap_or_default(),
+        el.role(),
+        el.name().unwrap_or_default(),
+    ));
+    if let Ok(children) = el.children() {
+        for c in &children {
+            collect_nodes(c, budget, out);
+        }
+    }
+}
+
 /// which is what keeps the measured cost at tens of milliseconds rather than a
 /// full-window walk.
 fn collect_position(
@@ -659,6 +784,37 @@ mod tests {
         assert!(
             w.take_links().is_empty(),
             "only a real copy may arm a paste"
+        );
+    }
+
+    /// The encoding must never be mistakable for a cell reference in either
+    /// direction, or a spreadsheet position could decode as an element one.
+    #[test]
+    fn an_element_reference_cannot_be_confused_with_a_cell_reference() {
+        let encoded = encode_element_ref(3, Some("QUANTITY"));
+        assert_eq!(decode_element_ref(&encoded), Some((3, "QUANTITY".into())));
+        assert!(!looks_like_cell_ref(&encoded));
+
+        for cell in ["A1", "B2", "AA10", "C5"] {
+            assert_eq!(decode_element_ref(cell), None, "{cell} is a cell reference");
+        }
+    }
+
+    #[test]
+    fn unlabelled_content_encodes_an_empty_field_rather_than_a_guess() {
+        let encoded = encode_element_ref(2, None);
+        assert_eq!(decode_element_ref(&encoded), Some((2, String::new())));
+    }
+
+    /// The §3 invariant, restated for the new path: an element reference is a
+    /// position and a label, never the value that was copied.
+    #[test]
+    fn an_element_reference_carries_no_copied_value() {
+        let encoded = encode_element_ref(1, Some("PRODUCT"));
+        assert!(encoded.contains("PRODUCT"), "the label is schema, and kept");
+        assert!(
+            !encoded.contains("Ceramic Mug Set"),
+            "no value may appear: {encoded}"
         );
     }
 
