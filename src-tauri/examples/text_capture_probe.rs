@@ -2730,6 +2730,323 @@ async fn gmailtree_mode() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Every Google Sheets document currently open, by document id.
+///
+/// Same enumeration idiom as `window_for_doc` -- browser windows are found by
+/// their "Google Sheets" title, and the id comes off each window's own address
+/// bar. Used to identify a newly created document by set difference rather than
+/// by guessing which window is the new one.
+async fn sheets_doc_ids(desktop: &Desktop) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(windows) = desktop
+        .locator("role:Window|name:Google Sheets")
+        .within(desktop.root())
+        .all(Some(Duration::from_secs(8)), None)
+        .await
+    {
+        for w in windows {
+            let addr = address_of(desktop, &w).await;
+            if let Some(p) = addr.find("/d/") {
+                let id: String = addr[p + 3..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if id.len() >= 40 && !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    out
+}
+
+// --------------------------------------------------------- skiprun mode ----
+//
+// The live acceptance gate for the §7.1 cutover. Not a re-run of the
+// already-proven Sheets-to-Sheets case: this one specifically exercises the
+// reason the change was made.
+//
+//   1. Detection on a recording that SKIPS source row 5 (examples 2,3,4,6).
+//      Before the cutover this was InconsistentAdvance and unsaveable.
+//   2. Store it, and mark 2,3,4,6 processed -- the state a real recording
+//      would leave behind.
+//   3. "Check for new" against the LIVE source. Row 5 must be found.
+//   4. Run for real, through real surfaces, writing to a FRESH throwaway
+//      document created by sheets.new.
+//   5. Verify by CSV export of the destination that the skipped record's
+//      values actually landed.
+//
+// Never touches any pre-existing document. The source is read-only.
+async fn skiprun_mode() -> ExitCode {
+    use paradigm_lib::compile::CompiledTemplate;
+    use paradigm_lib::detect::{detect, Cell, Detection, FieldMapping, Observation, SourceRef};
+
+    const SOURCE: &str = "1ko7z65TnzI5suwvu3LGv8yoemmhOs5siSQe9KBB8NZs";
+    // Source row 5 -- the record the recording skips. Its values must appear in
+    // the destination by the end, or the whole change did nothing useful.
+    const SKIPPED_A: &str = "Cedar Point Logistics";
+    const SKIPPED_B: &str = "340";
+
+    println!("== live: a skipped record, end to end ==\n");
+    println!("source (read-only): {SOURCE}");
+    println!("destination: a NEW throwaway sheet\n");
+
+    // ---- 1. detection, with the skip -------------------------------------
+    println!("-- 1. detection on examples 2,3,4,6 (row 5 skipped) --");
+    let obs = |seq: usize, s: i64, d: i64| Observation {
+        seq,
+        surface: "DST".into(),
+        destination: Cell {
+            field: "A".into(),
+            record: d,
+        },
+        source: Some(SourceRef {
+            surface: "SRC".into(),
+            cell: Cell {
+                field: "A".into(),
+                record: s,
+            },
+        }),
+    };
+    let recording = vec![obs(1, 2, 2), obs(2, 3, 3), obs(3, 4, 4), obs(4, 6, 5)];
+    match detect(&recording, "SRC", "DST") {
+        Detection::Pattern(p) => println!(
+            "   ACCEPTED => Pattern source_step={} destination_step={} examples={}",
+            p.source_step, p.destination_step, p.examples
+        ),
+        other => {
+            println!("   REJECTED => {other:?}");
+            println!("   the cutover did not take; stopping before touching anything live");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // ---- 2. a fresh destination ------------------------------------------
+    println!("\n-- 2. creating a throwaway destination --");
+
+    // Identify the new document by DIFFERENCE, not by guessing which window is
+    // the right one. A first attempt walked up from the Name Box and landed on
+    // an unrelated application's window, then read an empty address bar off it
+    // -- which is the "an element looks reliable and isn't" trap this project
+    // keeps hitting, so this takes the unambiguous route instead.
+    let desktop_pre = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("desktop unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let before = sheets_doc_ids(&desktop_pre).await;
+    println!("   Sheets documents already open: {}", before.len());
+
+    for browser in browser_order() {
+        if let Ok(mut c) = std::process::Command::new("cmd")
+            .args(["/C", "start", "", browser, &scratch_url()])
+            .spawn()
+        {
+            let _ = c.wait();
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    let desktop = match Desktop::new(false, false) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("desktop unavailable: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let after = sheets_doc_ids(&desktop).await;
+    println!("   Sheets documents open now:      {}", after.len());
+    let fresh: Vec<String> = after
+        .iter()
+        .filter(|id| !before.contains(id))
+        .cloned()
+        .collect();
+    let destination = match fresh.as_slice() {
+        [one] => one.clone(),
+        [] => {
+            eprintln!("   no new document appeared -- sheets.new did not create one");
+            return ExitCode::FAILURE;
+        }
+        many => {
+            eprintln!("   {} new documents appeared; refusing to guess", many.len());
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("   created: {destination}");
+    if destination == "1g3lvtsYyGc_aIqoiPBKJRlsSjkk4i2AAg72VPFvPm3Q" {
+        eprintln!("   REFUSING: that is the document under a restore conflict.");
+        return ExitCode::FAILURE;
+    }
+
+    // ---- 3. playbook + ledger reflecting the recording --------------------
+    let template = CompiledTemplate {
+        source_id: SOURCE.to_string(),
+        destination_id: destination.clone(),
+        source_step: 1,
+        destination_step: 1,
+        examples: 4,
+        fields: vec![
+            FieldMapping {
+                source_field: "A".into(),
+                destination_field: "A".into(),
+            },
+            FieldMapping {
+                source_field: "B".into(),
+                destination_field: "B".into(),
+            },
+        ],
+    };
+
+    let dir = {
+        let base = std::env::var("APPDATA").expect("APPDATA");
+        std::path::Path::new(&base).join("com.amitj.paradigm")
+    };
+    let (db_path, key_path) = paradigm_lib::db::paths_in(&dir);
+    let mut conn = paradigm_lib::db::open(&db_path, &key_path).expect("db");
+    let mut stream = paradigm_lib::capture::CapturedStream::new(
+        paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
+    );
+    stream.admit(paradigm_lib::capture::ActionCandidate {
+        kind: paradigm_lib::capture::ActionKind::Click,
+        identifiers: vec!["msedge.exe".into()],
+        process_name: None,
+        element_role: Some("Button".into()),
+        element_name: Some("Next".into()),
+        payload: None,
+        detail: None,
+        timestamp_ms: 0,
+    });
+    let playbook = paradigm_lib::compile::compile(
+        stream.actions(),
+        "SKIPPED-RECORD RUN",
+        &paradigm_lib::compile::ReversibilityPolicy::placeholder(),
+        &paradigm_lib::labeling::RedactionPolicy::placeholder(),
+    )
+    .with_template(template.clone());
+    paradigm_lib::compile::store::store(&mut conn, &playbook).expect("store");
+
+    println!("\n-- 3. ledger: marking 2, 3, 4, 6 processed (row 5 NOT marked) --");
+    for row in [2u64, 3, 4, 6] {
+        paradigm_lib::run::mark_processed(
+            &conn,
+            &playbook.id,
+            &paradigm_lib::source::SourcePosition {
+                source_id: SOURCE.to_string(),
+                row_key: row.to_string(),
+            },
+        )
+        .expect("mark");
+    }
+    println!("   playbook {}", playbook.id);
+
+    // ---- 4. Check for new, against the live source ------------------------
+    println!("\n-- 4. Check for new (live source read) --");
+    let (mut scan_reader, _w) =
+        match paradigm_lib::run::surfaces::open_for(&desktop, &template, 2, 1, 2).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("   open_for FAILED: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    match paradigm_lib::run::batch::scan(&conn, &playbook.id, &template, scan_reader.as_mut()) {
+        Ok(scan) => {
+            println!("   {scan:?}");
+            match &scan {
+                paradigm_lib::run::batch::BatchScan::Found { first_row, .. }
+                    if first_row == "5" =>
+                {
+                    println!("   -> the SKIPPED record is offered first");
+                }
+                other => println!("   -> unexpected: {other:?}"),
+            }
+        }
+        Err(e) => println!("   scan failed: {e}"),
+    }
+
+    // ---- 5. run it for real ----------------------------------------------
+    println!("\n-- 5. running --");
+    let (mut reader, mut writer) =
+        match paradigm_lib::run::surfaces::open_for(&desktop, &template, 2, 1, 2).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("   open_for FAILED: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let control = paradigm_lib::run::control::RunControl::new();
+    let corrections = paradigm_lib::run::correction::RunCorrections::new();
+    let supervision = paradigm_lib::run::supervision::RunSupervision::off();
+    let started = std::time::Instant::now();
+    let report = paradigm_lib::run::run_with_control(
+        &conn,
+        &playbook.id,
+        &template,
+        reader.as_mut(),
+        writer.as_mut(),
+        &control,
+        &corrections,
+        &supervision,
+    );
+    match &report {
+        Ok(r) => {
+            println!(
+                "   stopped: {:?}, {} record(s) in {:.1}s",
+                r.stop,
+                r.records.len(),
+                started.elapsed().as_secs_f64()
+            );
+            for rec in &r.records {
+                println!("      source row {} -> destination {}", rec.position.row_key, rec.destination);
+            }
+        }
+        Err(e) => {
+            println!("   run FAILED: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // ---- 6. ground truth --------------------------------------------------
+    println!("\n-- 6. CSV ground truth from the destination --");
+    match download_csv("msedge", &destination, "0").await {
+        Some(csv) => {
+            let mut found_skipped = false;
+            for row in 1..=12usize {
+                let a = csv_at(&csv, 1, row).unwrap_or_default();
+                let b = csv_at(&csv, 2, row).unwrap_or_default();
+                if a.trim().is_empty() && b.trim().is_empty() {
+                    continue;
+                }
+                let mark = if a == SKIPPED_A && b == SKIPPED_B {
+                    found_skipped = true;
+                    "   <== THE SKIPPED RECORD"
+                } else {
+                    ""
+                };
+                println!("   row {row}: {a:?} / {b:?}{mark}");
+            }
+            println!();
+            if found_skipped {
+                println!("   PASS -- the skipped source record was found and written.");
+            } else {
+                println!("   FAIL -- {SKIPPED_A:?} never reached the destination.");
+                return ExitCode::FAILURE;
+            }
+        }
+        None => {
+            println!("   could not export the destination");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    println!("\n   throwaway destination left in Drive: {destination}");
+    ExitCode::SUCCESS
+}
+
 // -------------------------------------------------------- skiptest mode ----
 //
 // The open design question: if a recording SKIPS a record, is that record
@@ -14081,6 +14398,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().any(|a| a == "gmailcapture") {
         return gmailcapture_mode().await;
+    }
+    if std::env::args().any(|a| a == "skiprun") {
+        return skiprun_mode().await;
     }
     if std::env::args().any(|a| a == "skiptest") {
         return skiptest_mode().await;
