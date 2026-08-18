@@ -1,8 +1,14 @@
 # Generalizing Source/Destination Tracking Beyond Spreadsheets
 
-**Status:** direction confirmed tonight, grounded in real, direct evidence
-from four separate application investigations. Not yet built. This document
-exists so the decision and its evidence survive past this conversation.
+**Status:** direction confirmed 2026-08-16, grounded in real, direct evidence
+from four separate application investigations. Partly built as of 2026-08-17
+(Steps 2a and 2b). This document exists so the decision and its evidence
+survive past this conversation.
+
+**For the current standing of the work -- what is general, what has actually
+been proven and to what depth, and why "works on any site" is not a state that
+can be reached -- see §9. Read that section before describing this work's
+coverage anywhere.**
 
 ---
 
@@ -73,10 +79,23 @@ first as a stable *role* label, not a source of tracked identity.
 
 - The `SourceReader` interface — already built generically ("a source," not
   "a spreadsheet"), with the Sheets reader as its first implementation.
-- Capture's existing per-action element identity (role, name, runtime id
-  where available) — the raw material this needs, already being recorded
-  for every click and type action, just not yet used for cross-app pattern
-  detection.
+- Capture's existing per-action element identity — **only partly, and not the
+  part that matters.** Role and name are recorded for every click and for a
+  text-field type. A *grid* type records neither: `capture::grid::emit`
+  synthesises `element_role: "ComboBox"` and puts the cell reference in
+  `element_name`, so that action carries no element identity at all. And **no
+  runtime id is recorded on any action** — `CapturedAction` has no id field,
+  and `to_candidate` holds the event's `UIElement` and takes only role and
+  name from it. Ids *are* read transiently, by `read_element_position` on the
+  clipboard path and by `capture::text` to compare elements, but none is
+  stored.
+
+  *Corrected 2026-08-18.* This bullet previously read "(role, name, runtime id
+  where available) … already being recorded for every click and type action".
+  The id half was false. That matters because the id is exactly what the
+  structural rule in `identity::tree` keys on, so this is raw material the work
+  has to **add**, not reuse. See §9.4 for a second, independent reason the id
+  is weaker material than this bullet assumed.
 - The Rule-of-3 confirmation logic, the reversible/irreversible safety
   model, pause/resume, fail-loud-never-guess — none of this is
   spreadsheet-specific and all of it should carry over unchanged.
@@ -202,3 +221,115 @@ about which recordings are *accepted*, this is about which records a run
 mechanism removes the notion of a numeric step entirely, so this may dissolve
 rather than need a separate fix — but that is an expectation, not a result,
 and it should be verified rather than assumed at cutover.
+
+---
+
+## 9. Status of generality: what is proven, and why it is never finished
+
+**Written 2026-08-18. A standing status statement, meant to be amended as
+surfaces are added. It is worded deliberately so that it cannot be read as a
+completion claim, because there is no state in which it would become one.**
+
+### 9.1 The mechanism is general and app-agnostic
+
+**No file in the identity or detection path contains logic for any specific
+application.** There is no branch on "if Gmail", no allowlist of roles, no
+per-site label table, no application name at all in:
+
+* `identity::tree` -- `classify`, `walk`, `locate`, `records`. The only inputs
+  are a document-order node list and its multiplicity.
+* `identity` -- `RecordKey`, `prove_advance`, `next_unprocessed`,
+  `FieldAddress`. Order-free and arithmetic-free by construction.
+* `detect` -- `detect`, `link::observations`, `link::dominant_surfaces`. These
+  deal in fields and record keys. A spreadsheet reaches them only after the
+  spreadsheet adapter has already turned `"B2"` into a field and a record.
+
+The fixtures in those modules' tests are real captures from separate
+investigations, kept as *evidence that the rule generalizes* -- not as things
+the code matches against. Deleting every fixture changes no behaviour.
+
+### 9.2 What has actually been shown, surface by surface
+
+Four surfaces, and four different degrees of proof. "Proven" is not one thing,
+and this table exists so that it is never reported as though it were.
+
+| Surface | Real capture | Carried as far as | Not done |
+|---|---|---|---|
+| Gmail message list | yes -- real ids, incl. the star cell `601850` shared by every row | the grouping rule only (`identity::tree` unit test) | end-to-end detection; live recording |
+| Amazon listings | yes -- real ids, incl. the price label `118404` shared by every listing | the grouping rule only (unit test) | end-to-end detection; live recording |
+| OrderFlow dashboard | yes -- full card tree with ids | the whole chain, offline: nodes -> `locate` -> `encode_element_ref` -> `observations` -> `detect` -> `Pattern` | the live recording, which needs a human's hands |
+| PDF (Edge's viewer) | yes -- probed 2026-08-18 via `pagetree` | tree *shape* only: each value is its own `Text` element with an id, in document order, under a `Group "Page 1"` | the grouping rule; end-to-end detection; live recording; every non-Edge viewer |
+
+### 9.3 Google Sheets is not a fifth proof point -- it is the standing exception
+
+Sheets must not be listed as evidence for the general mechanism, because the
+general mechanism cannot read it. Its grid is canvas-rendered: the whole window
+is ~56 nodes and the document subtree is two, `Document > Pane`. There are no
+per-cell elements, so there is nothing whose id could be counted.
+
+Sheets is therefore served by two *separate* paths, both deliberate:
+`read_position` resolves a spreadsheet through the Name Box and returns before
+`read_element_position` is ever reached, and record reading is done from the
+CSV export rather than from the tree. §1's requirement -- that the Name Box
+trick must not remain *the* detection mechanism -- is satisfied by it no longer
+being the only one, not by it having been removed.
+
+### 9.4 One caveat that qualifies every row in 9.2 (found 2026-08-18)
+
+`identity::tree`'s rule is "an id occurring more than once is structural; an id
+occurring exactly once is content", justified on the grounds that ids separate
+two coincidentally-equal values and names do not.
+
+**On Windows that justification does not hold.** `terminator-rs`'s
+`generate_element_id` hashes `automation_id + role + name + class_name`
+(`platforms/windows/utils.rs:23`), then truncates to six characters
+(`element.rs:464`). Where `automation_id` and `class_name` are empty -- which is
+the case for the text nodes on *every* surface in 9.2 -- the id is a hash of the
+text. Measured three ways on 2026-08-18: a PDF built with the dashboard's
+strings reproduced the dashboard's ids exactly, across a different format and
+renderer; the source above states the mechanism; and a capture in which two
+orders shared a product had both instances collapse to one id.
+
+The consequence is that two records that legitimately share a value have that
+value classified **structural** and refused by `locate` -- which is precisely
+the `$145.00` trap in §3's table, documented as avoided and in fact not avoided.
+`tree.rs`'s `records_are_not_merged_when_two_values_coincide` passes only
+because its fixture gives the two identical values two different ids, which the
+platform never does.
+
+So every row in 9.2 shows that the rule generalizes *across applications*. None
+of them shows that it is correct *within* an application whose records can
+repeat a value. That is an open defect, not a caveat to be worked around.
+
+### 9.5 Coverage of "any site" is not a state that can be reached
+
+**This is the part that must never be softened into a completion claim.**
+
+The mechanism being app-agnostic is a property of the *code*. It is not a
+guarantee about the *world*. Every application investigated so far has produced
+some version of "an element looks reliable and is not" -- four different shapes
+of it in §3, and a fifth on 2026-08-18 in §9.4 -- and each one was found only by
+capturing that application and looking. None was predicted from the ones before.
+
+It follows that:
+
+* **"Works on any site" is not a milestone, and there is no build that
+  achieves it.** Support is established one real application at a time, by
+  capturing it, running the rule against what came back, and recording what
+  broke.
+* **A surface is only as proven as the row in 9.2 says it is.** Reaching the
+  grouping rule is not the same as reaching a detected pattern, and neither is
+  the same as a live recording.
+* **Adding a surface can invalidate earlier ones.** §9.4 was found on the fifth
+  surface investigated and applies retroactively to the first four. Anything
+  written here is provisional in that direction, permanently.
+* **The correct way to describe this work, internally or to a user, is by
+  naming the applications it has been verified against and the depth of that
+  verification** -- never as general coverage, and never with a number of
+  supported sites, which would imply a countable set that closes.
+
+The honest summary, and the one to reuse: *the mechanism is general by
+construction and carries no per-application logic; it has been exercised
+against four real applications to four different depths, with one open defect
+affecting all of them; and it is extended and re-verified one real application
+at a time, indefinitely.*
