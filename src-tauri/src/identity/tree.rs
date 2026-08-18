@@ -420,16 +420,39 @@ mod tests {
 
     /// Two records whose VALUES coincide must still be two records. The planning
     /// document's real example: one listing's unit price equals another's total.
+    ///
+    /// **THIS TEST FAILS, AND MUST BE LEFT FAILING.** It is pinned to an open
+    /// defect: see `docs/known-issues/element-id-is-a-hash-of-the-text.md`.
+    ///
+    /// It previously passed on an impossible fixture. The two identical
+    /// `"$145.00"` values were given two *different* ids (`201` and `202`),
+    /// which the platform never produces: `terminator-rs`'s
+    /// `generate_element_id` hashes `automation_id + role + name + class_name`,
+    /// so two elements with the same role and the same text always receive the
+    /// same id. Measured 2026-08-18 — a PDF containing two orders for
+    /// `"Ceramic Mug Set"` reported `id=136415` for both.
+    ///
+    /// So the ids below are now what the platform actually reports, and the
+    /// assertion is what the rule is supposed to guarantee. The gap between
+    /// them is the defect. Both values collapse to one id, `classify` calls
+    /// that id structural, and `records` therefore yields no records at all.
+    ///
+    /// Do not "fix" this by relaxing the assertion or by restoring the two-id
+    /// fixture. The assertion states the requirement; the fixture states the
+    /// platform. Neither is negotiable, and `#[ignore]` would hide the one
+    /// case that proves the rule is unsound.
     #[test]
     fn records_are_not_merged_when_two_values_coincide() {
         let tree = vec![
             n("100", "Text", "PRICE"),
             n("201", "Text", "$145.00"),
             n("100", "Text", "PRICE"),
-            n("202", "Text", "$145.00"),
+            // Same role, same text, therefore the SAME id. This is the line
+            // that used to read `n("202", …)` and made the test vacuous.
+            n("201", "Text", "$145.00"),
         ];
         let recs = records(&tree);
-        assert_eq!(recs.len(), 2, "identical values, different elements");
+        assert_eq!(recs.len(), 2, "identical values, different records");
     }
 
     /// A tree with no repetition has no structural elements, so it yields no
