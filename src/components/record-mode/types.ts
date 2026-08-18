@@ -25,6 +25,13 @@ export type CaptureSummary = {
   excluded_count: number;
   unmapped_events: number;
   /**
+   * Events the recorder emitted that capture never saw. Zero is the only good
+   * value, and it is distinct from `unmapped_events`: an unmapped event was
+   * seen and deliberately not turned into an action, while a lost one was never
+   * seen at all and may have been one.
+   */
+  events_lost: number;
+  /**
    * Pastes seen. Non-zero means the recording may be missing data movement
    * that no action records.
    */

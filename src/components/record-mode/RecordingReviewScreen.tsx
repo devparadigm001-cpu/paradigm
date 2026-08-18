@@ -140,6 +140,22 @@ export function RecordingReviewScreen({
           {summary.action_count} captured, {summary.excluded_count} excluded,{" "}
           {summary.unmapped_events} unmapped raw events.
         </p>
+        {/* Only ever rendered when something was lost. A recording that saw
+            everything says so by not raising the subject -- but the number is
+            in the log either way, including the zero, so "nothing was lost" is
+            a positive result somewhere rather than merely an absence here. */}
+        {summary.events_lost > 0 ? (
+          <p
+            role="alert"
+            className="border-destructive/40 bg-destructive/10 text-destructive mt-2 rounded-md border p-3 text-center text-sm font-medium"
+          >
+            {summary.events_lost} event
+            {summary.events_lost === 1 ? " was" : "s were"} lost before capture
+            saw {summary.events_lost === 1 ? "it" : "them"}. This recording is
+            incomplete — actions may be missing with nothing here to show for
+            it.
+          </p>
+        ) : null}
       </div>
 
       {/* §4.12: the detected mapping is a new section at the TOP of the review

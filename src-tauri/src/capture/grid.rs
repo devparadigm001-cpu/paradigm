@@ -53,18 +53,39 @@ use super::stream::{ActionCandidate, ActionKind};
 
 // ------------------------------------------------------------------ timing --
 //
-// Two relaxed atomic adds per keystroke. This exists because the cost of
+// Two relaxed atomic adds per key event. This exists because the cost of
 // resolving the focused element on every key-down was flagged as suspected --
 // the observation came from a machine in an unusually loaded state, with no
 // user-facing symptom -- and "suspected" is not a number.
+//
+// Key-down and key-up are counted SEPARATELY because key-up sampling was added
+// to close the one-keystroke lag, and "it roughly doubles the calls" is exactly
+// the kind of assumption this counter exists to replace. Reported at session
+// stop, so a real recording produces the real number.
 static GRID_CALLS: AtomicU64 = AtomicU64::new(0);
 static GRID_MICROS: AtomicU64 = AtomicU64::new(0);
+static GRID_UP_CALLS: AtomicU64 = AtomicU64::new(0);
+static GRID_UP_MICROS: AtomicU64 = AtomicU64::new(0);
 
-/// (calls, total microseconds) spent in `observe_key` since the last reset.
+/// (calls, total microseconds) spent in `observe_key` since the last reset,
+/// both directions together.
 pub fn timing() -> (u64, u64) {
+    let (down, up) = timing_split();
+    (down.0 + up.0, down.1 + up.1)
+}
+
+/// The same numbers split as `(key_down, key_up)`, which is what says whether
+/// key-up sampling cost what it was expected to cost.
+pub fn timing_split() -> ((u64, u64), (u64, u64)) {
     (
-        GRID_CALLS.load(Ordering::Relaxed),
-        GRID_MICROS.load(Ordering::Relaxed),
+        (
+            GRID_CALLS.load(Ordering::Relaxed),
+            GRID_MICROS.load(Ordering::Relaxed),
+        ),
+        (
+            GRID_UP_CALLS.load(Ordering::Relaxed),
+            GRID_UP_MICROS.load(Ordering::Relaxed),
+        ),
     )
 }
 
@@ -72,6 +93,8 @@ pub fn timing() -> (u64, u64) {
 pub fn reset_timing() {
     GRID_CALLS.store(0, Ordering::Relaxed);
     GRID_MICROS.store(0, Ordering::Relaxed);
+    GRID_UP_CALLS.store(0, Ordering::Relaxed);
+    GRID_UP_MICROS.store(0, Ordering::Relaxed);
 }
 
 /// Does this name look like a spreadsheet cell reference (`A1`, `BC12`)?
@@ -344,18 +367,22 @@ impl GridCellWatcher {
         }
 
         let mut budget = 3000usize;
-        let mut cell = None;
-        let mut document = None;
-        collect_position(&root, 0, &mut budget, &mut cell, &mut document);
-        if let (Some(document), Some(cell)) = (document.clone(), cell.clone()) {
-            return Some((document, cell));
-        }
+        let mut scan = WindowScan::default();
+        collect_position(&root, 0, &mut budget, &mut scan);
 
-        // No Name Box, or no /d/ document id -- so this is not a spreadsheet.
-        // Fall back to element identity. Everything above is untouched: this
-        // runs only where the existing path found nothing, so a spreadsheet
-        // never reaches it.
-        self.read_element_position(&root, &focused)
+        match scan.decide() {
+            PositionRead::Spreadsheet { document, cell } => Some((document, cell)),
+            // A spreadsheet that would not read, or a walk that saw too little
+            // to say. Both return nothing, which is what this did before the
+            // element-identity path existed. Element identity cannot address a
+            // canvas grid -- it has no per-cell elements to address -- so
+            // reaching for it here yields the same ordinal for every cell and
+            // silently collapses distinct destinations into one.
+            PositionRead::SpreadsheetUnreadable | PositionRead::Inconclusive => None,
+            // A page that was never a spreadsheet. Everything above is
+            // untouched: this runs only where the Name Box was genuinely absent.
+            PositionRead::NotASpreadsheet => self.read_element_position(&root, &focused),
+        }
     }
 
     /// A position for a page that has no Name Box, expressed generally.
@@ -395,88 +422,137 @@ impl GridCellWatcher {
         Some((page, encode_element_ref(located.record, located.label.as_deref())))
     }
 
-    /// A key went down. Samples the editor, and emits when an edit finishes.
+    /// A key event. Samples the editor, and emits when an edit finishes.
     ///
-    /// Two things end an edit: a trigger key (Enter or Tab), and the editor
-    /// reporting a *different* cell than the one being tracked, which is how a
-    /// click into another cell mid-edit shows up.
+    /// Called for key-**down** and key-**up** alike, and the difference matters.
+    /// A key-down sample is taken before the OS has processed that key, so it
+    /// shows the editor as it was one keystroke ago; the character just typed is
+    /// only visible once the key comes back up. Sampling both ways is what keeps
+    /// the last character from being lost when an edit ends without a trigger
+    /// key -- by a window switch, by a click into another cell, or by the
+    /// session stopping. Measured: a value typed and then abandoned for another
+    /// window was recorded one character short, every time.
+    ///
+    /// Only a key-down can COMMIT. A key-up folds in what it sees and nothing
+    /// more, so a released Enter cannot end an edit its press already ended.
     pub fn observe_key(
         &mut self,
         key_code: u32,
+        is_key_down: bool,
         ctrl_pressed: bool,
+        alt_pressed: bool,
         timestamp_ms: u64,
     ) -> Option<ActionCandidate> {
         let started = std::time::Instant::now();
-        // Clipboard first: a copy has no editor to sample, and a paste's
-        // destination must be read BEFORE the sampling below can disturb
-        // anything. Only ever runs on Ctrl+C / Ctrl+V, so the ~50ms walk it
-        // costs is not on the typing path.
-        if ctrl_pressed && (key_code == KEY_C || key_code == KEY_V) {
-            if let Some(position) = self.read_position() {
-                self.pair_clipboard(key_code, position, timestamp_ms);
+        let out = if is_key_down {
+            // Clipboard first: a copy has no editor to sample, and a paste's
+            // destination must be read BEFORE the sampling below can disturb
+            // anything. Only ever runs on Ctrl+C / Ctrl+V, so the ~50ms walk it
+            // costs is not on the typing path -- and never on key-up, so the
+            // walk still happens once per clipboard action, not twice.
+            if ctrl_pressed && (key_code == KEY_C || key_code == KEY_V) {
+                if let Some(position) = self.read_position() {
+                    self.pair_clipboard(key_code, position, timestamp_ms);
+                }
             }
+            self.observe_key_inner(key_code, alt_pressed, timestamp_ms)
+        } else {
+            self.observe_key_up(timestamp_ms)
+        };
+        if is_key_down {
+            GRID_CALLS.fetch_add(1, Ordering::Relaxed);
+            GRID_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        } else {
+            GRID_UP_CALLS.fetch_add(1, Ordering::Relaxed);
+            GRID_UP_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        let out = self.observe_key_inner(key_code, timestamp_ms);
-        GRID_CALLS.fetch_add(1, Ordering::Relaxed);
-        GRID_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         out
     }
 
     fn observe_key_inner(
         &mut self,
         key_code: u32,
+        alt_pressed: bool,
         timestamp_ms: u64,
     ) -> Option<ActionCandidate> {
-        // Sample first: on a trigger key the editor is typically still alive at
-        // key-down, but relying on that is the mistake this module exists to
-        // avoid, so the sample that gets emitted is from an earlier keystroke.
-        let observed = self.sample();
-
-        if let Some((cell, text, ids)) = observed {
-            // Prefer identity from a click when there was one; fall back to the
-            // element's own, so keyboard-only editing is still identifiable.
-            let identifiers = if self.identifiers.is_empty() {
-                ids
-            } else {
-                self.identifiers.clone()
-            };
-            match self.current.as_mut() {
-                Some(edit) if edit.cell == cell => {
-                    edit.text = text;
-                    edit.keystrokes += 1;
-                }
-                Some(_) => {
-                    // Moved to a different cell without a trigger key.
-                    let finished = self.emit(timestamp_ms);
-                    self.current = Some(GridEdit {
-                        cell,
-                        text,
-                        identifiers,
-                        process_name: self.process_name.clone(),
-                        keystrokes: 1,
-                        started_ms: timestamp_ms,
-                    });
-                    return finished;
-                }
-                None => {
-                    self.current = Some(GridEdit {
-                        cell,
-                        text,
-                        identifiers,
-                        process_name: self.process_name.clone(),
-                        keystrokes: 1,
-                        started_ms: timestamp_ms,
-                    });
-                }
-            }
+        // Sample first, exactly as before. The key-up sample means this is no
+        // longer the only chance to see the last character, but a click into
+        // another cell still shows up here and nowhere else.
+        if let Absorbed::Switched(finished) = self.absorb_sample(timestamp_ms, true) {
+            return finished;
         }
 
-        if is_trigger_key(key_code) {
+        if is_trigger_key(key_code, alt_pressed) {
             return self.emit(timestamp_ms);
         }
         None
     }
 
+    /// A key came back up: the character it produced is now in the editor.
+    ///
+    /// Folds that in and nothing else. A key-up never commits, so an edit ends
+    /// only where it ended before this existed.
+    fn observe_key_up(&mut self, timestamp_ms: u64) -> Option<ActionCandidate> {
+        match self.absorb_sample(timestamp_ms, false) {
+            Absorbed::Switched(finished) => finished,
+            Absorbed::Continued | Absorbed::Nothing => None,
+        }
+    }
+
+    /// Take a fresh sample and fold it into the edit in flight.
+    ///
+    /// `counts_as_keystroke` is false for key-up, so the keystroke count in the
+    /// emitted detail keeps meaning "keys the user pressed" rather than doubling
+    /// now that both directions sample.
+    ///
+    /// The `is_cell_editor` gate inside `sample` is what keeps this from
+    /// inventing an edit out of a cell the user only moved through: with no
+    /// editor overlay open there is nothing to sample and this does nothing.
+    fn absorb_sample(&mut self, timestamp_ms: u64, counts_as_keystroke: bool) -> Absorbed {
+        let Some((cell, text, ids)) = self.sample() else {
+            return Absorbed::Nothing;
+        };
+        // Prefer identity from a click when there was one; fall back to the
+        // element's own, so keyboard-only editing is still identifiable.
+        let identifiers = if self.identifiers.is_empty() {
+            ids
+        } else {
+            self.identifiers.clone()
+        };
+        match self.current.as_mut() {
+            Some(edit) if edit.cell == cell => {
+                edit.text = text;
+                if counts_as_keystroke {
+                    edit.keystrokes += 1;
+                }
+                Absorbed::Continued
+            }
+            Some(_) => {
+                // Moved to a different cell without a trigger key.
+                let finished = self.emit(timestamp_ms);
+                self.current = Some(GridEdit {
+                    cell,
+                    text,
+                    identifiers,
+                    process_name: self.process_name.clone(),
+                    keystrokes: 1,
+                    started_ms: timestamp_ms,
+                });
+                Absorbed::Switched(finished)
+            }
+            None => {
+                self.current = Some(GridEdit {
+                    cell,
+                    text,
+                    identifiers,
+                    process_name: self.process_name.clone(),
+                    keystrokes: 1,
+                    started_ms: timestamp_ms,
+                });
+                Absorbed::Continued
+            }
+        }
+    }
     /// Emit whatever edit is in flight. Called when the session stops.
     pub fn flush(&mut self, timestamp_ms: u64) -> Option<ActionCandidate> {
         self.emit(timestamp_ms)
@@ -642,16 +718,80 @@ fn collect_nodes(
     }
 }
 
-/// which is what keeps the measured cost at tens of milliseconds rather than a
-/// full-window walk.
-fn collect_position(
-    el: &UIElement,
-    depth: usize,
-    budget: &mut usize,
-    cell: &mut Option<String>,
-    document: &mut Option<String>,
-) {
-    if *budget == 0 || depth > 14 || (cell.is_some() && document.is_some()) {
+/// What one window walk established, kept together because one walk answers
+/// several questions at once.
+#[derive(Debug, Default, Clone)]
+struct WindowScan {
+    /// The Name Box's cell reference, if it read.
+    cell: Option<String>,
+    /// The `/d/<id>/` document id from the address bar, if there was one.
+    document: Option<String>,
+    /// A Name Box group was **present in the tree**, whether or not it read.
+    ///
+    /// This is the fact that separates "not a spreadsheet" from "a spreadsheet
+    /// having a bad moment", and they are not the same page at all.
+    name_box_seen: bool,
+    /// The walk stopped early on budget, so it saw only part of the tree and
+    /// the absence of a Name Box proves nothing.
+    truncated: bool,
+}
+
+/// What a scan licenses the caller to do.
+#[derive(Debug, PartialEq, Eq)]
+enum PositionRead {
+    /// A spreadsheet, read successfully.
+    Spreadsheet { document: String, cell: String },
+    /// A Name Box is there and the walk could not turn it into a position --
+    /// no readable reference, or no document id to disambiguate two windows
+    /// both titled "Untitled spreadsheet".
+    ///
+    /// The honest answer is nothing, exactly as it was before the
+    /// element-identity path existed. Falling back to element identity here is
+    /// what produced the live failure this distinction exists to prevent: see
+    /// `a_sheets_window_whose_name_box_will_not_read_yields_no_position`.
+    SpreadsheetUnreadable,
+    /// No Name Box anywhere in a walk that saw the whole tree. A page that was
+    /// never a spreadsheet, and the only case element identity may address.
+    NotASpreadsheet,
+    /// The walk was truncated, so nothing can be concluded from what it did
+    /// not find. Treated as a failed read rather than as a non-spreadsheet,
+    /// because "I did not look everywhere" is not evidence of absence.
+    Inconclusive,
+}
+
+impl WindowScan {
+    fn decide(&self) -> PositionRead {
+        if let (Some(document), Some(cell)) = (self.document.clone(), self.cell.clone()) {
+            return PositionRead::Spreadsheet { document, cell };
+        }
+        // A Name Box in the tree settles what kind of surface this is, whatever
+        // else the walk did or did not manage to read.
+        if self.name_box_seen {
+            return PositionRead::SpreadsheetUnreadable;
+        }
+        if self.truncated {
+            return PositionRead::Inconclusive;
+        }
+        PositionRead::NotASpreadsheet
+    }
+}
+
+/// Walk the window for the two facts a spreadsheet position needs, and for
+/// whether a Name Box was there at all.
+///
+/// Stops as soon as both facts are in hand, which is what keeps the measured
+/// cost at tens of milliseconds rather than a full-window walk.
+///
+/// Depth truncation is ordinary and is not recorded: real web trees are deeper
+/// than 14 and the Name Box and address bar both sit well above that. Running
+/// out of BUDGET is different -- it means whole branches went unvisited -- and
+/// that is recorded, because a Name Box could have been in one of them.
+fn collect_position(el: &UIElement, depth: usize, budget: &mut usize, scan: &mut WindowScan) {
+    if *budget == 0 {
+        scan.truncated = true;
+        return;
+    }
+    if depth > 14 || (scan.cell.is_some() && scan.document.is_some()) {
         return;
     }
     *budget -= 1;
@@ -660,13 +800,18 @@ fn collect_position(
     let trimmed = name.trim();
 
     // The Name Box group holds an Edit reporting the selected cell reference.
-    if cell.is_none() && trimmed.starts_with("Name box") {
-        if let Ok(children) = el.children() {
-            if let Some(edit) = children.into_iter().find(|c| c.role() == "Edit") {
-                let text = edit.text(0).unwrap_or_default();
-                let reference = text.trim();
-                if looks_like_cell_ref(split_sheet_ref(reference).1) {
-                    *cell = Some(reference.to_string());
+    if trimmed.starts_with("Name box") {
+        // Seen is recorded before the read is attempted, because the whole
+        // point is that a Name Box which fails to read is still a Name Box.
+        scan.name_box_seen = true;
+        if scan.cell.is_none() {
+            if let Ok(children) = el.children() {
+                if let Some(edit) = children.into_iter().find(|c| c.role() == "Edit") {
+                    let text = edit.text(0).unwrap_or_default();
+                    let reference = text.trim();
+                    if looks_like_cell_ref(split_sheet_ref(reference).1) {
+                        scan.cell = Some(reference.to_string());
+                    }
                 }
             }
         }
@@ -674,12 +819,12 @@ fn collect_position(
 
     // The address bar carries /d/<id>/, which is the only thing that separates
     // two documents both titled "Untitled spreadsheet".
-    if document.is_none() && trimmed == "Address and search bar" {
+    if scan.document.is_none() && trimmed == "Address and search bar" {
         let url = el.text(0).unwrap_or_default();
         if let Some(rest) = url.split("/d/").nth(1) {
             if let Some(id) = rest.split('/').next() {
                 if !id.is_empty() {
-                    *document = Some(id.to_string());
+                    scan.document = Some(id.to_string());
                 }
             }
         }
@@ -687,16 +832,40 @@ fn collect_position(
 
     if let Ok(children) = el.children() {
         for child in children {
-            collect_position(&child, depth + 1, budget, cell, document);
-            if cell.is_some() && document.is_some() {
+            collect_position(&child, depth + 1, budget, scan);
+            if scan.cell.is_some() && scan.document.is_some() {
                 return;
             }
         }
     }
 }
 
+/// What one sample did to the edit in flight.
+///
+/// `Switched` is the only outcome that ends an edit, and it carries whatever
+/// that ending produced -- which may be nothing, when the finished edit had no
+/// text worth emitting. Keeping that `Option` inside the variant is what lets
+/// the caller return early on a switch without a trigger key ever being
+/// considered, exactly as it did before key-up sampling existed.
+enum Absorbed {
+    /// No editor open, so there was nothing to fold in.
+    Nothing,
+    /// Folded into the edit in flight.
+    Continued,
+    /// The sample named a different cell, so the previous edit ended here.
+    Switched(Option<ActionCandidate>),
+}
+
 /// Enter and Tab, the two keys that commit a cell edit.
-fn is_trigger_key(key_code: u32) -> bool {
+///
+/// Alt+Tab is a window switch, not a commit, and the key code alone cannot tell
+/// the two apart -- the recorder carries `alt_pressed` on the same event, so the
+/// question is answerable rather than guessable. Treating a window switch as a
+/// commit ends the edit at a moment the user did not choose.
+fn is_trigger_key(key_code: u32, alt_pressed: bool) -> bool {
+    if alt_pressed {
+        return false;
+    }
     key_code == 0x0D || key_code == 0x09
 }
 
@@ -960,11 +1129,21 @@ mod tests {
 
     #[test]
     fn only_enter_and_tab_commit_a_cell() {
-        assert!(is_trigger_key(0x0D));
-        assert!(is_trigger_key(0x09));
+        assert!(is_trigger_key(0x0D, false));
+        assert!(is_trigger_key(0x09, false));
         for other in [0x41u32, 0x30, 0x1B, 0x08] {
-            assert!(!is_trigger_key(other));
+            assert!(!is_trigger_key(other, false));
         }
+    }
+
+    #[test]
+    fn alt_tab_is_a_window_switch_and_never_a_commit() {
+        // The live OrderFlow recording ended a cell edit by leaving for the
+        // browser. A Tab arriving with Alt held is that switch, not a commit,
+        // and committing there ends the edit on a keystroke the user did not
+        // aim at the cell.
+        assert!(!is_trigger_key(0x09, true), "Alt+Tab is not a Tab");
+        assert!(!is_trigger_key(0x0D, true), "Alt+Enter is not a commit either");
     }
 
     #[test]
@@ -1000,5 +1179,88 @@ mod tests {
         // observed means no candidate, whatever keys arrive.
         let mut w = GridCellWatcher::new();
         assert!(w.flush(0).is_none());
+    }
+
+    /// The exact case that produced the false collapse in the live OrderFlow
+    /// recording, and the whole reason this distinction exists.
+    ///
+    /// A Google Sheets window whose Name Box will not read is still a
+    /// spreadsheet. Routing it to element identity is not a harmless fallback:
+    /// Sheets exposes no per-cell elements, so `identity::tree::locate` returns
+    /// the same ordinal for every cell in the document -- measured as `el/0/`
+    /// against that module's own canvas fixture. Three pastes into three
+    /// different rows then encode ONE destination, `detect` collapses them in
+    /// its corrections map, and the Rule of 3 reports `TooFewExamples` with one
+    /// record where there were three. A wrong destination wearing the
+    /// appearance of a right one.
+    #[test]
+    fn a_sheets_window_whose_name_box_will_not_read_yields_no_position() {
+        let scan = WindowScan {
+            cell: None,
+            document: Some("1AbCdEfGhIjK".to_string()),
+            name_box_seen: true,
+            truncated: false,
+        };
+        assert_eq!(
+            scan.decide(),
+            PositionRead::SpreadsheetUnreadable,
+            "a spreadsheet having a bad moment must never reach element identity"
+        );
+    }
+
+    #[test]
+    fn a_name_box_that_read_without_a_document_id_is_still_a_spreadsheet() {
+        // Both halves are required for a position, but failing the second half
+        // does not turn the page into something element identity may address.
+        let scan = WindowScan {
+            cell: Some("B7".to_string()),
+            document: None,
+            name_box_seen: true,
+            truncated: false,
+        };
+        assert_eq!(scan.decide(), PositionRead::SpreadsheetUnreadable);
+    }
+
+    #[test]
+    fn a_page_with_no_name_box_anywhere_routes_to_element_identity() {
+        // The case the element path was built for: a dashboard, an inbox, a
+        // listing page. Unchanged by this gate.
+        let scan = WindowScan {
+            cell: None,
+            document: None,
+            name_box_seen: false,
+            truncated: false,
+        };
+        assert_eq!(scan.decide(), PositionRead::NotASpreadsheet);
+    }
+
+    #[test]
+    fn a_readable_name_box_still_reads_exactly_as_before() {
+        let scan = WindowScan {
+            cell: Some("Sheet2!B7".to_string()),
+            document: Some("1AbCdEfGhIjK".to_string()),
+            name_box_seen: true,
+            truncated: false,
+        };
+        assert_eq!(
+            scan.decide(),
+            PositionRead::Spreadsheet {
+                document: "1AbCdEfGhIjK".to_string(),
+                cell: "Sheet2!B7".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_truncated_walk_proves_nothing_about_a_missing_name_box() {
+        // "I did not look everywhere" is not evidence of absence, so this fails
+        // closed rather than claiming the page is not a spreadsheet.
+        let scan = WindowScan {
+            cell: None,
+            document: None,
+            name_box_seen: false,
+            truncated: true,
+        };
+        assert_eq!(scan.decide(), PositionRead::Inconclusive);
     }
 }

@@ -28,6 +28,7 @@ pub mod stream;
 pub mod grid;
 pub mod text;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,6 +76,33 @@ pub struct CaptureReport {
     /// not "data was definitely lost".
     /// See docs/known-issues/complex-web-grid-capture-unreliable.md.
     pub pastes_observed: usize,
+    /// Events the recorder emitted that **capture never saw**.
+    ///
+    /// Zero is the expected value. A non-zero count means the recording is
+    /// incomplete, and specifically that actions may be missing with nothing
+    /// else to show for it.
+    ///
+    /// This exists because the loss is otherwise **silent**. The pump consumes
+    /// a `tokio::broadcast` of capacity 1000; a receiver that falls behind gets
+    /// `RecvError::Lagged(n)`, and the recorder's own `event_stream` swallows
+    /// it -- `tracing::error!("⚠️ Event stream LAGGED!")` then `continue`, with
+    /// the skipped events gone. Nothing installs a `tracing` subscriber in this
+    /// app, so that message goes nowhere. The pump cannot detect the gap
+    /// either: it only ever sees the events it was yielded.
+    ///
+    /// So it is measured from outside. A second subscription is taken on the
+    /// same broadcast which does nothing but count -- no UI Automation reads,
+    /// no locks -- and therefore cannot lag. The difference between what it saw
+    /// and what the pump handled is this number.
+    ///
+    /// Two causes are deliberately not separated, because both mean the same
+    /// thing to a recording: events dropped by broadcast lag, and events still
+    /// queued when `stop_session` cut the pump off. Neither reached capture.
+    ///
+    /// Sampling costs ~26ms per keystroke in a live grid session (measured
+    /// 2026-08-18: key-down 16785us, key-up 9261us), which is what makes
+    /// falling behind a real possibility rather than a theoretical one.
+    pub events_lost: usize,
     /// Copy → paste pairs seen this session: where a value came from, and where
     /// it went. Positions only, never content.
     ///
@@ -106,6 +134,12 @@ pub struct CaptureSession {
     watcher: Arc<Mutex<TextFieldWatcher>>,
     grid: Arc<Mutex<GridCellWatcher>>,
     pump: Option<JoinHandle<()>>,
+    /// Events the pump actually handled, and events that existed to be handled.
+    /// See `CaptureReport::events_lost` for why the second number is taken from
+    /// a separate subscription rather than from the pump.
+    handled: Arc<AtomicUsize>,
+    seen: Arc<AtomicUsize>,
+    census: Option<JoinHandle<()>>,
 }
 
 impl CaptureSession {
@@ -128,11 +162,26 @@ impl CaptureSession {
             ..Default::default()
         };
 
+        // One run's numbers are its own. `timing_split` is read at stop.
+        grid::reset_timing();
+
         let mut recorder = WorkflowRecorder::new(name.clone(), config);
 
         // Subscribe BEFORE start(): event_tx is a broadcast channel, so a
         // subscription created afterwards would miss everything in between.
         let mut events = Box::pin(recorder.event_stream());
+
+        // A second subscription on the same broadcast, for one purpose: to be
+        // fast enough that it cannot lag, so its count is the true number of
+        // events. The pump does UI Automation reads costing ~26ms per keystroke
+        // and CAN fall behind; when it does, the recorder drops the events and
+        // says so only through a `tracing` macro this app has no subscriber
+        // for. Comparing the two counts is what makes that loss visible.
+        //
+        // Deliberately does no work at all -- no locks, no reads, no mapping.
+        // Anything it did here would be a way for the measurement to acquire
+        // the same problem it exists to detect.
+        let mut census = Box::pin(recorder.event_stream());
 
         let stream = Arc::new(Mutex::new(CapturedStream::new(exclusions)));
         let unmapped = Arc::new(Mutex::new(0usize));
@@ -145,8 +194,23 @@ impl CaptureSession {
         let pump_pastes = Arc::clone(&pastes);
         let pump_watcher = Arc::clone(&watcher);
         let pump_grid = Arc::clone(&grid);
+
+        let handled = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let census_seen = Arc::clone(&seen);
+        let census = tokio::spawn(async move {
+            while census.next().await.is_some() {
+                census_seen.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let pump_handled = Arc::clone(&handled);
         let pump = tokio::spawn(async move {
             while let Some(event) = events.next().await {
+                // Counted before any work, so an event that arrives and is then
+                // cut off mid-processing still counts as reaching the pump. The
+                // number this feeds is about events that never arrived at all.
+                pump_handled.fetch_add(1, Ordering::Relaxed);
                 // Typed text is synthesised from focus transitions rather than
                 // taken from the recorder's own TextInputCompleted -- see
                 // `capture::text` for the measurements behind that. Emitted
@@ -209,6 +273,9 @@ impl CaptureSession {
             watcher,
             grid,
             pump: Some(pump),
+            handled,
+            seen,
+            census: Some(census),
         })
     }
 
@@ -224,6 +291,13 @@ impl CaptureSession {
         if let Some(pump) = self.pump.take() {
             pump.abort();
             let _ = pump.await;
+        }
+        // Stopped after the pump, never before: the census is the reference the
+        // pump is measured against, so cutting it off first would hide exactly
+        // the shortfall it exists to reveal.
+        if let Some(census) = self.census.take() {
+            census.abort();
+            let _ = census.await;
         }
 
         // The user may have stopped recording while still inside a field, so
@@ -255,11 +329,45 @@ impl CaptureSession {
         };
         let unmapped_events = *self.unmapped.lock().unwrap_or_else(|e| e.into_inner());
 
+        // The sampling cost, measured rather than assumed. Key-up sampling was
+        // added to close the one-keystroke lag, and this is where the price of
+        // it becomes a number: calls and mean microseconds for each direction,
+        // printed once per session so a real recording answers the question.
+        {
+            let ((dc, dus), (uc, uus)) = grid::timing_split();
+            let mean = |calls: u64, micros: u64| micros.checked_div(calls).unwrap_or(0);
+            eprintln!(
+                "[paradigm] grid sampling: key-down {dc} calls, {} us mean; key-up {uc} calls, {} us mean; total {} calls, {} us",
+                mean(dc, dus),
+                mean(uc, uus),
+                dc + uc,
+                dus + uus
+            );
+        }
+
+        // Events that existed versus events the pump got to. See
+        // `CaptureReport::events_lost`. Printed unconditionally, including the
+        // zero, so a clean recording is positively confirmed rather than merely
+        // not complained about -- the distinction that made the truncation
+        // defect opaque for so long.
+        let seen = self.seen.load(Ordering::Relaxed);
+        let handled = self.handled.load(Ordering::Relaxed);
+        let events_lost = seen.saturating_sub(handled);
+        eprintln!(
+            "[paradigm] event census: {seen} emitted, {handled} handled, {events_lost} LOST{}",
+            if events_lost == 0 {
+                ""
+            } else {
+                " -- this recording is incomplete"
+            }
+        );
+
         Ok(CaptureReport {
             session_name: self.name,
             actions,
             exclusions,
             unmapped_events,
+            events_lost,
             pastes_observed: *self.pastes.lock().unwrap_or_else(|e| e.into_inner()),
             // Drained rather than copied: the watcher must not hand the same
             // positions to a second reader, and nothing should hold them after
@@ -363,15 +471,25 @@ fn observe_grid(
     match event {
         // Keyboard events carry no `ui_element` -- measured, 0 of 15 key-downs
         // in a driven Sheets session -- so the watcher resolves focus itself.
-        // The modifier state is passed for one reason: Ctrl+C and Ctrl+V are
-        // where a value's SOURCE position can be observed, and only
-        // `capture::grid` knows what a spreadsheet cell is. One extra
-        // parameter through the seam that already exists, exactly as
-        // `note_click` took one -- the generic `to_candidate` path still knows
-        // nothing about spreadsheets or clipboards.
-        WorkflowEvent::Keyboard(e) if e.is_key_down => grid.observe_key(
+        // The modifier state is passed for two reasons now: Ctrl+C and Ctrl+V
+        // are where a value's SOURCE position can be observed, and Alt+Tab is a
+        // window switch that must not be mistaken for a committing Tab. Only
+        // `capture::grid` knows what a spreadsheet cell is -- the generic
+        // `to_candidate` path still knows nothing about spreadsheets,
+        // clipboards or modifiers.
+        //
+        // Key-UP events are forwarded too, and the `is_key_down` guard that
+        // used to sit here is gone. A key-down samples the editor before the OS
+        // has processed that key, so the character just typed is visible only on
+        // the way back up; dropping key-up is what recorded a value one
+        // character short whenever an edit ended without Enter or Tab. The text
+        // watcher above still takes key-downs only -- it reads its element when
+        // the edit ends, so it never had the lag.
+        WorkflowEvent::Keyboard(e) => grid.observe_key(
             e.key_code,
+            e.is_key_down,
             e.ctrl_pressed,
+            e.alt_pressed,
             e.metadata.timestamp.unwrap_or_else(now_ms),
         ),
 

@@ -66,6 +66,14 @@ pub struct CaptureSummary {
     pub action_count: usize,
     pub excluded_count: usize,
     pub unmapped_events: usize,
+    /// Events the recorder emitted that capture never saw. **Zero is the only
+    /// good value**, and it is distinct from `unmapped_events`: an unmapped
+    /// event was seen and deliberately not turned into an action, while a lost
+    /// one was never seen at all and may have been an action.
+    ///
+    /// See `CaptureReport::events_lost` for how it is measured and why it
+    /// cannot be observed from inside the pump.
+    pub events_lost: usize,
     /// Pastes seen. Non-zero means the recording may be missing data movement
     /// that no action records -- see `CaptureReport::pastes_observed`.
     pub pastes_observed: usize,
@@ -340,6 +348,7 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
         action_count: report.actions.len(),
         excluded_count: report.exclusions.len(),
         unmapped_events: report.unmapped_events,
+        events_lost: report.events_lost,
         pastes_observed: report.pastes_observed,
         actions: view_of(&report.actions, &policy),
         template,
