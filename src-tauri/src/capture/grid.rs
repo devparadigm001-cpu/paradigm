@@ -398,6 +398,35 @@ impl GridCellWatcher {
         }
     }
 
+    /// The user said, explicitly, that this is a source value.
+    ///
+    /// The general marker. Every other route into `pending_source` is
+    /// copy-shaped -- a `Ctrl+C`, or the clipboard changing -- which means a
+    /// workflow with no copying in it can mark nothing, however repetitive it
+    /// is. Reading a value off a page and typing it somewhere else is a real
+    /// workflow and produced no source link at all before this existed.
+    ///
+    /// Returns whether a position could actually be read. **`false` is common
+    /// and is not an error**: `read_position` resolves a spreadsheet through the
+    /// Name Box and any other page through element identity, and a surface that
+    /// offers neither -- a PDF viewer, a native app with a shallow tree -- has
+    /// no position to give. The caller is expected to tell the user, because a
+    /// marker that silently does nothing is worse than no marker.
+    ///
+    /// Sets `last_copy_key_ms` for the same reason the `Ctrl+C` path does: an
+    /// explicit mark is at least as authoritative as an inferred copy, and must
+    /// not be overwritten by a clipboard event arriving behind it.
+    pub fn note_marked_source(&mut self, timestamp_ms: u64) -> bool {
+        self.last_copy_key_ms = Some(timestamp_ms);
+        match self.read_position() {
+            Some(position) => {
+                self.pair_clipboard(KEY_C, position, timestamp_ms);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The focused window's document id and selected cell, read synchronously.
     ///
     /// Measured, and the reason this is a small change rather than a
@@ -1058,6 +1087,30 @@ mod tests {
             w.take_links().is_empty(),
             "only a real copy may arm a paste"
         );
+    }
+
+    /// An explicit mark is the most authoritative statement of intent there is,
+    /// so a clipboard event arriving behind it must not replace its position --
+    /// and the marked source must still feed the paste that follows.
+    ///
+    /// Exercises what `note_marked_source` does either side of its live read,
+    /// which is the part that cannot run without a real desktop.
+    #[test]
+    fn an_explicit_mark_survives_a_clipboard_event_behind_it() {
+        let mut w = GridCellWatcher::new();
+        w.last_copy_key_ms = Some(1_000);
+        w.pair_clipboard(KEY_C, pos("orders", "C2"), 1_000);
+
+        assert!(
+            !w.clipboard_needs_own_read(1_300),
+            "the monitor must stand down after a deliberate mark"
+        );
+
+        w.pair_clipboard(KEY_V, pos("book", "B2"), 1_400);
+        let links = w.take_links();
+        assert_eq!(links.len(), 1, "the mark armed exactly one paste");
+        assert_eq!(links[0].source_cell, "C2");
+        assert_eq!(links[0].destination_cell, "B2");
     }
 
     /// A copy made with no keystroke -- menu, right-click, a Copy button -- is

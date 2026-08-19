@@ -23,10 +23,32 @@ use capture::{CaptureSession, CapturedAction};
 /// separate "shortcut path" through the backend.
 pub const RECORD_MODE_TOGGLE_SHORTCUT_EVENT: &str = "record-mode:toggle-shortcut";
 
-/// The one global shortcut Phase 1 wires up. A reasonable default, not a
-/// locked binding -- customization is an explicit later-pass item.
+/// Emitted when the source-marker shortcut fires during a recording. The
+/// payload is whether a position could actually be read, because a marker the
+/// user cannot tell failed is worse than no marker at all.
+pub const SOURCE_MARK_EVENT: &str = "record-mode:source-marked";
+
+/// A reasonable default, not a locked binding -- customization is an explicit
+/// later-pass item.
 fn record_mode_toggle_shortcut() -> Shortcut {
     Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyR)
+}
+
+/// "Mark what I am looking at as a source value."
+///
+/// The general marker, and the reason it exists: every other way to mark a
+/// source is copy-shaped. `Ctrl+C` marks one, and so now does any other copy
+/// gesture via the clipboard monitor -- but a workflow where the user *reads* a
+/// value and types it somewhere else involves no copy at all, and marked
+/// nothing. Those are ordinary workflows, not edge cases.
+///
+/// `M` for mark, alongside `R` for record. **A global shortcut takes the
+/// combination away from whatever is in front**, so this is a default to be
+/// changed rather than a claim that `Ctrl+Shift+M` is free; it collides with
+/// at least one browser devtools binding. Registration failure is already
+/// non-fatal, which is the right behaviour for a binding someone else holds.
+fn mark_source_shortcut() -> Shortcut {
+    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyM)
 }
 
 /// Everything the commands need, managed once at startup.
@@ -138,13 +160,43 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
-                    if event.state() == ShortcutState::Pressed
-                        && shortcut == &record_mode_toggle_shortcut()
-                    {
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    if shortcut == &record_mode_toggle_shortcut() {
                         if let Err(e) = app.emit(RECORD_MODE_TOGGLE_SHORTCUT_EVENT, ()) {
                             eprintln!(
                                 "[paradigm] failed to emit {RECORD_MODE_TOGGLE_SHORTCUT_EVENT}: {e}"
                             );
+                        }
+                        return;
+                    }
+                    if shortcut == &mark_source_shortcut() {
+                        // Read here, not after a round trip through the webview:
+                        // the whole point is "what is focused AT THE KEYPRESS".
+                        let state = app.state::<AppState>();
+                        // `None` means no recording is running, and nothing is
+                        // reported for it. The combination is global, so it
+                        // fires whether or not this app is doing anything, and
+                        // a notification every time someone presses it in
+                        // another program would be noise.
+                        let marked = match state.session.lock() {
+                            Ok(guard) => guard
+                                .as_ref()
+                                .map(|session| session.mark_source(capture::now_ms())),
+                            Err(_) => Some(false),
+                        };
+                        if let Some(marked) = marked {
+                            if !marked {
+                                eprintln!(
+                                    "[paradigm] source mark: no position could be read from the \
+                                     focused surface -- it exposes neither a Name Box nor \
+                                     resolvable element identity"
+                                );
+                            }
+                            if let Err(e) = app.emit(SOURCE_MARK_EVENT, marked) {
+                                eprintln!("[paradigm] failed to emit {SOURCE_MARK_EVENT}: {e}");
+                            }
                         }
                     }
                 })
@@ -158,6 +210,15 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
                 eprintln!(
                     "[paradigm] could not register the Record Mode global shortcut \
                      (Ctrl+Shift+R): {e}"
+                );
+            }
+            // Same best-effort rule, and more likely to be refused: Ctrl+Shift+M
+            // is a binding other applications also want. Failing to get it costs
+            // the marker, not the recording.
+            if let Err(e) = app.global_shortcut().register(mark_source_shortcut()) {
+                eprintln!(
+                    "[paradigm] could not register the source-marker global shortcut \
+                     (Ctrl+Shift+M): {e}"
                 );
             }
 

@@ -397,6 +397,27 @@ impl CaptureSession {
         })
     }
 
+    /// Mark the currently focused position as a source, on the user's explicit
+    /// say-so. Returns whether a position could be read.
+    ///
+    /// Called from the global-shortcut handler rather than through the frontend,
+    /// which is a deliberate departure from how the Record Mode shortcut works.
+    /// That one emits an event and lets the UI run the same flow the button
+    /// runs, because *when* it happens does not matter to a millisecond. This
+    /// one is a reading of "what is focused right now", so a round trip through
+    /// the webview would resolve the position after the round trip rather than
+    /// at the keypress.
+    ///
+    /// Briefly locks the same watcher the pump uses. The lock is held for one
+    /// position read; the pump's own hold is per event, so the worst case is
+    /// that one of them waits for the other.
+    pub fn mark_source(&self, timestamp_ms: u64) -> bool {
+        self.grid
+            .lock()
+            .map(|mut g| g.note_marked_source(timestamp_ms))
+            .unwrap_or(false)
+    }
+
     /// Actions admitted so far, for live progress display.
     pub fn admitted_so_far(&self) -> usize {
         self.stream.lock().map(|s| s.len()).unwrap_or(0)
@@ -555,7 +576,7 @@ fn observe_grid(
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
