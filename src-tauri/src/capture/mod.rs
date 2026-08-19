@@ -155,9 +155,26 @@ impl CaptureSession {
             capture_ui_elements: true,
             record_text_input_completion: true,
             record_application_switches: true,
-            // Not needed for Phase 1 and each is another source of captured
-            // content we would have to gate.
-            record_clipboard: false,
+            // ON, so that a copy made by any gesture marks a source -- the
+            // right-click menu, an Edit menu, an application's own Copy button,
+            // Ctrl+Insert. The `Ctrl+C` hook in `capture::grid` sees only the
+            // keystroke, which is a keyboard-shaped hole in a mechanism that is
+            // supposed to be about "the user took this value".
+            record_clipboard: true,
+            // **Zero, and this is the §3 enforcement.** The recorder truncates
+            // clipboard content to this length before it builds the event, so
+            // at 0 the event carries an empty string and the copied VALUE never
+            // enters this process at all. Change detection is unaffected: the
+            // recorder hashes the *full* content before truncating, so a copy is
+            // still detected -- we get the trigger without the data.
+            //
+            // Enforcing it here rather than by remembering not to read
+            // `ClipboardEvent::content` is deliberate. A rule the type system
+            // cannot state should at least be stated where it cannot be
+            // forgotten.
+            max_clipboard_content_length: 0,
+            // Not needed for Phase 1 and another source of captured content we
+            // would have to gate.
             record_browser_tab_navigation: false,
             ..Default::default()
         };
@@ -519,6 +536,19 @@ fn observe_grid(
 
         WorkflowEvent::ApplicationSwitch(e) => {
             grid.flush(e.metadata.timestamp.unwrap_or_else(now_ms))
+        }
+
+        // A copy made by a gesture the keystroke hook cannot see. Marks a
+        // source position and produces no action of its own -- a copy is not
+        // something to replay, it is something that says where a value came
+        // from.
+        //
+        // `e.content` is deliberately never read. It is also empty: capture
+        // sets `max_clipboard_content_length` to 0, so the copied value never
+        // reaches this process. See `CaptureSession::start_session`.
+        WorkflowEvent::Clipboard(e) => {
+            grid.note_clipboard_copy(e.metadata.timestamp.unwrap_or_else(now_ms));
+            None
         }
 
         _ => None,

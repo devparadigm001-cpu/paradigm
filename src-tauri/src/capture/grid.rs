@@ -229,6 +229,14 @@ pub struct SourceLink {
 const KEY_C: u32 = 0x43;
 const KEY_V: u32 = 0x56;
 
+/// How long a `Ctrl+C` keeps the clipboard monitor from reading a position of
+/// its own. The monitor polls every 200ms and then resolves the focused element
+/// with a 200ms timeout, so its report of a keystroke copy can trail the
+/// keystroke by roughly 400ms before pump latency. One second covers that with
+/// room to spare, and the cost of covering it is stated on
+/// [`GridCellWatcher::clipboard_needs_own_read`].
+const COPY_KEY_GRACE_MS: u64 = 1000;
+
 /// Follows the transient cell editor and produces `Type` candidates.
 #[derive(Default)]
 pub struct GridCellWatcher {
@@ -242,6 +250,10 @@ pub struct GridCellWatcher {
     /// Where the last Ctrl+C happened: (document, cell). Held until the next
     /// copy replaces it, so one copy can legitimately feed several pastes.
     pending_source: Option<(String, String)>,
+    /// When the `Ctrl+C` hook last read a position, so the clipboard monitor
+    /// does not overwrite it with a worse one. See [`GridCellWatcher::
+    /// clipboard_needs_own_read`].
+    last_copy_key_ms: Option<u64>,
     /// Completed source -> destination pairs. Drained at stop.
     links: Vec<SourceLink>,
 }
@@ -329,6 +341,54 @@ impl GridCellWatcher {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Whether a clipboard change should read a position of its own.
+    ///
+    /// `Ctrl+C` fires **both** paths: the keystroke hook, and ~200ms later the
+    /// clipboard monitor noticing the content changed. Only the first is worth
+    /// having. The keystroke hook reads the position *synchronously, at the
+    /// keypress*; the monitor polls on a 200ms timer, so by the time it reports,
+    /// the user may already be moving to the destination and the focused element
+    /// is whatever they moved to. Letting the late one overwrite the early one
+    /// would make every `Ctrl+C` copy *worse* than before the monitor existed.
+    ///
+    /// So the monitor's job is strictly to cover gestures the keystroke hook
+    /// cannot see -- menu Copy, a right-click, a toolbar button -- and it stands
+    /// down whenever a copy keystroke has just been handled.
+    ///
+    /// The window is generous on purpose. Under it, a second copy made by menu
+    /// within the window is missed; over it, a plain `Ctrl+C` gets its accurate
+    /// position replaced by a stale one. Missing a source is recoverable -- the
+    /// paste simply records no link, which §4.1 already treats as an
+    /// observation to exclude. A *wrong* source is not: it puts a fabricated
+    /// example into a Rule-of-3 count.
+    fn clipboard_needs_own_read(&self, timestamp_ms: u64) -> bool {
+        match self.last_copy_key_ms {
+            Some(key_ms) => timestamp_ms.saturating_sub(key_ms) > COPY_KEY_GRACE_MS,
+            None => true,
+        }
+    }
+
+    /// A copy happened by some gesture other than `Ctrl+C`.
+    ///
+    /// **Carries no content, and cannot.** `max_clipboard_content_length` is set
+    /// to 0 in `capture::CaptureSession::start_session`, so the event this
+    /// responds to holds an empty string. This reads a *position* and nothing
+    /// else, exactly as the keystroke path does.
+    ///
+    /// The position is up to ~200ms stale -- the monitor's poll interval -- and
+    /// that is the honest cost of covering gestures with no keystroke. It is a
+    /// worse reading than the keystroke path's, which is why
+    /// [`Self::clipboard_needs_own_read`] keeps it out of the way when a real
+    /// keystroke was seen.
+    pub fn note_clipboard_copy(&mut self, timestamp_ms: u64) {
+        if !self.clipboard_needs_own_read(timestamp_ms) {
+            return;
+        }
+        if let Some(position) = self.read_position() {
+            self.pair_clipboard(KEY_C, position, timestamp_ms);
         }
     }
 
@@ -451,6 +511,15 @@ impl GridCellWatcher {
             // costs is not on the typing path -- and never on key-up, so the
             // walk still happens once per clipboard action, not twice.
             if ctrl_pressed && (key_code == KEY_C || key_code == KEY_V) {
+                if key_code == KEY_C {
+                    // Recorded whether or not the read below succeeds. The
+                    // point is that a copy KEYSTROKE happened and was handled
+                    // here; if its position could not be read, the clipboard
+                    // monitor reading a later, staler one is not an improvement.
+                    // A paste with no source records no link, which §4.1
+                    // already excludes -- a wrong source it would not.
+                    self.last_copy_key_ms = Some(timestamp_ms);
+                }
                 if let Some(position) = self.read_position() {
                     self.pair_clipboard(key_code, position, timestamp_ms);
                 }
@@ -978,6 +1047,61 @@ mod tests {
         assert!(
             w.take_links().is_empty(),
             "only a real copy may arm a paste"
+        );
+    }
+
+    /// A copy made with no keystroke -- menu, right-click, a Copy button -- is
+    /// the whole reason the clipboard monitor is consumed at all.
+    #[test]
+    fn a_clipboard_change_with_no_copy_keystroke_reads_its_own_position() {
+        let w = GridCellWatcher::new();
+        assert!(
+            w.clipboard_needs_own_read(5_000),
+            "nothing else marked this source, so the monitor must"
+        );
+    }
+
+    /// `Ctrl+C` fires the keystroke hook AND, ~200ms later, the clipboard
+    /// monitor. The keystroke read the position synchronously at the keypress;
+    /// the monitor's would be later and possibly from another window. The early,
+    /// accurate one must win.
+    #[test]
+    fn a_clipboard_change_just_after_ctrl_c_does_not_read_again() {
+        let mut w = GridCellWatcher::new();
+        w.last_copy_key_ms = Some(1_000);
+        assert!(!w.clipboard_needs_own_read(1_000), "same instant");
+        assert!(!w.clipboard_needs_own_read(1_200), "one poll interval later");
+        assert!(
+            !w.clipboard_needs_own_read(1_400),
+            "poll plus the element-resolution timeout"
+        );
+        assert!(
+            !w.clipboard_needs_own_read(2_000),
+            "the grace window is inclusive at its edge"
+        );
+    }
+
+    /// A later copy by menu is a genuinely new source and must be read, however
+    /// the previous one arrived.
+    #[test]
+    fn a_clipboard_change_well_after_ctrl_c_reads_again() {
+        let mut w = GridCellWatcher::new();
+        w.last_copy_key_ms = Some(1_000);
+        assert!(w.clipboard_needs_own_read(2_001), "past the grace window");
+        assert!(w.clipboard_needs_own_read(30_000), "much later");
+    }
+
+    /// Timestamps are not guaranteed monotonic across the recorder's threads,
+    /// and a subtraction that wrapped would suppress every later copy for the
+    /// rest of the session.
+    #[test]
+    fn a_clipboard_change_before_the_copy_key_does_not_underflow() {
+        let mut w = GridCellWatcher::new();
+        w.last_copy_key_ms = Some(5_000);
+        assert!(
+            !w.clipboard_needs_own_read(4_000),
+            "an earlier timestamp saturates to zero rather than wrapping to a \
+             huge difference that would read again"
         );
     }
 
