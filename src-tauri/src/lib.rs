@@ -187,7 +187,18 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
                             Err(_) => Some(false),
                         };
                         if let Some(marked) = marked {
-                            if !marked {
+                            // BOTH outcomes are logged, including the success.
+                            // A silent success cannot be told apart from a press
+                            // that never arrived -- this is a global chord that
+                            // another application may hold, and registration is
+                            // best-effort -- so "nothing in the log" has to mean
+                            // "it did not reach us" and nothing else. Same rule
+                            // as the event census printing its zero.
+                            if marked {
+                                eprintln!(
+                                    "[paradigm] source mark: position read, source armed"
+                                );
+                            } else {
                                 eprintln!(
                                     "[paradigm] source mark: no position could be read from the \
                                      focused surface -- it exposes neither a Name Box nor \
