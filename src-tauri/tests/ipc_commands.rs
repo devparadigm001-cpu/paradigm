@@ -264,6 +264,7 @@ fn gated_actions(names: &[&str]) -> Vec<CapturedAction> {
     let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
     for (i, name) in names.iter().enumerate() {
         stream.admit(ActionCandidate {
+            element_bounds: None,
             kind: ActionKind::Click,
             identifiers: vec!["paradigm-ipc-test.exe".into()],
             process_name: Some("paradigm-ipc-test.exe".into()),

@@ -474,6 +474,11 @@ impl TextFieldWatcher {
         let appended = payload.len() < current.len();
         let duration = timestamp_ms.saturating_sub(watched.started_ms);
         Some(ActionCandidate {
+            // Read at emit rather than at watch-start: the element is the one
+            // this watcher has been holding all along, and reading once when
+            // the edit ends costs one call per action instead of one per
+            // keystroke.
+            element_bounds: super::bounds_of(Some(&watched.element)),
             kind: ActionKind::Type,
             identifiers: watched.identifiers,
             process_name: watched.process_name,

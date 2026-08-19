@@ -589,6 +589,13 @@ fn to_candidate(event: &WorkflowEvent) -> Option<ActionCandidate> {
                 element_name: non_empty(&e.element_text),
                 payload: None,
                 detail: Some(format!("{:?}", e.interaction_type)),
+                // One UI Automation call, on an element the event already
+                // resolved. `click_position` is also on the event and is
+                // cheaper still, but it records where the user clicked rather
+                // than what they clicked -- two clicks on one element differ,
+                // and one click on each of two identical-looking elements may
+                // not. Bounds describe the element.
+                element_bounds: bounds_of(e.metadata.ui_element.as_ref()),
                 timestamp_ms: e.metadata.timestamp.unwrap_or_else(now_ms),
             })
         }
@@ -633,12 +640,30 @@ fn to_candidate(event: &WorkflowEvent) -> Option<ActionCandidate> {
                     .from_window_and_application_name
                     .as_ref()
                     .map(|from| format!("from {from:?}")),
+                // The window's own rectangle. Weaker identity than an
+                // element's -- two windows of one application often coincide --
+                // but it costs the same one call and a window switch is rare.
+                element_bounds: bounds_of(e.metadata.ui_element.as_ref()),
                 timestamp_ms: e.metadata.timestamp.unwrap_or_else(now_ms),
             })
         }
 
         _ => None,
     }
+}
+
+/// An element's rectangle, when it has one.
+///
+/// One UI Automation call, and only on events that produce an action -- never
+/// on the keystroke path, where `capture::grid` samples on every key in both
+/// directions and a per-key call would cost more than the whole identity read
+/// that was removed from it.
+///
+/// `None` is ordinary rather than exceptional: the event may carry no element,
+/// and an element may refuse to report bounds. Callers treat it as "no
+/// positional identity available", not as a failure.
+fn bounds_of(element: Option<&terminator::UIElement>) -> Option<(f64, f64, f64, f64)> {
+    element.and_then(|el| el.bounds().ok())
 }
 
 /// Every name we can get for the application owning an element.

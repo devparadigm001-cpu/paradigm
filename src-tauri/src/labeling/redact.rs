@@ -127,6 +127,7 @@ mod tests {
     fn action(kind: ActionKind, role: &str, name: &str, payload: Option<&str>) -> CapturedAction {
         let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
         stream.admit(ActionCandidate {
+            element_bounds: None,
             kind,
             identifiers: vec!["notepad.exe".into()],
             process_name: None,

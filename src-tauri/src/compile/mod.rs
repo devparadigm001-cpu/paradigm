@@ -221,6 +221,22 @@ fn compile_step(
     if let Some(detail) = &action.detail {
         payload["detail"] = json!(detail);
     }
+    // Positional identity, stored under `target` because that is what it
+    // identifies. A rectangle is a position and never content, so it is clean
+    // under §3 for the same reason a cell reference is.
+    //
+    // Stored rather than merely captured, deliberately. A recording carries two
+    // elements that say the same thing more often than it looks -- two records
+    // sharing a value -- and `name` cannot tell them apart. Neither can the
+    // platform's element id, which is a hash of role + name; see
+    // `docs/known-issues/element-id-is-a-hash-of-the-text.md`.
+    //
+    // Absent for playbooks recorded before this existed, and absent whenever the
+    // element would not report bounds. Consumers must treat missing as "no
+    // positional identity", never as an error.
+    if let Some((left, top, right, bottom)) = action.element_bounds {
+        payload["target"]["bounds"] = json!([left, top, right, bottom]);
+    }
 
     CompiledStep {
         id: Uuid::new_v4().to_string(),
@@ -259,6 +275,7 @@ mod tests {
         let mut s = CapturedStream::new(ExclusionList::from_patterns(["!never!"]));
         for (kind, role, name, payload) in items {
             s.admit(ActionCandidate {
+            element_bounds: None,
                 kind,
                 identifiers: vec!["app.exe".into()],
                 process_name: None,
@@ -332,6 +349,71 @@ mod tests {
         )]));
         assert!(pb.steps[0].action_payload_json.contains("hello world"));
         assert!(!pb.steps[0].payload_redacted);
+    }
+
+    /// Positional identity has to survive compilation, or it is captured and
+    /// then thrown away -- which is what happened to `detail`, and cost a whole
+    /// investigation to work around. See
+    /// `docs/known-issues/sheets-cell-edits-are-captured-by-both-watchers.md`.
+    #[test]
+    fn element_bounds_reach_the_stored_payload() {
+        let mut acts = actions(vec![(ActionKind::Click, "Text", "Ceramic Mug Set", None)]);
+        acts[0].element_bounds = Some((10.0, 20.0, 110.0, 44.0));
+        let pb = compile_default(&acts);
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&pb.steps[0].action_payload_json).expect("payload is json");
+        assert_eq!(
+            payload["target"]["bounds"],
+            json!([10.0, 20.0, 110.0, 44.0]),
+            "the rectangle identifies WHICH element, where the name cannot"
+        );
+    }
+
+    /// Two records sharing a value are the case the whole positional identity
+    /// exists for: identical names, identical roles, and on Windows an
+    /// identical platform id, because the id is a hash of role + name.
+    #[test]
+    fn two_elements_with_the_same_name_are_still_distinguishable() {
+        let mut acts = actions(vec![
+            (ActionKind::Click, "Text", "Ceramic Mug Set", None),
+            (ActionKind::Click, "Text", "Ceramic Mug Set", None),
+        ]);
+        acts[0].element_bounds = Some((10.0, 20.0, 110.0, 44.0));
+        acts[1].element_bounds = Some((10.0, 320.0, 110.0, 344.0));
+        let pb = compile_default(&acts);
+
+        let first: serde_json::Value =
+            serde_json::from_str(&pb.steps[0].action_payload_json).expect("json");
+        let second: serde_json::Value =
+            serde_json::from_str(&pb.steps[1].action_payload_json).expect("json");
+
+        assert_eq!(
+            first["target"]["name"], second["target"]["name"],
+            "the premise: the names really are identical"
+        );
+        assert_ne!(
+            first["target"]["bounds"], second["target"]["bounds"],
+            "and the positions are not"
+        );
+    }
+
+    /// An element that will not report bounds is ordinary, not an error, and
+    /// must not put a null into the payload for a consumer to trip over.
+    #[test]
+    fn a_step_without_bounds_carries_no_bounds_key() {
+        let pb = compile_default(&actions(vec![(
+            ActionKind::Click,
+            "Button",
+            "Save",
+            None,
+        )]));
+        let payload: serde_json::Value =
+            serde_json::from_str(&pb.steps[0].action_payload_json).expect("json");
+        assert!(
+            payload["target"].get("bounds").is_none(),
+            "absent, not null"
+        );
     }
 
     #[test]

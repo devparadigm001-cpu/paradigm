@@ -348,6 +348,7 @@ mod tests {
             crate::capture::ExclusionList::from_patterns(["!never!"]),
         );
         stream.admit(crate::capture::ActionCandidate {
+            element_bounds: None,
             kind: crate::capture::ActionKind::Click,
             identifiers: vec!["app.exe".into()],
             process_name: None,

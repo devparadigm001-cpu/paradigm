@@ -2905,6 +2905,7 @@ async fn skiprun_mode() -> ExitCode {
         paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
+            element_bounds: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -3161,6 +3162,7 @@ async fn skiptest_mode() -> ExitCode {
             paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
         );
         stream.admit(paradigm_lib::capture::ActionCandidate {
+            element_bounds: None,
             kind: paradigm_lib::capture::ActionKind::Click,
             identifiers: vec!["probe".into()],
             process_name: None,
@@ -5920,6 +5922,7 @@ async fn ambigreplay_mode() -> ExitCode {
         (ActionKind::Type, "Edit", "AmbigField", Some("ambig")),
     ] {
         stream.admit(ActionCandidate {
+            element_bounds: None,
             kind,
             identifiers: vec![recorded_window.clone()],
             process_name: Some(format!("{browser}.exe")),
@@ -6214,6 +6217,7 @@ async fn resolveorder_mode() -> ExitCode {
         ),
     ] {
         stream.admit(ActionCandidate {
+            element_bounds: None,
             kind,
             identifiers: vec![recorded_window.clone()],
             process_name: Some(format!("{browser}.exe")),
@@ -11012,6 +11016,7 @@ async fn sheetsqualified_mode() -> ExitCode {
     let build = |name: &str, text: &str, title: &str| {
         let mut s = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
         s.admit(ActionCandidate {
+            element_bounds: None,
             kind: ActionKind::Type,
             identifiers: vec!["msedge.exe".into()],
             process_name: Some("msedge.exe".into()),
@@ -11850,6 +11855,7 @@ async fn sheetsscopefix_mode() -> ExitCode {
     // ---- the playbook: navigate to A, then click ITS Sheet1 tab -------------
     let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
     stream.admit(ActionCandidate {
+            element_bounds: None,
         kind: ActionKind::Navigate,
         identifiers: vec![title_a.clone()],
         process_name: Some("msedge.exe".into()),
@@ -11860,6 +11866,7 @@ async fn sheetsscopefix_mode() -> ExitCode {
         timestamp_ms: 0,
     });
     stream.admit(ActionCandidate {
+            element_bounds: None,
         kind: ActionKind::Click,
         identifiers: vec![title_a.clone()],
         process_name: Some("msedge.exe".into()),
@@ -12153,6 +12160,7 @@ async fn sheetsreplaytab_mode() -> ExitCode {
     // ---- the playbook, built from the REAL captured shape -------------------
     let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
     stream.admit(ActionCandidate {
+            element_bounds: None,
         kind: ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: Some("msedge.exe".into()),
@@ -13841,6 +13849,7 @@ async fn seedplaybooks_mode() -> ExitCode {
 
     let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
     stream.admit(ActionCandidate {
+            element_bounds: None,
         kind: ActionKind::Click,
         identifiers: vec!["probe.exe".into()],
         process_name: Some("probe.exe".into()),
@@ -15010,6 +15019,7 @@ async fn templatedrun_mode() -> ExitCode {
         paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
+            element_bounds: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -15431,6 +15441,7 @@ async fn templatedpreview_mode() -> ExitCode {
     );
     for name in ["Next", "Back"] {
         stream.admit(paradigm_lib::capture::ActionCandidate {
+            element_bounds: None,
             kind: paradigm_lib::capture::ActionKind::Click,
             identifiers: vec!["msedge.exe".into()],
             process_name: None,
@@ -15904,6 +15915,7 @@ async fn templateddrift_mode() -> ExitCode {
         paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
+            element_bounds: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -16362,6 +16374,7 @@ async fn templatedbatch_mode() -> ExitCode {
         paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
+            element_bounds: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -16920,6 +16933,7 @@ async fn uiflow_mode() -> ExitCode {
         paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
+            element_bounds: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -17417,6 +17431,7 @@ async fn templatedcorrection_mode() -> ExitCode {
         paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
+            element_bounds: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -17756,6 +17771,7 @@ async fn uicorrection_mode() -> ExitCode {
         paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
+            element_bounds: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -20681,6 +20697,7 @@ async fn overwritecheck_mode() -> ExitCode {
             paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
         );
         stream.admit(paradigm_lib::capture::ActionCandidate {
+            element_bounds: None,
             kind: paradigm_lib::capture::ActionKind::Click,
             identifiers: vec!["msedge.exe".into()],
             process_name: None,
@@ -22282,6 +22299,7 @@ async fn tworundoc_mode() -> ExitCode {
         paradigm_lib::capture::ExclusionList::from_patterns(["!never!"]),
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
+            element_bounds: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,

@@ -194,6 +194,7 @@ mod tests {
     ) -> CapturedAction {
         let mut s = CapturedStream::new(ExclusionList::from_patterns(["!never!"]));
         s.admit(ActionCandidate {
+            element_bounds: None,
             kind,
             identifiers: vec!["app.exe".into()],
             process_name: None,

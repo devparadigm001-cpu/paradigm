@@ -383,6 +383,7 @@ mod tests {
         let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
         for (i, name) in names.iter().enumerate() {
             stream.admit(ActionCandidate {
+            element_bounds: None,
                 kind: ActionKind::Click,
                 identifiers: vec!["app.exe".into()],
                 process_name: None,
@@ -967,6 +968,7 @@ mod tests {
 
         let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
         stream.admit(ActionCandidate {
+            element_bounds: None,
             kind: ActionKind::Type,
             identifiers: vec!["msedge.exe".into()],
             process_name: Some("msedge.exe".into()),
@@ -1018,6 +1020,7 @@ mod tests {
         // Built through the real gate, with a process name attached.
         let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
         stream.admit(ActionCandidate {
+            element_bounds: None,
             kind: ActionKind::Navigate,
             identifiers: vec!["Untitled - Notepad".into()],
             process_name: Some("notepad.exe".into()),

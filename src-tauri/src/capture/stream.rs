@@ -63,6 +63,20 @@ pub struct ActionCandidate {
     /// Typed text and similar. Dropped, never stored, when excluded.
     pub payload: Option<String>,
     pub detail: Option<String>,
+    /// The acted-on element's rectangle, `(left, top, right, bottom)`.
+    ///
+    /// A positional identity that does not collapse when two elements say the
+    /// same thing. `element_name` cannot do that job, and neither can the
+    /// platform's element id: `terminator-rs` synthesises the id by hashing
+    /// role + name, so two records sharing a value share an id -- see
+    /// `docs/known-issues/element-id-is-a-hash-of-the-text.md`.
+    ///
+    /// **A position, never content**, so it is clean under §3 for the same
+    /// reason a cell reference is.
+    ///
+    /// `None` whenever the element could not be resolved or would not report
+    /// bounds, which is a real and ordinary outcome rather than an error.
+    pub element_bounds: Option<(f64, f64, f64, f64)>,
     pub timestamp_ms: u64,
 }
 
@@ -84,6 +98,9 @@ pub struct CapturedAction {
     pub element_name: Option<String>,
     pub payload: Option<String>,
     pub detail: Option<String>,
+    /// See [`ActionCandidate::element_bounds`]. Positional identity, kept
+    /// because names and platform element ids both collapse on equal text.
+    pub element_bounds: Option<(f64, f64, f64, f64)>,
     pub timestamp_ms: u64,
     _gated: Gated,
 }
@@ -194,6 +211,7 @@ impl CapturedStream {
             element_name: candidate.element_name,
             payload: candidate.payload,
             detail: candidate.detail,
+            element_bounds: candidate.element_bounds,
             timestamp_ms: candidate.timestamp_ms,
             _gated: Gated,
         });
@@ -224,6 +242,7 @@ mod tests {
 
     fn candidate(app: &str, payload: &str) -> ActionCandidate {
         ActionCandidate {
+            element_bounds: None,
             kind: ActionKind::Type,
             identifiers: vec![app.to_string()],
             process_name: None,

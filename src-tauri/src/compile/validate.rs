@@ -146,6 +146,7 @@ mod tests {
     fn one_action() -> Vec<CapturedAction> {
         let mut s = CapturedStream::new(ExclusionList::from_patterns(["!never!"]));
         s.admit(ActionCandidate {
+            element_bounds: None,
             kind: ActionKind::Click,
             identifiers: vec!["app.exe".into()],
             process_name: None,

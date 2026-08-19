@@ -199,6 +199,12 @@ struct GridEdit {
     text: String,
     identifiers: Vec<String>,
     process_name: Option<String>,
+    /// The cell editor's rectangle, read when the edit STARTED.
+    ///
+    /// Not read at emit, for the same reason `text` is not re-read there: by the
+    /// time an edit ends the editor is gone, and re-reading it is exactly the
+    /// mistake that produced `U+FEFF` payloads.
+    bounds: Option<(f64, f64, f64, f64)>,
     keystrokes: u32,
     started_ms: u64,
 }
@@ -597,6 +603,7 @@ impl GridCellWatcher {
                 let identifiers = self.identity_for(&el);
                 let finished = self.emit(timestamp_ms);
                 self.current = Some(GridEdit {
+                    bounds: super::bounds_of(Some(&el)),
                     cell,
                     text,
                     identifiers,
@@ -609,6 +616,7 @@ impl GridCellWatcher {
             None => {
                 let identifiers = self.identity_for(&el);
                 self.current = Some(GridEdit {
+                    bounds: super::bounds_of(Some(&el)),
                     cell,
                     text,
                     identifiers,
@@ -702,6 +710,8 @@ impl GridCellWatcher {
             return None;
         }
         Some(ActionCandidate {
+            // From when the edit started. The editor no longer exists here.
+            element_bounds: edit.bounds,
             kind: ActionKind::Type,
             identifiers: edit.identifiers,
             process_name: edit.process_name,
@@ -1199,6 +1209,7 @@ mod tests {
         let mut w = GridCellWatcher::new();
         assert_eq!(w.tracked_sheet(), None);
         w.current = Some(GridEdit {
+            bounds: None,
             cell: "B2".into(),
             text: "hello".into(),
             identifiers: vec!["msedge.exe".into()],
@@ -1219,6 +1230,7 @@ mod tests {
         );
         assert_eq!(w.tracked_sheet(), Some("Sheet2"));
         w.current = Some(GridEdit {
+            bounds: None,
             cell: "B2".into(),
             text: "hello".into(),
             identifiers: vec!["msedge.exe".into()],
