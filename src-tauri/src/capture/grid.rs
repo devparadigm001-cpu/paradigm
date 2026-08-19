@@ -228,6 +228,51 @@ pub struct SourceLink {
     pub destination_cell: String,
 }
 
+/// What an explicit source mark managed to read.
+///
+/// Carries the **route** and the position, and deliberately **not the
+/// document**. A cell reference and an `el/<ordinal>/<label>` are positions, the
+/// same class of thing `SourceLink` already holds. A document is a URL *or a
+/// window title*, and a browser title routinely contains page content --
+/// `"Invoice #1234 for Acme - Google Docs"`. `SourceLink` keeps that transient
+/// by design; a log file on disk is not transient, so it does not go there.
+///
+/// The route is what makes a log line readable: it says which of the three
+/// surfaces a mark landed on without naming it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkOutcome {
+    /// Read through the Name Box. A spreadsheet.
+    Spreadsheet { cell: String },
+    /// Read through element identity, on a page with no Name Box. Note that
+    /// this includes surfaces resolved only by the window-title fallback in
+    /// `page_identity`, where the document half is weak even though the
+    /// position is real.
+    Element { reference: String },
+    /// Nothing could be read. Common, and not an error.
+    Unavailable,
+}
+
+impl MarkOutcome {
+    pub fn armed(&self) -> bool {
+        !matches!(self, MarkOutcome::Unavailable)
+    }
+
+    /// One line for the log, carrying route and position and no identity.
+    pub fn describe(&self) -> String {
+        match self {
+            MarkOutcome::Spreadsheet { cell } => {
+                format!("armed via Name Box, cell {cell}")
+            }
+            MarkOutcome::Element { reference } => {
+                format!("armed via element identity, {reference}")
+            }
+            MarkOutcome::Unavailable => "NOT armed -- no position could be read \
+                 from the focused surface"
+                .to_string(),
+        }
+    }
+}
+
 /// `C` and `V`. Copy and paste are the only clipboard keys this tracks; cut
 /// (`X`) is deliberately excluded, because a cut REMOVES the source row and a
 /// pattern inferred from vanishing sources would replay against data that is no
@@ -416,14 +461,23 @@ impl GridCellWatcher {
     /// Sets `last_copy_key_ms` for the same reason the `Ctrl+C` path does: an
     /// explicit mark is at least as authoritative as an inferred copy, and must
     /// not be overwritten by a clipboard event arriving behind it.
-    pub fn note_marked_source(&mut self, timestamp_ms: u64) -> bool {
+    pub fn note_marked_source(&mut self, timestamp_ms: u64) -> MarkOutcome {
         self.last_copy_key_ms = Some(timestamp_ms);
         match self.read_position() {
-            Some(position) => {
-                self.pair_clipboard(KEY_C, position, timestamp_ms);
-                true
+            Some((document, reference)) => {
+                let outcome = if decode_element_ref(&reference).is_some() {
+                    MarkOutcome::Element {
+                        reference: reference.clone(),
+                    }
+                } else {
+                    MarkOutcome::Spreadsheet {
+                        cell: reference.clone(),
+                    }
+                };
+                self.pair_clipboard(KEY_C, (document, reference), timestamp_ms);
+                outcome
             }
-            None => false,
+            None => MarkOutcome::Unavailable,
         }
     }
 
@@ -1087,6 +1141,48 @@ mod tests {
             w.take_links().is_empty(),
             "only a real copy may arm a paste"
         );
+    }
+
+    /// A log line has to say WHICH surface a mark landed on. Four marks in one
+    /// session all logged "armed" and nothing distinguished a spreadsheet from
+    /// Notepad, which is what made the 2026-08-18 results unreadable.
+    #[test]
+    fn a_mark_outcome_names_its_route_and_position() {
+        let sheet = MarkOutcome::Spreadsheet { cell: "A2".into() };
+        assert!(sheet.armed());
+        assert!(sheet.describe().contains("Name Box"));
+        assert!(sheet.describe().contains("A2"));
+
+        let page = MarkOutcome::Element {
+            reference: encode_element_ref(2, Some("PRODUCT")),
+        };
+        assert!(page.armed());
+        assert!(page.describe().contains("element identity"));
+        assert!(page.describe().contains("PRODUCT"));
+
+        assert!(!MarkOutcome::Unavailable.armed());
+        assert!(MarkOutcome::Unavailable.describe().contains("NOT armed"));
+    }
+
+    /// The document half is a URL **or a window title**, and a browser title
+    /// routinely carries page content. `SourceLink` keeps that transient; a log
+    /// file is not transient, so it must not appear in a description.
+    #[test]
+    fn a_mark_outcome_never_describes_the_document() {
+        let outcomes = [
+            MarkOutcome::Spreadsheet { cell: "B7".into() },
+            MarkOutcome::Element {
+                reference: encode_element_ref(0, Some("QUANTITY")),
+            },
+            MarkOutcome::Unavailable,
+        ];
+        for outcome in outcomes {
+            let described = outcome.describe();
+            assert!(
+                !described.contains("Invoice") && !described.contains("http"),
+                "a description carries a position, never a document: {described:?}"
+            );
+        }
     }
 
     /// An explicit mark is the most authoritative statement of intent there is,

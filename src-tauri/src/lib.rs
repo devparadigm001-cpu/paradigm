@@ -180,32 +180,32 @@ pub fn configure<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
                         // fires whether or not this app is doing anything, and
                         // a notification every time someone presses it in
                         // another program would be noise.
+                        let at = capture::now_ms();
                         let marked = match state.session.lock() {
-                            Ok(guard) => guard
-                                .as_ref()
-                                .map(|session| session.mark_source(capture::now_ms())),
-                            Err(_) => Some(false),
+                            Ok(guard) => guard.as_ref().map(|session| session.mark_source(at)),
+                            Err(_) => Some(capture::grid::MarkOutcome::Unavailable),
                         };
-                        if let Some(marked) = marked {
-                            // BOTH outcomes are logged, including the success.
-                            // A silent success cannot be told apart from a press
-                            // that never arrived -- this is a global chord that
-                            // another application may hold, and registration is
-                            // best-effort -- so "nothing in the log" has to mean
-                            // "it did not reach us" and nothing else. Same rule
-                            // as the event census printing its zero.
-                            if marked {
-                                eprintln!(
-                                    "[paradigm] source mark: position read, source armed"
-                                );
-                            } else {
-                                eprintln!(
-                                    "[paradigm] source mark: no position could be read from the \
-                                     focused surface -- it exposes neither a Name Box nor \
-                                     resolvable element identity"
-                                );
-                            }
-                            if let Err(e) = app.emit(SOURCE_MARK_EVENT, marked) {
+                        if let Some(outcome) = marked {
+                            // EVERY outcome is logged, success included, and
+                            // each line carries the timestamp and the route.
+                            //
+                            // The timestamp is here because four log lines
+                            // appeared for what was reported as three presses
+                            // (2026-08-18) and there was no way to tell a fourth
+                            // press from one chord auto-repeating. It turned out
+                            // to be a genuine fourth press; without a clock that
+                            // could only be taken on trust.
+                            //
+                            // The route is here because all four lines said
+                            // "armed" and nothing said WHERE, so a mark on a
+                            // spreadsheet and a mark on Notepad were the same
+                            // line. See `MarkOutcome` for what is deliberately
+                            // left out of it.
+                            eprintln!(
+                                "[paradigm] source mark @{at}: {}",
+                                outcome.describe()
+                            );
+                            if let Err(e) = app.emit(SOURCE_MARK_EVENT, outcome.armed()) {
                                 eprintln!("[paradigm] failed to emit {SOURCE_MARK_EVENT}: {e}");
                             }
                         }

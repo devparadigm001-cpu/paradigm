@@ -411,11 +411,11 @@ impl CaptureSession {
     /// Briefly locks the same watcher the pump uses. The lock is held for one
     /// position read; the pump's own hold is per event, so the worst case is
     /// that one of them waits for the other.
-    pub fn mark_source(&self, timestamp_ms: u64) -> bool {
+    pub fn mark_source(&self, timestamp_ms: u64) -> grid::MarkOutcome {
         self.grid
             .lock()
             .map(|mut g| g.note_marked_source(timestamp_ms))
-            .unwrap_or(false)
+            .unwrap_or(grid::MarkOutcome::Unavailable)
     }
 
     /// Actions admitted so far, for live progress display.
