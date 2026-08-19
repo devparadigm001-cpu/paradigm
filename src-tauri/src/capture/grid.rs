@@ -509,18 +509,14 @@ impl GridCellWatcher {
     /// inventing an edit out of a cell the user only moved through: with no
     /// editor overlay open there is nothing to sample and this does nothing.
     fn absorb_sample(&mut self, timestamp_ms: u64, counts_as_keystroke: bool) -> Absorbed {
-        let Some((cell, text, ids)) = self.sample() else {
+        let Some((cell, text, el)) = self.sample() else {
             return Absorbed::Nothing;
-        };
-        // Prefer identity from a click when there was one; fall back to the
-        // element's own, so keyboard-only editing is still identifiable.
-        let identifiers = if self.identifiers.is_empty() {
-            ids
-        } else {
-            self.identifiers.clone()
         };
         match self.current.as_mut() {
             Some(edit) if edit.cell == cell => {
+                // The common path, and the reason identity is not resolved
+                // above: this branch does not use it. Every keystroke after the
+                // first in a cell lands here.
                 edit.text = text;
                 if counts_as_keystroke {
                     edit.keystrokes += 1;
@@ -529,6 +525,7 @@ impl GridCellWatcher {
             }
             Some(_) => {
                 // Moved to a different cell without a trigger key.
+                let identifiers = self.identity_for(&el);
                 let finished = self.emit(timestamp_ms);
                 self.current = Some(GridEdit {
                     cell,
@@ -541,6 +538,7 @@ impl GridCellWatcher {
                 Absorbed::Switched(finished)
             }
             None => {
+                let identifiers = self.identity_for(&el);
                 self.current = Some(GridEdit {
                     cell,
                     text,
@@ -558,21 +556,19 @@ impl GridCellWatcher {
         self.emit(timestamp_ms)
     }
 
-    /// The current editor's (cell, text, app identifiers), if one is open.
+    /// The focused cell editor's reference and text, and the element itself.
     ///
     /// Returns `None` for every non-grid context, which is the common case, so
     /// this must stay cheap: one focused-element resolution and two string
-    /// checks.
+    /// checks before the `is_cell_editor` gate rejects.
     ///
-    /// The identifiers matter more than they look. `CapturedStream::admit` fails
-    /// closed on an action whose source app cannot be named, and a cell edit
-    /// driven purely from the keyboard produces no `Click`, so `note_context`
-    /// never runs and there is nothing to name it with. Measured: four real cell
-    /// edits were detected, sampled, and emitted, then all four were dropped as
-    /// `UnidentifiedSource`. Reading the identity off the element we have
-    /// already resolved is the same identification a click performs -- it
-    /// supplies the missing fact rather than weakening the gate.
-    fn sample(&mut self) -> Option<(String, String, Vec<String>)> {
+    /// Runs on **every** key event in both directions, so what is not done here
+    /// matters as much as what is. It reads four properties at most and returns
+    /// the element rather than deriving anything further from it: the owning
+    /// application and window are two more round trips each and are needed only
+    /// when an edit is being STARTED, which is a small minority of samples.
+    /// See [`Self::identity_for`].
+    fn sample(&mut self) -> Option<(String, String, UIElement)> {
         if self.desktop.is_none() {
             self.desktop = Desktop::new_default().ok();
         }
@@ -587,7 +583,36 @@ impl GridCellWatcher {
         if text.is_empty() {
             return None;
         }
+        Some((cell, text, el))
+    }
 
+    /// Identity for an edit that is starting: the click's, when there was one,
+    /// and otherwise the element's own so keyboard-only editing stays
+    /// identifiable.
+    ///
+    /// The fallback matters more than it looks, and the reason is measured.
+    /// `CapturedStream::admit` fails closed on an action whose source app
+    /// cannot be named, and a cell edit driven purely from the keyboard
+    /// produces no `Click`, so `note_context` never runs and there is nothing
+    /// to name it with. Measured: four real cell edits were detected, sampled
+    /// and emitted, then all four were dropped as `UnidentifiedSource`. Reading
+    /// the identity off the element already resolved is the same
+    /// identification a click performs -- it supplies the missing fact rather
+    /// than weakening the gate. Moving this out of `sample` changes *when* it
+    /// is read, never *whether*.
+    ///
+    /// Deliberately not computed on the common path. `application()` and
+    /// `window()` are UI Automation round trips with a name read each, and
+    /// until now they ran on every sample and were then discarded twice over:
+    /// once whenever a click had already populated `self.identifiers`, and once
+    /// more because the "same cell as before" branch -- every keystroke after
+    /// the first in a cell -- never reads the result at all. Typing a
+    /// twenty-character value paid for them about forty times and used them
+    /// once.
+    fn identity_for(&self, el: &UIElement) -> Vec<String> {
+        if !self.identifiers.is_empty() {
+            return self.identifiers.clone();
+        }
         let mut ids = Vec::new();
         if let Ok(Some(app)) = el.application() {
             if let Some(n) = app.name().filter(|n| !n.trim().is_empty()) {
@@ -599,7 +624,7 @@ impl GridCellWatcher {
                 ids.push(n);
             }
         }
-        Some((cell, text, ids))
+        ids
     }
 
     fn emit(&mut self, timestamp_ms: u64) -> Option<ActionCandidate> {
