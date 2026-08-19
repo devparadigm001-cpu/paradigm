@@ -360,6 +360,18 @@ impl CaptureSession {
                 dc + uc,
                 dus + uus
             );
+
+            // The position reads that do NOT happen on a key event, and so
+            // appear nowhere in the line above. A menu copy performed one of
+            // these in a real session on 2026-08-19 and contributed to no
+            // figure that session reported.
+            let ((cc, cus), (mc, mus)) = grid::off_key_timing();
+            eprintln!(
+                "[paradigm] off-key position reads: clipboard {cc} calls, {} us mean; \
+                 mark {mc} calls, {} us mean",
+                mean(cc, cus),
+                mean(mc, mus)
+            );
         }
 
         // Events that existed versus events the pump got to. See

@@ -67,6 +67,24 @@ static GRID_MICROS: AtomicU64 = AtomicU64::new(0);
 static GRID_UP_CALLS: AtomicU64 = AtomicU64::new(0);
 static GRID_UP_MICROS: AtomicU64 = AtomicU64::new(0);
 
+// The two position reads that do NOT happen on a key event, and were therefore
+// invisible to everything above.
+//
+// `observe_key` is what GRID_* wraps, so a `read_position` reached any other way
+// contributed nothing to any number this module reported. Both of these run the
+// same full walk a `Ctrl+C` does -- the Name Box scan, or up to 3000 nodes for
+// element identity -- and a menu copy performed one in a real session on
+// 2026-08-19 that appears in none of that session's figures.
+//
+// Kept apart rather than folded into one "off-key" total because they fire for
+// different reasons and at different rates: the clipboard monitor polls at
+// 200ms and fires on any copy anywhere, while a mark is one deliberate keypress.
+// A single number would hide which one is costing anything.
+static CLIP_CALLS: AtomicU64 = AtomicU64::new(0);
+static CLIP_MICROS: AtomicU64 = AtomicU64::new(0);
+static MARK_CALLS: AtomicU64 = AtomicU64::new(0);
+static MARK_MICROS: AtomicU64 = AtomicU64::new(0);
+
 /// (calls, total microseconds) spent in `observe_key` since the last reset,
 /// both directions together.
 pub fn timing() -> (u64, u64) {
@@ -89,12 +107,33 @@ pub fn timing_split() -> ((u64, u64), (u64, u64)) {
     )
 }
 
+/// The position reads taken OFF the key path, as
+/// `((clipboard_calls, clipboard_us), (mark_calls, mark_us))`.
+///
+/// Neither appears in [`timing_split`], which wraps `observe_key` only.
+pub fn off_key_timing() -> ((u64, u64), (u64, u64)) {
+    (
+        (
+            CLIP_CALLS.load(Ordering::Relaxed),
+            CLIP_MICROS.load(Ordering::Relaxed),
+        ),
+        (
+            MARK_CALLS.load(Ordering::Relaxed),
+            MARK_MICROS.load(Ordering::Relaxed),
+        ),
+    )
+}
+
 /// Zero the counters, so one run's numbers are its own.
 pub fn reset_timing() {
     GRID_CALLS.store(0, Ordering::Relaxed);
     GRID_MICROS.store(0, Ordering::Relaxed);
     GRID_UP_CALLS.store(0, Ordering::Relaxed);
     GRID_UP_MICROS.store(0, Ordering::Relaxed);
+    CLIP_CALLS.store(0, Ordering::Relaxed);
+    CLIP_MICROS.store(0, Ordering::Relaxed);
+    MARK_CALLS.store(0, Ordering::Relaxed);
+    MARK_MICROS.store(0, Ordering::Relaxed);
 }
 
 /// Does this name look like a spreadsheet cell reference (`A1`, `BC12`)?
@@ -435,10 +474,17 @@ impl GridCellWatcher {
     /// [`Self::clipboard_needs_own_read`] keeps it out of the way when a real
     /// keystroke was seen.
     pub fn note_clipboard_copy(&mut self, timestamp_ms: u64) {
+        // Counted only when a read actually happens: a suppressed clipboard
+        // event costs nothing, and counting it would dilute the mean with zeros
+        // and hide what a real one costs.
         if !self.clipboard_needs_own_read(timestamp_ms) {
             return;
         }
-        if let Some(position) = self.read_position() {
+        let started = std::time::Instant::now();
+        let position = self.read_position();
+        CLIP_CALLS.fetch_add(1, Ordering::Relaxed);
+        CLIP_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(position) = position {
             self.pair_clipboard(KEY_C, position, timestamp_ms);
         }
     }
@@ -463,7 +509,13 @@ impl GridCellWatcher {
     /// not be overwritten by a clipboard event arriving behind it.
     pub fn note_marked_source(&mut self, timestamp_ms: u64) -> MarkOutcome {
         self.last_copy_key_ms = Some(timestamp_ms);
-        match self.read_position() {
+        // Timed for the same reason the clipboard path is: this walk is the
+        // full one, and it happens while the user waits for the mark to take.
+        let started = std::time::Instant::now();
+        let position = self.read_position();
+        MARK_CALLS.fetch_add(1, Ordering::Relaxed);
+        MARK_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        match position {
             Some((document, reference)) => {
                 let outcome = if decode_element_ref(&reference).is_some() {
                     MarkOutcome::Element {
@@ -1140,6 +1192,27 @@ mod tests {
         assert!(
             w.take_links().is_empty(),
             "only a real copy may arm a paste"
+        );
+    }
+
+    /// "One run's numbers are its own" has to hold for the off-key counters
+    /// too, or a second recording reports the first one's position reads. The
+    /// original four were reset and these two were added later, which is
+    /// exactly how a counter gets missed.
+    #[test]
+    fn resetting_clears_the_off_key_counters_as_well() {
+        CLIP_CALLS.store(7, Ordering::Relaxed);
+        CLIP_MICROS.store(700, Ordering::Relaxed);
+        MARK_CALLS.store(3, Ordering::Relaxed);
+        MARK_MICROS.store(300, Ordering::Relaxed);
+
+        reset_timing();
+
+        assert_eq!(
+            off_key_timing(),
+            ((0, 0), (0, 0)),
+            "a new session must start from zero on every counter, not just the \
+             ones that existed first"
         );
     }
 
