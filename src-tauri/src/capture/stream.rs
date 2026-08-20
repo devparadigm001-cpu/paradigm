@@ -63,7 +63,14 @@ pub struct ActionCandidate {
     /// Typed text and similar. Dropped, never stored, when excluded.
     pub payload: Option<String>,
     pub detail: Option<String>,
-    /// The acted-on element's rectangle, `(left, top, right, bottom)`.
+    /// The acted-on element's rectangle, `(x, y, width, height)`.
+    ///
+    /// **Width and height, not a right and bottom edge.** `terminator-rs`
+    /// returns `rect.get_left(), get_top(), get_width(), get_height()`
+    /// (`platforms/windows/element.rs:630`). Mislabelled as right/bottom when
+    /// this field was added on 2026-08-18, and corrected on 2026-08-20 after an
+    /// analysis read the third value as a right edge and got a number smaller
+    /// than the left one on every row.
     ///
     /// A positional identity that does not collapse when two elements say the
     /// same thing. `element_name` cannot do that job, and neither can the

@@ -234,8 +234,12 @@ fn compile_step(
     // Absent for playbooks recorded before this existed, and absent whenever the
     // element would not report bounds. Consumers must treat missing as "no
     // positional identity", never as an error.
-    if let Some((left, top, right, bottom)) = action.element_bounds {
-        payload["target"]["bounds"] = json!([left, top, right, bottom]);
+    // `[x, y, width, height]` -- width and height, NOT a right and bottom edge.
+    // See `ActionCandidate::element_bounds`. A consumer that reads the third
+    // value as a right edge gets a number smaller than the left one, which is
+    // exactly how the mislabelling was found.
+    if let Some((x, y, width, height)) = action.element_bounds {
+        payload["target"]["bounds"] = json!([x, y, width, height]);
     }
 
     CompiledStep {
