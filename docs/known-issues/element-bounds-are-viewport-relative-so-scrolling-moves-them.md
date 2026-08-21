@@ -55,14 +55,51 @@ reached on 2026-08-19.
 
 ## The candidate directions, with what is unknown about each
 
-**1. Read the scroll offset and store document-relative coordinates.**
-Cleanest in principle: `y_document = y_viewport + scroll_offset`. Requires the
-new dependency. Two things are unverified and would have to be measured before
-committing: whether Chrome and Edge expose `ScrollPattern` for *web content* at
-all, and — more awkward — that the pattern reports `VerticalScrollPercent`, a
-**percentage**, not a pixel offset. Converting it needs the scrollable content's
-total height, which is not obviously exposed. A percentage of an unknown height
-is not a coordinate.
+**1. Read the scroll offset and store document-relative coordinates. MEASURED
+AND DEAD (2026-08-21).**
+
+The idea was `y_document = y_viewport + scroll_offset`. Probed against a tall
+page in Edge, scrolling with real Page Down keystrokes between samples:
+
+```
+sample 0 (top)           percent=0.000  marker_y= 1209
+sample 1 (+3x PageDown)  percent=0.000  marker_y=-1299
+sample 2 (+3x PageDown)  percent=0.000  marker_y=-2327
+```
+
+The page moved more than 3500px. **`VerticalScrollPercent` stayed exactly 0.000
+throughout.** The pattern IS exposed -- found at depth 11 on a `Pane` named
+`Chrome Legacy Window` -- and both of its write methods, `scroll()` and
+`set_scroll_percent()`, fail outright. It is a stub: present in the tree,
+non-functional in both directions.
+
+So the question was never the awkward one about converting a percentage to
+pixels. There is no value to convert.
+
+This is the trap this project keeps meeting in a new place: the pattern's
+*presence* would have been taken as evidence that reading it works. Only
+scrolling the page and watching the number not move settles it.
+
+**The probe is not in the repository, and that is deliberate.** It needed
+`uiautomation` as a dev-dependency, and adding one changes the lib test
+binary's hash — which this machine's Application Control policy then blocked
+permanently (`os error 4551`), leaving `cargo test --lib` unrunnable. A probe
+that answers a question once is not worth an unrunnable suite, so both were
+removed once the measurement was in hand. To redo it in about fifteen minutes:
+
+1. add `uiautomation = { version = "0.22", features = ["pattern"] }` to
+   `[dev-dependencies]`;
+2. `auto.create_matcher().contains_name("<window title>").find_first()` — match
+   the window by TITLE, not by focus, because running a probe returns focus to
+   the terminal;
+3. walk down with `auto.create_tree_walker()` until
+   `get_pattern::<UIScrollPattern>()` succeeds;
+4. read `get_vertical_scroll_percent()`, scroll the page by any external means,
+   and read again.
+
+Note for whoever does: `scroll()` and `set_scroll_percent()` on that pattern
+both fail, so the scrolling has to come from outside — Page Down through
+`WScript.Shell` worked.
 
 **2. Abandon pixels for document-order ordinal.** Scroll-invariant by
 construction, and it is what `an-element-identity-mark-records-no-field-label.md`
