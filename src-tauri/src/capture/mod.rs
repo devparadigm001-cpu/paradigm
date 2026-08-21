@@ -391,6 +391,37 @@ impl CaptureSession {
             }
         );
 
+        // The property `detect` actually tests, reported directly.
+        //
+        // `prove_advance` rejects a recording whose source positions repeat, and
+        // until now the only way to see WHY it rejected one was to infer it from
+        // a sentence on the review screen -- the links themselves are transient
+        // and gone by then. That is how a stale-source defect survived: a
+        // recording of three plainly distinct sources reported
+        // `SourceDidNotAdvance` and nothing on disk could say whether the
+        // sources really repeated or had been mis-paired.
+        //
+        // Distinct-source count is what separates those two cases.
+        let links_now = self
+            .grid
+            .lock()
+            .map(|g| g.peek_links())
+            .unwrap_or_default();
+        let distinct_sources: std::collections::BTreeSet<(String, String)> = links_now
+            .iter()
+            .map(|l| (l.source_document.clone(), l.source_cell.clone()))
+            .collect();
+        eprintln!(
+            "[paradigm] source links: {} pair(s), {} distinct source position(s){}",
+            links_now.len(),
+            distinct_sources.len(),
+            if links_now.len() >= 2 && distinct_sources.len() == 1 {
+                " -- every paste shares ONE source, which detect will call SourceDidNotAdvance"
+            } else {
+                ""
+            }
+        );
+
         Ok(CaptureReport {
             session_name: self.name,
             actions,

@@ -407,6 +407,49 @@ impl GridCellWatcher {
         std::mem::take(&mut self.links)
     }
 
+    /// The same links WITHOUT draining, for reporting at stop.
+    ///
+    /// Separate from [`Self::take_links`] because draining is load-bearing --
+    /// the watcher must not hand the same positions to a second reader -- and a
+    /// diagnostic must not be able to consume them by accident.
+    pub fn peek_links(&self) -> Vec<SourceLink> {
+        self.links.clone()
+    }
+
+    /// A clipboard key was pressed and a position read was attempted.
+    ///
+    /// **A copy whose position could not be read DISARMS the source.** That is
+    /// the whole point of this function existing, and it is the fix for a
+    /// measured defect: `pending_source` was only ever assigned on a successful
+    /// read and never cleared, so a `Ctrl+C` whose read failed left the
+    /// PREVIOUS copy's position armed and the next paste paired with it.
+    ///
+    /// Session record-f15e933d (2026-08-21) is what that looks like from the
+    /// outside. The user copied Free/Go/Plus and $0/$8/$20 into three
+    /// spreadsheet rows -- plainly distinct sources -- and detection returned
+    /// `SourceDidNotAdvance`, because enough destinations had been paired with
+    /// one stale source that `prove_advance` saw a repeat.
+    ///
+    /// The principle was already written down three lines from the bug: *a
+    /// paste with no source records no link, which §4.1 already excludes -- a
+    /// wrong source it would not*. This applies it.
+    ///
+    /// A failed **paste** read is deliberately different: it disarms nothing,
+    /// because one copy may legitimately feed several pastes and a destination
+    /// that could not be read is not evidence about the source.
+    fn note_clipboard_key(
+        &mut self,
+        key_code: u32,
+        position: Option<(String, String)>,
+        seq: u64,
+    ) {
+        match position {
+            Some(position) => self.pair_clipboard(key_code, position, seq),
+            None if key_code == KEY_C => self.pending_source = None,
+            None => {}
+        }
+    }
+
     /// Record a copy, or pair a paste with the copy that preceded it.
     ///
     /// Separated from the reading of the position so the PAIRING -- which is
@@ -484,9 +527,9 @@ impl GridCellWatcher {
         let position = self.read_position();
         CLIP_CALLS.fetch_add(1, Ordering::Relaxed);
         CLIP_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-        if let Some(position) = position {
-            self.pair_clipboard(KEY_C, position, timestamp_ms);
-        }
+        // Same rule as the keystroke path: a copy whose position could not be
+        // read disarms the source rather than leaving a stale one armed.
+        self.note_clipboard_key(KEY_C, position, timestamp_ms);
     }
 
     /// The user said, explicitly, that this is a source value.
@@ -526,10 +569,18 @@ impl GridCellWatcher {
                         cell: reference.clone(),
                     }
                 };
-                self.pair_clipboard(KEY_C, (document, reference), timestamp_ms);
+                self.note_clipboard_key(KEY_C, Some((document, reference)), timestamp_ms);
                 outcome
             }
-            None => MarkOutcome::Unavailable,
+            None => {
+                // Same rule again. A mark the user deliberately made, on a
+                // surface that yields no position, must not silently leave the
+                // PREVIOUS source armed -- that would pair the next paste with
+                // something the user did not mark, which is worse than the
+                // honest `Unavailable` they are told about.
+                self.note_clipboard_key(KEY_C, None, timestamp_ms);
+                MarkOutcome::Unavailable
+            }
         }
     }
 
@@ -661,9 +712,8 @@ impl GridCellWatcher {
                     // already excludes -- a wrong source it would not.
                     self.last_copy_key_ms = Some(timestamp_ms);
                 }
-                if let Some(position) = self.read_position() {
-                    self.pair_clipboard(key_code, position, timestamp_ms);
-                }
+                let position = self.read_position();
+                self.note_clipboard_key(key_code, position, timestamp_ms);
             }
             self.observe_key_inner(key_code, alt_pressed, timestamp_ms)
         } else {
@@ -1256,6 +1306,65 @@ mod tests {
                 "a description carries a position, never a document: {described:?}"
             );
         }
+    }
+
+    /// THE DEFECT, reproduced. A copy whose position could not be read used to
+    /// leave the previous copy's position armed, so the next paste paired with
+    /// a source the user never copied. Enough of those and every destination
+    /// shares one source, `prove_advance` sees a repeat, and detection reports
+    /// `SourceDidNotAdvance` about a recording whose source advanced fine.
+    ///
+    /// That is exactly what session record-f15e933d produced on 2026-08-21.
+    #[test]
+    fn a_copy_whose_position_cannot_be_read_disarms_the_source() {
+        let mut w = GridCellWatcher::new();
+        w.note_clipboard_key(KEY_C, Some(pos("pricing", "el/0/TIER")), 1);
+        // Second copy: the read failed -- scrolled off-screen, structural
+        // element, whatever the cause.
+        w.note_clipboard_key(KEY_C, None, 2);
+        w.note_clipboard_key(KEY_V, Some(pos("book", "B3")), 3);
+
+        assert!(
+            w.take_links().is_empty(),
+            "the paste must record NO link rather than pair with the first \
+             copy's position, which the user did not copy this time"
+        );
+    }
+
+    /// The correction must not break the documented behaviour that one copy may
+    /// feed several pastes -- a failed DESTINATION read says nothing about the
+    /// source and must disarm nothing.
+    #[test]
+    fn a_paste_whose_position_cannot_be_read_leaves_the_source_armed() {
+        let mut w = GridCellWatcher::new();
+        w.note_clipboard_key(KEY_C, Some(pos("orders", "C2")), 1);
+        w.note_clipboard_key(KEY_V, None, 2); // destination unreadable
+        w.note_clipboard_key(KEY_V, Some(pos("book", "B2")), 3);
+
+        let links = w.take_links();
+        assert_eq!(links.len(), 1, "the second paste still pairs");
+        assert_eq!(links[0].source_cell, "C2");
+        assert_eq!(links[0].destination_cell, "B2");
+    }
+
+    /// The three sources of a three-record transfer must stay distinct, which
+    /// is the property `prove_advance` checks and the one the defect destroyed.
+    #[test]
+    fn three_reads_that_all_succeed_still_produce_three_distinct_sources() {
+        let mut w = GridCellWatcher::new();
+        for (i, (src, dst)) in [("el/0/TIER", "A2"), ("el/1/TIER", "A3"), ("el/2/TIER", "A4")]
+            .iter()
+            .enumerate()
+        {
+            let seq = (i as u64) * 2;
+            w.note_clipboard_key(KEY_C, Some(pos("pricing", src)), seq);
+            w.note_clipboard_key(KEY_V, Some(pos("book", dst)), seq + 1);
+        }
+        let links = w.take_links();
+        assert_eq!(links.len(), 3);
+        let sources: std::collections::BTreeSet<&str> =
+            links.iter().map(|l| l.source_cell.as_str()).collect();
+        assert_eq!(sources.len(), 3, "three distinct sources, so the source advanced");
     }
 
     /// An explicit mark is the most authoritative statement of intent there is,
