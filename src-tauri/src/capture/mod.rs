@@ -421,6 +421,25 @@ impl CaptureSession {
                 ""
             }
         );
+        // The pairs themselves, because the counts above still could not explain
+        // an `InconsistentMapping`. That verdict compares the SIGNATURE of each
+        // record -- the set of (source field -> destination field) -- and the
+        // source field is the label half of `el/<ordinal>/<label>`, which is
+        // assigned by adjacency and is frequently empty. A recording whose
+        // destinations are a clean A/B/C across three records can still carry
+        // three different source labels and be rejected for disagreeing.
+        //
+        // Documents are deliberately omitted, exactly as in
+        // `MarkOutcome::describe`: a cell reference and an `el/<n>/<label>` are
+        // a position and a schema name, while a document is a URL or a window
+        // title and can carry page content. §3 permits the first pair durably
+        // and not the second.
+        for link in &links_now {
+            eprintln!(
+                "[paradigm]   link {:>3}: {:<28} -> {}",
+                link.seq, link.source_cell, link.destination_cell
+            );
+        }
 
         Ok(CaptureReport {
             session_name: self.name,
