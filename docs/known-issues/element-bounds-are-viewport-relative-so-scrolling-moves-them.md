@@ -109,12 +109,88 @@ and 14.8s per session. The two open defects squeeze positional identity from
 opposite sides: the cheap signal is not stable, and the stable signal is not
 cheap.
 
-**3. Scroll-epoch partitioning.** Detect scroll *from the captured data itself* —
-an element with the same name and width at a different y proves the view moved —
-and refuse to compare positions across an epoch boundary. Needs no new
-dependency and no extra reads, and it is honest. The cost is that it discards
-comparisons rather than fixing them: a recording that scrolls between every
-record leaves one element per epoch and nothing to cluster.
+**3. Scroll-epoch partitioning. SCOPED 2026-08-21, and it changed shape.**
+
+The original sketch was pure inference: *an element with the same name and width
+at a different y proves the view moved.* Two things came out of scoping it.
+
+**First, that inference rule is not weak, it is wrong.** A vertical list of
+records — the exact layout this pipeline exists for — routinely shows the same
+text at the same x and different y in every record. Three rows reading `$0` are
+not a scroll; they are the structure. The rule would read normal repetition as
+motion and split one record set into several epochs, destroying the clustering
+it was added to protect. The salvageable form is a **rigid-translation** test:
+a scroll moves *every* element by the *same* delta, so a boundary needs two or
+more re-observed elements agreeing on one offset. One element moving stays
+ambiguous.
+
+**Second, and more usefully: the scroll is already in the event stream,
+unread.** `MouseEventType::Wheel` carries `scroll_delta`, and every filter that
+would drop it is off in paradigm's config (`filter_mouse_noise: false`,
+`performance_mode: Normal`, no rate limit, zero processing delay). Paradigm's
+pump simply has no `WorkflowEvent::Mouse` arm, so it is discarded on arrival.
+
+Measured, against a tall page in Edge:
+
+```
+  wheel #1   delta=(    0,   -1)  at ( 3383,  530)  under: Document "WHEELTEST"
+  ... one event per notch, element under the cursor resolved
+```
+
+```
+  4 notches  MARKER-0  -2930 -> -3330   =  -400px
+  7 notches  MARKER-0  -3330 -> -4030   =  -700px
+```
+
+**Exactly 100px per notch, linear, and identical for every marker** — a rigid
+translation, predicted to the pixel. `scroll_delta` is in **notches, not
+pixels**, so the conversion is real but it is a per-surface constant.
+
+So direction 3 splits cleanly, and both halves are worth having:
+
+* **3a — partition on observed boundaries.** Needs only the boundary, not the
+  magnitude. Cheap: one pump arm, no UI Automation reads, no new dependency.
+* **3b — correct, where a magnitude exists.** `y_document = y + cumulative_px`,
+  from wheel notches times a calibrated pixels-per-notch. Strictly better than
+  discarding, and available only sometimes.
+
+### What is measured, and what is still unknown
+
+| Scroll gesture | Observable? | Magnitude? |
+|---|---|---|
+| Mouse wheel | yes, one event per notch | yes — 100px/notch **on the one surface measured** |
+| Page Down / keyboard | yes, as key code 34 | **no** |
+| Scrollbar drag, trackpad, touch | untested | untested |
+| Programmatic (anchor jump, focus scroll-into-view) | **no input event at all** | no |
+
+Page Down is measured, not assumed: two presses moved the page **1656px** and
+produced **zero** wheel events. The keystroke says *that* the view moved and
+says nothing about how far, because 828px is the viewport height, not a
+property of the key.
+
+The 100px/notch figure is one browser, one zoom level, one Windows
+`SPI_GETWHEELSCROLLLINES` setting. Treating it as a constant would be the same
+error as treating `VerticalScrollPercent`'s presence as evidence it worked.
+**It must be calibrated per surface or not used.**
+
+The last row is the hole that no observation closes. A page that scrolls itself
+emits nothing. That is where the rigid-translation test earns its place — not
+as the primary mechanism, but as the backstop for the cases direct observation
+cannot see.
+
+### What building it costs
+
+Stamp each `CapturedAction` with `scroll_epoch: u32` and
+`scroll_offset_px: Option<f64>` at capture time, where the ordering is already
+known, and carry both into the stored payload. **Leave `element_bounds` raw.**
+A consumer adds the offset when it is present and refuses to compare across
+epochs when it is not — which keeps the rule in this doc that a negative y is a
+correct report and must not be clamped away.
+
+One caveat found while measuring, written up separately in
+`wheel-and-mouse-events-are-dropped-until-the-first-mouse-move.md`: the
+recorder discards wheel events entirely until it has seen a mouse *move*, so
+the signal is gated on something a keyboard-driven user may never do.
 
 **4. One snapshot at stop.** Re-read the page once when recording ends, so every
 position shares a single scroll state. Attractive until you notice it requires
@@ -157,3 +233,5 @@ design.
   other half of the identity problem.
 * `docs/planning/Filtered-Post-Hoc-Confirmation.md` — the pipeline that depends
   on positional identity being stable, and which is blocked on this.
+* `docs/known-issues/wheel-and-mouse-events-are-dropped-until-the-first-mouse-move.md`
+  — the gate that made the wheel signal look absent when it was only unarmed.
