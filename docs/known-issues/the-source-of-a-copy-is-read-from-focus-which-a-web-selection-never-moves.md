@@ -1,7 +1,9 @@
 # The source of a copy is read from focus, which a web selection never moves
 
-**Status:** open, measured and reproduced 2026-08-21 in session
-record-fe88fb0d.
+**Status:** FIXED 2026-08-21, same day it was found. Kept because the
+limitations below are live constraints, not history: the fix declines in four
+situations, and each decline is a link that does not exist.
+**Was:** measured and reproduced in session record-fe88fb0d.
 **Severity: HIGH.** It is the direct cause of `SourceDidNotAdvance` on every
 non-spreadsheet page tested so far, and it silently collapses every source in a
 session into one.
@@ -78,7 +80,103 @@ returns early through the Name Box before any of this is reached. The
 assumption "focused element = what the user is acting on" happens to hold there
 and fails everywhere else. It was never tested on a page until now.
 
-## The fix direction, and what is already in place
+## The fix, and the evidence it works
+
+`read_element_position` now resolves the source from the **last click** rather
+than the focused element. `WorkflowEvent::Click` already reached
+`grid.note_click` carrying `metadata.ui_element`; its id was being discarded.
+No new dependency, and no extra walk — the read was already paid for on the
+click.
+
+**Same isolated case that exposed the defect, re-run against the fix:**
+
+```
+[paradigm] copy source: el/19/
+[paradigm] copy source: el/20/
+[paradigm] copy source: el/21/
+```
+
+Three selections, three copies, **three consecutive records**. Before: one
+reference three times.
+
+**The real ChatGPT pricing page**, `$0` / `$8` / `$20`, scrolling between each:
+
+```
+[paradigm] copy source: el/30/
+[paradigm] copy source: el/50/
+[paradigm] copy source: el/18/
+```
+
+Three distinct sources. `prove_advance` tests distinctness, and distinctness
+holds.
+
+### A caveat those numbers make visible
+
+They are not in order — 30, 50, 18 for three tiers read top to bottom. The
+ordinal is computed against whatever `collect_nodes` saw on that walk, and the
+page was scrolled between copies, so each ordinal is relative to a different
+tree. **The ordinal is meaningful only within one snapshot.**
+
+Distinctness is what detection needs and it is satisfied here, but the mirror
+risk follows directly and is NOT covered: three copies of the *same* record at
+three scroll positions could produce three different ordinals and look like
+advancement. That is `element-bounds-are-viewport-relative-so-scrolling-moves-them.md`
+arriving through a second door, and this fix does not close it.
+
+### The label is still empty, and that is a different defect
+
+`el/19/`, not `el/19/PRICE`. On the tier pages the price has no repeated label
+beside it, so there is nothing to address it by. Unchanged by this work; see
+`an-element-identity-mark-records-no-field-label.md`.
+
+## The four declines, each tested live
+
+The recency rule is `CLICK_SOURCE_GRACE_MS`, five seconds, modelled on
+`COPY_KEY_GRACE_MS`. It is the one number here that is chosen rather than
+measured, and it is a first calibration.
+
+Every case below was run against a live page, and every one printed
+`(none -- declined)`:
+
+| Case | Gesture tested | Result |
+|---|---|---|
+| No click at all | window focused programmatically, then `Ctrl+C` | declined |
+| Stale click | click, wait 7s, `Ctrl+C` | declined |
+| Click in another window | click in Notepad, focus the page, `Ctrl+C` | declined |
+| Structural element | double-click one of three identical `/ month` lines | declined |
+
+The last is `identity::tree::locate` refusing a structural element, not a rule
+written for this — a label is not a position. So `/ month` does decline, just
+never for the reason the original hypothesis proposed.
+
+**The cross-window run carried its own positive control**: the same session
+went on to copy a real price and printed `el/20/`. A run in which everything
+declines proves nothing about declining correctly, which is the lesson
+`wheel-and-mouse-events-are-dropped-until-the-first-mouse-move.md` records.
+
+### What it costs, measured
+
+Reading the clicked element's id is not free: `UIElement::id()` hashes four
+cross-process UI Automation reads -- automation id, control type, name, class
+name. It is paid on EVERY click, not only on copies, so it was given its own
+counter rather than being allowed to hide inside a keystroke figure:
+
+```
+[paradigm] clicked element ids: 6 calls, 837 us mean, 5025 us total
+[paradigm] grid sampling: key-down 6 calls, 118841 us mean
+```
+
+**0.84ms per click**, against 119ms for a key-down on the same surface. Not a
+concern at this scale, and now a number rather than an assumption.
+
+### What is genuinely lost
+
+A copy from a **focused input the user never clicked** — tabbed into, selected
+with `Ctrl+A` — used to resolve through focus and now declines. Whether it ever
+produced a *correct* answer is untested; focus is right in that case in
+principle. It is a real narrowing, stated rather than discovered later.
+
+## The old fix direction, kept for the reasoning
 
 The clicked element is the source, not the focused one — and the pump already
 has it. `WorkflowEvent::Click` reaches `grid.note_click` with `element_role`,
@@ -106,7 +204,23 @@ rather than reach back to an unrelated click from a minute ago.
 1. `cargo run --example focus_vs_selection_probe -- 20`
 2. In any browser page, double-click a word, press `Ctrl+C`, and repeat on two
    other words elsewhere on the page.
-3. The probe reports **1 distinct focused element** across all of it.
+3. The probe reports **1 distinct focused element** across all of it -- the
+   underlying platform behaviour, which the fix routes around rather than
+   changes.
+
+A warning for anyone automating this: verify the element coordinates against
+`page_bounds_probe` in the SAME window you are clicking. A run of this test
+reported one source for all three copies and looked like a regression; the
+window had opened 20px offset from the previous one, so every double-click
+landed in the card padding and hit the same container. That reading was
+correct -- the same element clicked three times IS one source -- and the
+mistake was in the harness, not the code.
+
+To watch the fix instead, run `capture_probe` and do the same three
+select-and-copy gestures. Each copy prints its own
+`[paradigm] copy source: el/N/` line as it happens, so a source that fails to
+advance is visible immediately rather than only once a paste has paired with
+it.
 
 ## Related
 

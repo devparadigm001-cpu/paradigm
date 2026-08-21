@@ -372,6 +372,16 @@ impl CaptureSession {
                 mean(cc, cus),
                 mean(mc, mus)
             );
+
+            // New cost on the click path, reported separately so it can never
+            // hide inside a keystroke figure. Four cross-process UI Automation
+            // reads per click is not free, and it is paid on every click rather
+            // than only on copies.
+            let (ic, ius) = grid::click_id_timing();
+            eprintln!(
+                "[paradigm] clicked element ids: {ic} calls, {} us mean, {ius} us total",
+                mean(ic, ius)
+            );
         }
 
         // Events that existed versus events the pump got to. See
@@ -608,9 +618,21 @@ fn observe_grid(
             // and not in `to_candidate`: `observe_grid` is already the
             // spreadsheet-specific path, so capture's generic mapping stays
             // app-agnostic and only `capture::grid` knows what a sheet tab is.
+            //
+            // And the element's own id, which is what arms the source of the
+            // next copy. It costs nothing to pass: the click event already
+            // carries the element, so no walk is added to reach it. Everything
+            // this needs was being discarded here.
+            let started = std::time::Instant::now();
+            let clicked_id = e.metadata.ui_element.as_ref().and_then(|u| u.id());
+            if e.metadata.ui_element.is_some() {
+                grid::note_click_id_cost(started.elapsed().as_micros() as u64);
+            }
             grid.note_click(
                 &e.element_role,
                 non_empty(&e.element_text).as_deref(),
+                clicked_id.as_deref(),
+                e.metadata.timestamp.unwrap_or_else(now_ms),
                 identifiers,
                 e.process_name.clone(),
             );

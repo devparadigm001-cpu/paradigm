@@ -85,6 +85,14 @@ static CLIP_MICROS: AtomicU64 = AtomicU64::new(0);
 static MARK_CALLS: AtomicU64 = AtomicU64::new(0);
 static MARK_MICROS: AtomicU64 = AtomicU64::new(0);
 
+/// Reading the clicked element's id, which is four cross-process UI Automation
+/// property reads -- automation id, control type, name, class name -- hashed
+/// together. Timed because it is NEW cost on the click path, added when the
+/// source of a copy moved from focus to the last click, and this project has
+/// already measured one read that turned out to cost 200ms a keystroke.
+static CLICK_ID_CALLS: AtomicU64 = AtomicU64::new(0);
+static CLICK_ID_MICROS: AtomicU64 = AtomicU64::new(0);
+
 /// (calls, total microseconds) spent in `observe_key` since the last reset,
 /// both directions together.
 pub fn timing() -> (u64, u64) {
@@ -125,7 +133,23 @@ pub fn off_key_timing() -> ((u64, u64), (u64, u64)) {
 }
 
 /// Zero the counters, so one run's numbers are its own.
+/// (calls, microseconds) spent reading clicked element ids.
+pub fn click_id_timing() -> (u64, u64) {
+    (
+        CLICK_ID_CALLS.load(Ordering::Relaxed),
+        CLICK_ID_MICROS.load(Ordering::Relaxed),
+    )
+}
+
+/// Record one click-id read. Called from the pump, where the element is.
+pub fn note_click_id_cost(micros: u64) {
+    CLICK_ID_CALLS.fetch_add(1, Ordering::Relaxed);
+    CLICK_ID_MICROS.fetch_add(micros, Ordering::Relaxed);
+}
+
 pub fn reset_timing() {
+    CLICK_ID_CALLS.store(0, Ordering::Relaxed);
+    CLICK_ID_MICROS.store(0, Ordering::Relaxed);
     GRID_CALLS.store(0, Ordering::Relaxed);
     GRID_MICROS.store(0, Ordering::Relaxed);
     GRID_UP_CALLS.store(0, Ordering::Relaxed);
@@ -327,6 +351,20 @@ const KEY_V: u32 = 0x56;
 /// [`GridCellWatcher::clipboard_needs_own_read`].
 const COPY_KEY_GRACE_MS: u64 = 1000;
 
+/// How long a click stays eligible to be the source of a copy.
+///
+/// Modelled on [`COPY_KEY_GRACE_MS`], and chosen rather than measured -- the one
+/// number in this mechanism that is a judgement. It has to span a deliberate
+/// select-then-read-then-copy, which is slower than the ~800ms an automated
+/// double-click-then-`Ctrl+C` takes, while staying far short of the gap that
+/// separates one record's work from the next. Five seconds is the first
+/// calibration, not a finding.
+///
+/// The failure it exists to prevent is specific: without it, a `Ctrl+C` with no
+/// click of its own would silently adopt whatever was clicked minutes earlier
+/// and report it as the source with full confidence.
+const CLICK_SOURCE_GRACE_MS: u64 = 5000;
+
 /// Follows the transient cell editor and produces `Type` candidates.
 #[derive(Default)]
 pub struct GridCellWatcher {
@@ -344,6 +382,15 @@ pub struct GridCellWatcher {
     /// does not overwrite it with a worse one. See [`GridCellWatcher::
     /// clipboard_needs_own_read`].
     last_copy_key_ms: Option<u64>,
+    /// The element id of the most recent click, and when it happened.
+    ///
+    /// This is what the source of a copy is resolved from on a page. It is NOT
+    /// the focused element: selecting text in a browser does not move focus, so
+    /// `Desktop::focused_element()` returns the same Document for every copy in
+    /// a session and reports nine different values as one source. Measured in
+    /// session record-fe88fb0d; see
+    /// `docs/known-issues/the-source-of-a-copy-is-read-from-focus-which-a-web-selection-never-moves.md`.
+    last_click: Option<(String, u64)>,
     /// Completed source -> destination pairs. Drained at stop.
     links: Vec<SourceLink>,
 }
@@ -379,13 +426,27 @@ impl GridCellWatcher {
     /// STARTS on a non-default sheet contains no tab click, so `current_sheet`
     /// stays `None` and its edits are recorded bare, exactly as before this
     /// existed. That case is not fixed by this and cannot be.
+    ///
+    /// It also arms the source of the next copy. `element_id` is the clicked
+    /// element's own id, and it is remembered because on a page the click is
+    /// what says which value the user is acting on -- focus does not move when
+    /// text is selected. An id that is empty arms nothing rather than arming a
+    /// blank, so a click on something the tree cannot name leaves the previous
+    /// source in place to age out on its own.
     pub fn note_click(
         &mut self,
         role: &str,
         name: Option<&str>,
+        element_id: Option<&str>,
+        timestamp_ms: u64,
         identifiers: Vec<String>,
         process_name: Option<String>,
     ) {
+        if let Some(id) = element_id {
+            if !id.trim().is_empty() {
+                self.last_click = Some((id.trim().to_string(), timestamp_ms));
+            }
+        }
         if let Some(n) = name {
             if looks_like_sheet_tab(role, n) {
                 // An in-flight edit belongs to the sheet it started on, so it is
@@ -443,6 +504,23 @@ impl GridCellWatcher {
         position: Option<(String, String)>,
         seq: u64,
     ) {
+        // Every copy reports what it resolved to, as it happens.
+        //
+        // The stop-time report can only show sources that reached a PASTE, so a
+        // copy that armed nothing -- or armed the same thing as the last one --
+        // was invisible until a pair existed to expose it. That is a slow way to
+        // learn that source resolution is broken, and it is how a session got as
+        // far as nine pastes sharing one source before anyone could see it.
+        //
+        // The document is deliberately left out, here as at stop: a URL can
+        // carry content in its query string, and §3 does not bend for a
+        // diagnostic.
+        if key_code == KEY_C {
+            match position.as_ref() {
+                Some((_, reference)) => eprintln!("[paradigm] copy source: {reference}"),
+                None => eprintln!("[paradigm] copy source: (none -- declined)"),
+            }
+        }
         match position {
             Some(position) => self.pair_clipboard(key_code, position, seq),
             None if key_code == KEY_C => self.pending_source = None,
@@ -497,6 +575,19 @@ impl GridCellWatcher {
     /// paste simply records no link, which §4.1 already treats as an
     /// observation to exclude. A *wrong* source is not: it puts a fabricated
     /// example into a Rule-of-3 count.
+    /// The click eligible to be the source of a copy happening now, if any.
+    ///
+    /// Split out for the same reason [`Self::clipboard_needs_own_read`] is: the
+    /// decision is a rule about time, it decides whether a link exists at all,
+    /// and a rule that important should be testable without a live desktop.
+    ///
+    /// Returning `None` is the correct, common answer, not a failure. It means
+    /// this copy gets no source rather than an unrelated one.
+    fn click_source_id(&self, timestamp_ms: u64) -> Option<&str> {
+        let (id, click_ms) = self.last_click.as_ref()?;
+        (timestamp_ms.saturating_sub(*click_ms) <= CLICK_SOURCE_GRACE_MS).then_some(id.as_str())
+    }
+
     fn clipboard_needs_own_read(&self, timestamp_ms: u64) -> bool {
         match self.last_copy_key_ms {
             Some(key_ms) => timestamp_ms.saturating_sub(key_ms) > COPY_KEY_GRACE_MS,
@@ -524,7 +615,7 @@ impl GridCellWatcher {
             return;
         }
         let started = std::time::Instant::now();
-        let position = self.read_position();
+        let position = self.read_position(timestamp_ms);
         CLIP_CALLS.fetch_add(1, Ordering::Relaxed);
         CLIP_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Same rule as the keystroke path: a copy whose position could not be
@@ -555,7 +646,7 @@ impl GridCellWatcher {
         // Timed for the same reason the clipboard path is: this walk is the
         // full one, and it happens while the user waits for the mark to take.
         let started = std::time::Instant::now();
-        let position = self.read_position();
+        let position = self.read_position(timestamp_ms);
         MARK_CALLS.fetch_add(1, Ordering::Relaxed);
         MARK_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         match position {
@@ -596,7 +687,7 @@ impl GridCellWatcher {
     /// blank spreadsheets share the window title "Untitled spreadsheet" -- the
     /// same ambiguity that bit replay earlier -- so the title cannot tell a
     /// source from a destination and the address bar's `/d/<id>/` can.
-    fn read_position(&mut self) -> Option<(String, String)> {
+    fn read_position(&mut self, timestamp_ms: u64) -> Option<(String, String)> {
         if self.desktop.is_none() {
             self.desktop = Desktop::new_default().ok();
         }
@@ -633,7 +724,7 @@ impl GridCellWatcher {
             PositionRead::SpreadsheetUnreadable | PositionRead::Inconclusive => None,
             // A page that was never a spreadsheet. Everything above is
             // untouched: this runs only where the Name Box was genuinely absent.
-            PositionRead::NotASpreadsheet => self.read_element_position(&root, &focused),
+            PositionRead::NotASpreadsheet => self.read_element_position(&root, timestamp_ms),
         }
     }
 
@@ -641,7 +732,38 @@ impl GridCellWatcher {
     ///
     /// The general rule lives in [`crate::identity::tree`] and is shared with
     /// everything else that reconstructs records; this only gathers the tree and
-    /// asks where the focused element sits.
+    /// asks where the user's element sits.
+    ///
+    /// **That element is the last CLICK, not the focused element**, and the
+    /// difference is the whole of this function's correctness. Selecting text on
+    /// a page does not move focus -- measured directly: three double-click
+    /// selections at three positions, each followed by `Ctrl+C`, produced *one*
+    /// focused element across 48 samples, the Document. Resolving from focus
+    /// therefore returned the same reference for every copy in a session and
+    /// reported nine distinct values as one source (record-fe88fb0d).
+    ///
+    /// **It declines rather than guessing, in four separate ways**, and each is
+    /// a case where the old code returned a confident wrong answer:
+    ///
+    /// 1. no click at all this session -- a keyboard-only selection;
+    /// 2. a click older than [`CLICK_SOURCE_GRACE_MS`];
+    /// 3. a click whose id is absent from THIS window's node list, which is what
+    ///    a click in the destination spreadsheet followed by a copy on the page
+    ///    looks like;
+    /// 4. a click on a STRUCTURAL element -- [`crate::identity::tree::locate`]
+    ///    refuses those, because a label is not a position. The three identical
+    ///    `/ month` lines on the pricing page are exactly this, so the element
+    ///    the earlier hypothesis suspected does decline, just not for the
+    ///    reason that hypothesis proposed.
+    ///
+    /// Declining costs a link; §4.1 already treats a paste with no source as an
+    /// observation to exclude. A wrong link cannot be excluded, because nothing
+    /// downstream can tell it from a real one.
+    ///
+    /// The recency check runs BEFORE the walk, so a copy that is going to
+    /// decline no longer pays for three traversals to find that out --
+    /// incidentally relieving some of what
+    /// `position-reads-dominate-an-ordinary-copy-paste-session.md` measures.
     ///
     /// **Carries no content.** The returned pair is a page identity and a
     /// `record ordinal + field label` -- the same kind of information a cell
@@ -658,19 +780,22 @@ impl GridCellWatcher {
     fn read_element_position(
         &mut self,
         root: &UIElement,
-        focused: &UIElement,
+        timestamp_ms: u64,
     ) -> Option<(String, String)> {
+        // Cases 1 and 2, both before any walk. A copy with nothing recent behind
+        // it has no source, and saying so costs one comparison.
+        let click_id = self.click_source_id(timestamp_ms)?.to_string();
+
         let page = page_identity(root)?;
 
         let mut nodes = Vec::new();
         let mut budget = 3000usize;
         collect_nodes(root, &mut budget, &mut nodes);
 
-        let focused_id = focused.id().unwrap_or_default();
-        if focused_id.trim().is_empty() {
-            return None;
-        }
-        let located = crate::identity::tree::locate(&nodes, &focused_id)?;
+        // Cases 3 and 4, both of them `locate` declining: an id this window does
+        // not contain is not in `nodes`, and a structural element is refused by
+        // the shared rule rather than by anything written here.
+        let located = crate::identity::tree::locate(&nodes, &click_id)?;
         Some((page, encode_element_ref(located.record, located.label.as_deref())))
     }
 
@@ -712,7 +837,7 @@ impl GridCellWatcher {
                     // already excludes -- a wrong source it would not.
                     self.last_copy_key_ms = Some(timestamp_ms);
                 }
-                let position = self.read_position();
+                let position = self.read_position(timestamp_ms);
                 self.note_clipboard_key(key_code, position, timestamp_ms);
             }
             self.observe_key_inner(key_code, alt_pressed, timestamp_ms)
@@ -1556,6 +1681,8 @@ mod tests {
         w.note_click(
             "text",
             Some("Sheet2"),
+            None,
+            0,
             vec!["msedge.exe".into()],
             Some("msedge.exe".into()),
         );
@@ -1578,14 +1705,93 @@ mod tests {
         // Clicks are how app identity is learned, so they arrive constantly.
         // Only a tab click may change which sheet edits are attributed to.
         let mut w = GridCellWatcher::new();
-        w.note_click("text", Some("Sheet2"), vec!["msedge.exe".into()], None);
-        w.note_click("text", Some("Windows PowerShell"), vec!["pwsh.exe".into()], None);
-        w.note_click("Button", Some("Add Sheet"), vec!["msedge.exe".into()], None);
-        w.note_click("ComboBox", Some("A1"), vec!["msedge.exe".into()], None);
+        w.note_click("text", Some("Sheet2"), None, 0, vec!["msedge.exe".into()], None);
+        w.note_click("text", Some("Windows PowerShell"), None, 0, vec!["pwsh.exe".into()], None);
+        w.note_click("Button", Some("Add Sheet"), None, 0, vec!["msedge.exe".into()], None);
+        w.note_click("ComboBox", Some("A1"), None, 0, vec!["msedge.exe".into()], None);
         assert_eq!(
             w.tracked_sheet(),
             Some("Sheet2"),
             "only a sheet-tab click may retarget the sheet"
+        );
+    }
+
+    /// The mechanism itself: a click arms the source of the next copy.
+    #[test]
+    fn a_click_arms_the_source_of_the_next_copy() {
+        let mut w = GridCellWatcher::new();
+        assert_eq!(
+            w.click_source_id(0),
+            None,
+            "nothing has been clicked, so there is no source to offer"
+        );
+        w.note_click("Text", Some("Free"), Some("id-free"), 1_000, vec![], None);
+        assert_eq!(w.click_source_id(1_200), Some("id-free"));
+    }
+
+    /// Each click replaces the last, so three selections give three sources.
+    /// This is the whole of the fix for record-fe88fb0d, where nine copies of
+    /// nine different values all resolved to one reference.
+    #[test]
+    fn three_clicks_offer_three_different_sources() {
+        let mut w = GridCellWatcher::new();
+        let mut seen = Vec::new();
+        for (id, at) in [("id-free", 1_000), ("id-go", 4_000), ("id-plus", 7_000)] {
+            w.note_click("Text", Some("tier"), Some(id), at, vec![], None);
+            seen.push(w.click_source_id(at + 800).map(str::to_string));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Some("id-free".to_string()),
+                Some("id-go".to_string()),
+                Some("id-plus".to_string())
+            ],
+            "each copy must take its own click, not the first one"
+        );
+    }
+
+    /// LIMITATION 1: a copy with no click behind it at all -- a keyboard-only
+    /// selection. It must decline, not fall back to the focused element, which
+    /// is the Document and is the same for every copy in the session.
+    #[test]
+    fn a_keyboard_only_selection_has_no_source() {
+        let w = GridCellWatcher::new();
+        assert_eq!(w.click_source_id(50_000), None);
+    }
+
+    /// LIMITATION 2: a click too old to be this copy's selection. The user
+    /// clicked something a minute ago and has since copied by some other means.
+    #[test]
+    fn a_stale_click_is_not_adopted_as_a_source() {
+        let mut w = GridCellWatcher::new();
+        w.note_click("Text", Some("Free"), Some("id-free"), 1_000, vec![], None);
+        assert_eq!(
+            w.click_source_id(1_000 + CLICK_SOURCE_GRACE_MS),
+            Some("id-free"),
+            "the boundary itself is still eligible"
+        );
+        assert_eq!(
+            w.click_source_id(1_000 + CLICK_SOURCE_GRACE_MS + 1),
+            None,
+            "one millisecond past the window is not"
+        );
+        assert_eq!(w.click_source_id(60_000), None, "a minute later, certainly not");
+    }
+
+    /// A click the tree could not name arms nothing, and -- importantly -- does
+    /// not disarm what was already there. The previous click stays, and ages out
+    /// on its own schedule rather than being cancelled by an unrelated event.
+    #[test]
+    fn a_click_with_no_id_neither_arms_nor_disarms() {
+        let mut w = GridCellWatcher::new();
+        w.note_click("Text", Some("Free"), Some("id-free"), 1_000, vec![], None);
+        w.note_click("Pane", None, Some("   "), 1_100, vec![], None);
+        w.note_click("Pane", None, None, 1_200, vec![], None);
+        assert_eq!(
+            w.click_source_id(1_300),
+            Some("id-free"),
+            "a nameless click must not erase a real one"
         );
     }
 

@@ -520,6 +520,58 @@ mod tests {
         assert_eq!(locate(&flat_card_tree(), "does-not-exist"), None);
     }
 
+    /// The pricing page, in the shape the source-from-click path now hands it:
+    /// three tiers, each with a distinct name and price, and the SAME "/ month"
+    /// beside every price.
+    ///
+    /// A click on a tier name or a price locates a record. A click on "/ month"
+    /// does not, because repetition makes it structural and a label is not a
+    /// position -- "the user copied the words / month" is not a record
+    /// reference. That decline is the honest half of the hypothesis this
+    /// replaced: `/ month` really is structural, it simply was never what
+    /// pinned the source.
+    #[test]
+    fn a_click_on_a_repeated_label_locates_nothing() {
+        let tree = vec![
+            n("t-free", "Text", "Free"),
+            n("p-0", "Text", "$0"),
+            n("per", "Text", "/ month"),
+            n("t-go", "Text", "Go"),
+            n("p-8", "Text", "$8"),
+            n("per", "Text", "/ month"),
+            n("t-plus", "Text", "Plus"),
+            n("p-20", "Text", "$20"),
+            n("per", "Text", "/ month"),
+        ];
+
+        let prices: Vec<usize> = ["p-0", "p-8", "p-20"]
+            .iter()
+            .map(|id| locate(&tree, id).expect("a price is content").record)
+            .collect();
+        // DISTINCTNESS is the requirement, not any particular ordinal. Detection
+        // has to know the three copies came from three different records; which
+        // records they were is a question for run time, against the live page.
+        // Asserting the exact numbers here would be asserting an implementation
+        // detail -- they are 1, 2, 3, because the walk numbers from the first
+        // structural element it meets.
+        let distinct: std::collections::BTreeSet<usize> = prices.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "three prices must land in three different records, got {prices:?}"
+        );
+        assert!(
+            prices.windows(2).all(|w| w[0] < w[1]),
+            "and in document order, got {prices:?}"
+        );
+
+        assert_eq!(
+            locate(&tree, "per"),
+            None,
+            "a repeated label is structural and addresses no record"
+        );
+    }
+
     #[test]
     fn empty_names_are_ignored_rather_than_counted_as_structure() {
         let tree = vec![
