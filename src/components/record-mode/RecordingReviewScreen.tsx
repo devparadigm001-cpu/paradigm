@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { describeError } from "@/lib/errors";
 import { TemplateProposalSection } from "@/components/templated-workflow";
+import { ConfirmationCandidatesSection } from "./ConfirmationCandidatesSection";
 import type { CapturedActionView, CaptureSummary, StoredPlaybookInfo } from "./types";
 
 type ReviewItem = {
@@ -168,6 +169,8 @@ export function RecordingReviewScreen({
         disabled={isSaving}
       />
 
+      <ConfirmationCandidatesSection candidates={summary.candidates} />
+
       <div className="w-full max-w-2xl flex-1 overflow-y-auto rounded-md border">
         {items.length === 0 ? (
           <p className="text-muted-foreground p-6 text-center text-sm">
@@ -188,6 +191,14 @@ export function RecordingReviewScreen({
                     <span className="rounded bg-secondary px-1.5 py-0.5 text-xs font-medium">
                       {item.action.action_type}
                     </span>
+                    {/* Ties an individual step back to the repeated-field list
+                        above. Absent on most steps by design: the filter exists
+                        because most of a recording is not a repeated field. */}
+                    {item.action.candidate_id ? (
+                      <span className="text-muted-foreground shrink-0 font-mono text-xs">
+                        {item.action.candidate_id}
+                      </span>
+                    ) : null}
                     <span className="truncate text-sm">
                       {describeAction(item.action)}
                     </span>
