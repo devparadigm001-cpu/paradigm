@@ -36,19 +36,34 @@
 //! crate holds -- `identity::tree` is pure for the same reason and the two
 //! share it on purpose.
 //!
-//! ## Two known gaps, tracked and NOT fixed here
+//! ## Three known gaps, tracked and NOT fixed here
 //!
-//! Both are real, both were found by earlier work, and both will show up in
-//! output. They are documented so that seeing them is recognition rather than
-//! a fresh investigation.
+//! All three are real, all three will show up in output, and each is documented
+//! so that seeing it is recognition rather than a fresh investigation.
 //!
-//! **1. Field labels are often missing or generic.** Confirmed on four separate
-//! applications -- Gmail, Amazon, OrderFlow and the ChatGPT pricing page. A page
-//! element frequently has no label beside it that could name the field, so a
-//! candidate may surface described only by its position. See
-//! `docs/known-issues/an-element-identity-mark-records-no-field-label.md`. The
-//! grouping does not depend on labels, which is exactly why it still works; the
-//! *description* the user reads is what suffers.
+//! **1. Field labels are missing, or WRONG.** Confirmed on four applications --
+//! Gmail, Amazon, OrderFlow and the ChatGPT pricing page. A page element often
+//! has no label beside it, so a candidate surfaces described only by its
+//! position.
+//!
+//! The worse half, measured on 2026-08-22: a label that repeats in every record
+//! is structural by the multiplicity rule and gets adopted as the field's name,
+//! so an order status became the label for the value beside it -- `el/0/Pending`
+//! rather than `el/0/CUSTOMER`. **A confidently wrong name is worse than none**,
+//! because an empty label at least announces that it does not know. See
+//! `docs/known-issues/an-element-identity-mark-records-no-field-label.md`.
+//!
+//! The grouping does not depend on labels, which is why it still works; the
+//! description the user reads is what suffers.
+//!
+//! **3. Positions from two windows of one application are pooled.** The record
+//! pitch is derived per `source_app`, which is the PROCESS name -- so a browser
+//! page and a browser-hosted spreadsheet are both `msedge.exe` and share one
+//! pitch. On the first natural recording that manufactured a fourth record for a
+//! page showing three. See
+//! `docs/known-issues/an-action-cannot-say-which-window-it-happened-in.md`; the
+//! discriminator this needs is already computed by
+//! `capture::grid::page_identity` and thrown away.
 //!
 //! **2. A scrolled session can inflate the record count.** `element_bounds` is
 //! viewport-relative, so scrolling moves an element without the element
@@ -179,6 +194,14 @@ enum FieldKey {
     },
     Position {
         kind: &'static str,
+        /// The application the position belongs to.
+        ///
+        /// **Positions from two applications are never the same field**, and
+        /// they are never even measured together: the record pitch is derived
+        /// per application. A pitch computed across two windows is arithmetic
+        /// on unrelated coordinate systems, and on the first natural recording
+        /// it manufactured a fourth record for a page that has three.
+        app: String,
         /// Which visual row within a record, in [`ROW_BAND_PX`] units.
         band: i64,
         /// Rank left-to-right within that row. **Rank, not absolute x.**
@@ -195,7 +218,12 @@ impl FieldKey {
             FieldKey::Column { kind, column } => {
                 format!("{kind} into column {column} of the spreadsheet")
             }
-            FieldKey::Position { kind, band, rank } => {
+            FieldKey::Position {
+                kind,
+                app,
+                band,
+                rank,
+            } => {
                 let ordinal = match rank {
                     0 => "1st".to_string(),
                     1 => "2nd".to_string(),
@@ -203,7 +231,7 @@ impl FieldKey {
                     n => format!("{}th", n + 1),
                 };
                 format!(
-                    "{kind} on the {ordinal} element across, {}px into each record",
+                    "{kind} on the {ordinal} element across, {}px into each record, in {app}",
                     (*band as f64 * ROW_BAND_PX) as i64
                 )
             }
@@ -226,6 +254,8 @@ impl FieldKey {
 struct Positioned {
     index: usize,
     kind: &'static str,
+    /// Which application's coordinate system `x` and `y` belong to.
+    app: String,
     x: f64,
     y: f64,
 }
@@ -311,20 +341,36 @@ fn assign_records(items: &[Positioned]) -> Option<Vec<(FieldKey, String)>> {
     }
 
     let mut out = Vec::with_capacity(items.len());
-    let mut seen: BTreeSet<(i64, i64, usize)> = BTreeSet::new();
+    // key -> the y that claimed it. The VALUE is what makes this a real check
+    // rather than a repeat-detector: see below.
+    let mut seen: BTreeMap<(i64, i64, usize), i64> = BTreeMap::new();
     for (p, (record, band, x)) in items.iter().zip(placed) {
         let rank = rows
             .get(&(record, band))?
             .iter()
             .position(|c| (*c - x).abs() < f64::EPSILON)?;
-        // The validation. Two elements of one record at one band and one rank
-        // means the pitch is wrong.
-        if !seen.insert((record, band, rank)) {
+        // The validation, and it must compare the Y rather than merely notice a
+        // repeat.
+        //
+        // Rank comes from a deduplicated x list, so two elements at one key
+        // always share an x. Two clicks on the SAME element are then
+        // indistinguishable from two records folded together by a bad pitch --
+        // unless the y is checked, which separates them exactly: the same
+        // element clicked twice has one y, a fold has two.
+        //
+        // Rejecting on the repeat alone -- which is what this did until
+        // 2026-08-22 -- makes the whole page side collapse on any real
+        // recording. Measured, on the first natural one: 179 clicks over 24
+        // distinct positions, 23 of them clicked more than once and one hit 59
+        // times. Clicking the same thing twice is ordinary, not ambiguous.
+        let y_key = p.y.round() as i64;
+        if *seen.entry((record, band, rank)).or_insert(y_key) != y_key {
             return None;
         }
         out.push((
             FieldKey::Position {
                 kind: p.kind,
+                app: p.app.clone(),
                 band,
                 rank,
             },
@@ -332,6 +378,57 @@ fn assign_records(items: &[Positioned]) -> Option<Vec<(FieldKey, String)>> {
         ));
     }
     Some(out)
+}
+
+/// Run [`assign_records`] once per application, and keep what succeeds.
+///
+/// **A pitch across two windows is arithmetic on unrelated coordinate
+/// systems.** Measured on session record-1a2123c0: pooling an OrderFlow page
+/// with a Google Sheets window produced a candidate claiming FOUR records for a
+/// page that shows three, because the sheet's y values entered the same
+/// division. Partitioning is not a refinement of the rule; without it the rule
+/// is computing something that does not mean anything.
+///
+/// A decline stays all-or-nothing **within** an application and no longer takes
+/// the others down with it, which is the one thing partitioning improves beyond
+/// correctness.
+///
+/// **It does not separate two WINDOWS of one application, and that is the case
+/// that actually bites.** `source_app` is the process name, so a browser page
+/// and a browser-hosted spreadsheet are both `msedge.exe` and stay pooled —
+/// verified on record-1a2123c0, where adding this partition changed the result
+/// not at all. The four-records-from-three artifact there survives it.
+///
+/// Fixing that needs a per-window or per-document discriminator on
+/// `CapturedAction`, which capture does not currently store even though
+/// `capture::grid::page_identity` already computes a URL for the position path.
+/// So this partition is correct and insufficient, and is kept for what it does
+/// prevent: pooling a desktop application's coordinates with a browser's.
+fn assign_records_per_app(items: &[Positioned]) -> Vec<(usize, FieldKey, String)> {
+    let mut by_app: BTreeMap<&str, Vec<&Positioned>> = BTreeMap::new();
+    for p in items {
+        by_app.entry(p.app.as_str()).or_default().push(p);
+    }
+
+    let mut out = Vec::new();
+    for group in by_app.values() {
+        let owned: Vec<Positioned> = group
+            .iter()
+            .map(|p| Positioned {
+                index: p.index,
+                kind: p.kind,
+                app: p.app.clone(),
+                x: p.x,
+                y: p.y,
+            })
+            .collect();
+        if let Some(assigned) = assign_records(&owned) {
+            for (p, (key, record)) in group.iter().zip(assigned) {
+                out.push((p.index, key, record));
+            }
+        }
+    }
+    out
 }
 
 /// Reduce a recording to the things worth asking the user about.
@@ -376,7 +473,13 @@ pub fn candidates(actions: &[CapturedAction]) -> CandidateSet {
 
         if let Some((x, y, _w, _h)) = action.element_bounds {
             funnel.with_identity += 1;
-            positioned.push(Positioned { index, kind, x, y });
+            positioned.push(Positioned {
+                index,
+                kind,
+                app: action.source_app.clone(),
+                x,
+                y,
+            });
         }
         // Everything else has no identity this can group by, and is dropped.
     }
@@ -388,12 +491,10 @@ pub fn candidates(actions: &[CapturedAction]) -> CandidateSet {
         e.0.insert(record);
         e.1.push(index);
     }
-    if let Some(assigned) = assign_records(&positioned) {
-        for (p, (key, record)) in positioned.iter().zip(assigned) {
-            let e = grouped.entry(key).or_default();
-            e.0.insert(record);
-            e.1.push(p.index);
-        }
+    for (index, key, record) in assign_records_per_app(&positioned) {
+        let e = grouped.entry(key).or_default();
+        e.0.insert(record);
+        e.1.push(index);
     }
 
     funnel.field_groups = grouped.len();
@@ -557,6 +658,72 @@ mod tests {
             "drifting x must not split one field into several"
         );
         assert!(set.groups.iter().all(|g| g.distinct_records == 3));
+    }
+
+    /// Clicking the same element more than once must not destroy the grouping.
+    ///
+    /// Regression for a defect the first natural recording exposed on
+    /// 2026-08-22 and no synthetic fixture had: 179 page clicks landed on 24
+    /// distinct positions, 23 of them clicked more than once, and one position
+    /// was clicked **59 times**. The collision check rejected on the repeat
+    /// alone, so `assign_records` declined and every page-side candidate in the
+    /// recording vanished -- 0 groups from 179 clicks.
+    ///
+    /// A person clicking the same thing twice is ordinary. Only two DIFFERENT
+    /// ys at one key is a real fold.
+    ///
+    /// **The fixture is the real click distribution, not a tidy one.** A clean
+    /// fixture -- one click per field per record -- is exactly what failed to
+    /// catch this, because the defect only appears once a position repeats. The
+    /// counts below are transcribed from record-1a2123c0: the OrderFlow page,
+    /// three orders, with the click count each position actually received.
+    #[test]
+    fn repeated_clicks_on_one_element_do_not_collapse_the_page_side() {
+        // (x, y, times clicked) -- measured, not invented. Three records at
+        // y234/407/580 for the status and y259/432/605 for the customer, plus
+        // the product row at y327/500/673 where one position was hit 10 times.
+        let measured: [(f64, f64, usize); 12] = [
+            (2738.0, 234.0, 6),
+            (2061.0, 259.0, 6),
+            (2061.0, 327.0, 6),
+            (2319.0, 327.0, 6),
+            (2738.0, 407.0, 4),
+            (2061.0, 432.0, 6),
+            (2061.0, 500.0, 6),
+            (2319.0, 500.0, 6),
+            (2738.0, 580.0, 4),
+            (2061.0, 605.0, 6),
+            (2061.0, 673.0, 6),
+            (2319.0, 673.0, 10),
+        ];
+        let mut specs = Vec::new();
+        for (x, y, times) in measured {
+            for _ in 0..times {
+                specs.push(at(x, y));
+            }
+        }
+        let total: usize = measured.iter().map(|m| m.2).sum();
+        assert_eq!(total, 72, "the fixture is the measured distribution");
+
+        let set = candidates(&actions(specs));
+        assert_eq!(
+            set.groups.len(),
+            4,
+            "status, customer, product and price -- four fields, whatever the \
+             click counts. Got: {:?}",
+            set.groups.iter().map(|g| &g.detail).collect::<Vec<_>>()
+        );
+        for g in &set.groups {
+            assert_eq!(
+                g.distinct_records, 3,
+                "three records, counted by position and not by click"
+            );
+        }
+        assert_eq!(
+            set.groups.iter().map(|g| g.occurrences()).sum::<usize>(),
+            total,
+            "every click is still accounted for as an occurrence"
+        );
     }
 
     /// A page that is not a repeating list has no pitch, and the honest answer

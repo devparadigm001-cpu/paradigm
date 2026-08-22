@@ -231,3 +231,86 @@ rather than modelled.
 
 Until then the pipeline is proven on real data only for the case that yields
 zero candidates, and the interesting numbers are a projection.
+
+## The first natural recording, 2026-08-22 — and what it broke
+
+Session record-1a2123c0, saved as playbook "t". **231 raw actions**, worked
+normally with deliberate incidental clicking. The first test of this pipeline on
+data that was not driven straight at the fields.
+
+```
+stage 0  raw actions                  : 231
+stage 1  after dropping Navigate      : 201  (-30)
+stage 2  with a cell ref or a position: 201  (-0)
+stage 3  distinct field groups        : 22
+stage 4  surviving the Rule of 3      : 3
+```
+
+**It found a defect, which is what it was for.** On the first run the page side
+produced *nothing*: 179 page clicks, 0 groups. `assign_records` declined for the
+entire recording.
+
+The cause, measured: **179 clicks landed on 24 distinct positions, 23 of them
+clicked more than once, and one position was clicked 59 times.** The collision
+check rejected on a repeated key, and because rank is taken from a deduplicated
+x list, two elements at one key always share an x — so the check was not
+detecting ambiguity at all. It was detecting *any repeated click*, which is
+ordinary behaviour. Comparing the y separates the two cases exactly: the same
+element clicked twice has one y, a genuine fold has two.
+
+No synthetic fixture had caught it. The OrderFlow probe run made six clicks on
+six distinct positions; a person makes 179 on 24.
+
+### The numbers, after the fix
+
+| | modelled projection | first natural recording |
+|---|---|---|
+| Navigate share | 14% | **13.0%** (30/231) |
+| candidates surviving | 13.0% of raw | **1.30%** (3/231) |
+| genuine decisions | 3.7% | **0.43%** (1/231) |
+
+The Navigate ratio landed almost exactly on the projection, which is some
+evidence the modelled fixture was built on a realistic session shape.
+
+**The survival rate did not.** 1.30% against a projected 13.0% — an order of
+magnitude fewer questions. Two of the three survivors are spreadsheet columns,
+which this document already argues are not genuinely in question, so the real
+count is **one ambiguous decision from 231 actions**.
+
+The projection is therefore **refuted in the generous direction**: far less
+tedium than modelled. But the two runs are not like for like — the modelled
+fixture had 54 actions and this one 231, and a longer session dilutes the
+survivor count without changing how many fields were transferred. The honest
+statement is that on one real recording the user would face **one question**,
+not that a 10x improvement has been demonstrated.
+
+### The known gaps, as they actually appeared
+
+**The label defect showed up in a worse form than "empty".** The source links
+carry labels like `el/0/Pending` and `el/2/Pending` — `Pending` is the order
+status, identical in every record, therefore structural, therefore adopted as
+the field's addressing label. So the field is not unnamed; it is **confidently
+misnamed**. `el/0/UNIT PRICE` and `el/1/PRODUCT` are correct, so the mechanism
+is not broken — it takes whatever structural element precedes the value, and on
+this page that is sometimes a status badge.
+
+**The surviving positional candidate claims 4 records** where the page shows
+three — `Pending` sits at y234, y407 and y580, and nowhere else.
+
+It first looked like the scroll gap. It is not. `assign_records` derives ONE
+record pitch from every position in the recording, and this session mixes an
+OrderFlow page (x≈2000–2700) with a Google Sheets window (x≈3000–3650).
+Dividing that pooled range by a single pitch invents a record.
+
+Partitioning by application was added and **changed the result not at all**,
+which is the more useful half of the finding: `source_app` is the PROCESS name,
+and both windows are `msedge.exe`. Capture stores no per-window or per-document
+discriminator, even though `capture::grid::page_identity` already computes a URL
+on the position path. So the partition is correct, insufficient, and the
+artifact stands until an action can say which window it happened in.
+
+The candidate itself is worth naming for what it is: `cand-1` is the **order
+status**, clicked fourteen times across the session. A textbook *systematic
+incidental* — the case this whole design exists for, because nothing can
+distinguish it from a meaningful field. The filter surfaced it and did not
+decide it, which is the intended behaviour rather than a miss.

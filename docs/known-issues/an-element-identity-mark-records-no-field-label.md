@@ -1,10 +1,19 @@
-# An element-identity mark records a position with no field label
+# An element-identity mark records a position with a missing or WRONG field label
 
 **Status:** open, real defect. Found 2026-08-19 in the first live test of the
-`Ctrl+Shift+M` source marker.
-**Severity: MEDIUM-HIGH.** The position is real and the record ordinal is
-correct, but the **field is an empty string**, so any pattern detected from
-these marks describes a mapping no one can read and nothing can resolve.
+`Ctrl+Shift+M` source marker. **Severity escalated 2026-08-22.**
+**Severity: HIGH**, raised from MEDIUM-HIGH.
+
+The original defect was an **empty** field: position and record ordinal right,
+field `""`, and a mapping built from it unreadable. The escalation is that the
+label is not always empty — it can be **confidently wrong**, adopting a repeated
+value such as an order status as the name of the field beside it
+(`el/0/Pending`).
+
+An empty label announces that it does not know. A wrong one does not, and it now
+reaches the user, because `detect::candidates` renders candidates on the review
+screen. Silent-wrong-target is the failure class this project keeps finding, and
+this is that class arriving in the label.
 **Where:** `capture::grid::read_element_position` → `identity::tree::locate` →
 `detect::link::surface_and_cell`.
 **Not** a spreadsheet problem. The Name Box path is unaffected and produced a
@@ -178,3 +187,29 @@ So the fix has a shape: get the label from the tree at capture time, alongside
 the position, rather than trying to recover it later from values. That is the
 same conclusion this doc already reached; what is new is that the cost of not
 doing it is now paid in front of the user.
+
+## Worse than empty: confidently WRONG (2026-08-22)
+
+Session record-1a2123c0, a natural OrderFlow recording:
+
+```
+el/0/Pending      -> A2
+el/0/UNIT PRICE   -> E2
+el/1/Pending      -> A3
+el/1/PRODUCT      -> C3
+el/2/Pending      -> C4
+```
+
+`UNIT PRICE` and `PRODUCT` are right. **`Pending` is the order status**, printed
+identically in every record — so it is structural by the multiplicity rule, and
+the adjacency rule adopts it as the label for whatever value follows it.
+
+The mechanism is not malfunctioning. It takes the structural element preceding
+the value, and on this page that is sometimes a status badge rather than a
+column heading. But the output is a field named `Pending`, which is worse than a
+field named nothing: an empty label announces that it does not know, and this
+one does not.
+
+Whatever supplies labels in future has to distinguish *a heading that addresses
+the next value* from *a repeated value that merely sits above one*. Adjacency
+alone cannot, because both are structural and both precede content.

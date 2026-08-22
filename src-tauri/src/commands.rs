@@ -406,10 +406,21 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
     // copying in it -- which is the whole point of a design that needs no
     // marker during recording.
     let candidates = detect::candidates::candidates(&report.actions);
+    // The FUNNEL, not just the count. A recording that surfaces two candidates
+    // from 231 actions cannot be explained by the count alone -- reconstructing
+    // it afterwards took a purpose-built probe and a saved playbook, and a
+    // recording that is not saved leaves no way to ask at all.
+    let f = candidates.funnel;
     eprintln!(
-        "[paradigm] confirmation candidates: {} from {} action(s)",
+        "[paradigm] confirmation candidates: {} from {} action(s) \
+         -- stages: raw {} / after Navigate {} / with identity {} / groups {} / surviving {}",
         candidates.groups.len(),
-        report.actions.len()
+        report.actions.len(),
+        f.raw,
+        f.after_navigate,
+        f.with_identity,
+        f.field_groups,
+        f.surviving
     );
     for c in &candidates.groups {
         eprintln!(
