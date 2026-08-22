@@ -57,7 +57,41 @@ pub struct CapturedActionView {
     /// secret never crosses the IPC boundary even for display.
     pub payload_preview: Option<String>,
     pub would_redact: bool,
+    /// What capture noted about how this action was observed -- keystroke
+    /// counts, edit duration, the window a switch came from.
+    ///
+    /// `CapturedAction` has carried this since capture was built and the view
+    /// simply never forwarded it, so the review screen could not explain why a
+    /// step looked the way it did.
+    ///
+    /// Withheld under redaction alongside `payload_preview`. It holds no
+    /// payload, but a `Navigate`'s detail is `from "<window title>"`, and a
+    /// title is exactly the kind of thing the policy exists to keep back.
+    pub detail: Option<String>,
+    /// The confirmation candidate this action belongs to, if any.
+    ///
+    /// `None` for the great majority of steps: most of a recording is context
+    /// and incidental clicking, and [`detect::candidates`] is a filter whose
+    /// whole purpose is that most actions do not survive it.
+    pub candidate_id: Option<String>,
     pub timestamp_ms: u64,
+}
+
+/// One thing the user is asked to confirm on the review screen.
+///
+/// Structure only. The filter decides what to ask about and never what the
+/// answer is, so nothing here asserts that a candidate is meaningful.
+#[derive(Debug, Serialize)]
+pub struct FieldCandidateView {
+    pub id: String,
+    pub detail: String,
+    pub action_type: String,
+    /// Distinct records the field was touched in. The Rule of 3 applies to
+    /// this, not to `occurrences`.
+    pub distinct_records: usize,
+    pub occurrences: usize,
+    /// 1-based step numbers, matching `CapturedActionView::step_order`.
+    pub step_orders: Vec<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +112,16 @@ pub struct CaptureSummary {
     /// that no action records -- see `CaptureReport::pastes_observed`.
     pub pastes_observed: usize,
     pub actions: Vec<CapturedActionView>,
+    /// What the user is asked to confirm, from [`detect::candidates`].
+    ///
+    /// Empty is the ordinary case and is not a failure: most recordings contain
+    /// no field repeated across three records.
+    ///
+    /// Distinct from `template`. That one requires source LINKS, which exist
+    /// only when the user copied and pasted; this reads the action stream
+    /// itself, so it also covers a workflow that transfers values by reading
+    /// and retyping them.
+    pub candidates: Vec<FieldCandidateView>,
     /// The repeating pattern detection found, if it found one. §4.12's review:
     /// the user sees the mapping in full before answering.
     pub template: Option<TemplateProposal>,
@@ -186,7 +230,11 @@ pub struct RunHistoryEntry {
     pub steps: Vec<StepLogView>,
 }
 
-fn view_of(actions: &[CapturedAction], policy: &RedactionPolicy) -> Vec<CapturedActionView> {
+fn view_of(
+    actions: &[CapturedAction],
+    policy: &RedactionPolicy,
+    candidates: &detect::candidates::CandidateSet,
+) -> Vec<CapturedActionView> {
     actions
         .iter()
         .enumerate()
@@ -204,6 +252,12 @@ fn view_of(actions: &[CapturedAction], policy: &RedactionPolicy) -> Vec<Captured
                     a.payload.as_ref().map(|p| truncate(p, 80))
                 },
                 would_redact,
+                detail: if would_redact {
+                    None
+                } else {
+                    a.detail.clone()
+                },
+                candidate_id: candidates.candidate_of(i).map(str::to_string),
                 timestamp_ms: a.timestamp_ms,
             }
         })
@@ -342,6 +396,31 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
     let (template, no_template_reason) =
         propose_template(&report.source_links, report.pastes_observed);
 
+    // The filtered-post-hoc-confirmation candidates, computed at the same
+    // moment and for the same reason: both are pure, both are cheap, and both
+    // answer a question the user is about to be asked on the review screen.
+    //
+    // Deliberately independent of `propose_template`. That path needs source
+    // LINKS, which only exist when the user copied and pasted; this one reads
+    // the action stream itself and therefore also covers a workflow with no
+    // copying in it -- which is the whole point of a design that needs no
+    // marker during recording.
+    let candidates = detect::candidates::candidates(&report.actions);
+    eprintln!(
+        "[paradigm] confirmation candidates: {} from {} action(s)",
+        candidates.groups.len(),
+        report.actions.len()
+    );
+    for c in &candidates.groups {
+        eprintln!(
+            "[paradigm]   {}: {} -- {} record(s), {} action(s)",
+            c.id,
+            c.detail,
+            c.distinct_records,
+            c.occurrences()
+        );
+    }
+
     let policy = RedactionPolicy::placeholder();
     let summary = CaptureSummary {
         session_name: report.session_name.clone(),
@@ -350,7 +429,19 @@ pub async fn stop_record_session(state: State<'_, AppState>) -> Result<CaptureSu
         unmapped_events: report.unmapped_events,
         events_lost: report.events_lost,
         pastes_observed: report.pastes_observed,
-        actions: view_of(&report.actions, &policy),
+        actions: view_of(&report.actions, &policy, &candidates),
+        candidates: candidates
+            .groups
+            .iter()
+            .map(|c| FieldCandidateView {
+                id: c.id.clone(),
+                detail: c.detail.clone(),
+                action_type: c.kind.as_str().to_string(),
+                distinct_records: c.distinct_records,
+                occurrences: c.occurrences(),
+                step_orders: c.action_indices.iter().map(|i| i + 1).collect(),
+            })
+            .collect(),
         template,
         no_template_reason,
     };

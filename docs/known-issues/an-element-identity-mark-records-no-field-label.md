@@ -146,3 +146,35 @@ safely" decision.
   live-surface pattern, and why `identity::tree`'s inputs deserve suspicion.
 * `docs/planning/Generalizing-Source-Destination-Tracking.md` §9.2 — the table
   of what has been proven per surface, and to what depth.
+
+## Confirmed on a fourth application, and now user-visible (2026-08-22)
+
+Four applications have shown it: Gmail, Amazon, OrderFlow, and the ChatGPT
+pricing page — the last through session record-fe88fb0d, where every one of
+nine source references was `el/N/` with the label half empty.
+
+`detect::candidates` shipped on 2026-08-22 and this defect is now something the
+**user reads**, not only something the logs record. A candidate is described by
+its position rather than by a field name:
+
+```
+[ ] cand-1  click on the 1st element across, 0px into each record    3 records
+[ ] cand-2  click on the 1st element across, 100px into each record  3 records
+```
+
+Those two are the customer name and the quantity on a real OrderFlow page,
+correctly grouped across three orders. The **grouping** does not depend on
+labels — it is positional by design, which is exactly why it works — so this
+does not break detection. It degrades the question the user is asked into one
+they have to decode.
+
+**The names were captured.** The same recording holds `Harbor Point Traders`,
+`Ashgrove Manufacturing`, `Windmere Consulting`. They cannot name the field
+because they are the *values*, and they differ per record by design. The field
+name would have to come from an adjacent structural element, which is what
+`identity::tree` supplies and what the action stream does not carry.
+
+So the fix has a shape: get the label from the tree at capture time, alongside
+the position, rather than trying to recover it later from values. That is the
+same conclusion this doc already reached; what is new is that the cost of not
+doing it is now paid in front of the user.

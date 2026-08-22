@@ -111,6 +111,16 @@ cheap.
 
 **3. Scroll-epoch partitioning. SCOPED 2026-08-21, and it changed shape.**
 
+RAISED IN PRIORITY 2026-08-22: `detect::candidates` now ships and inherits this
+defect directly. One element clicked three times at three scroll positions
+produces a candidate reading "3 records" -- reproduced live, and pinned by a
+failing test, `one_element_seen_at_three_scroll_positions_is_not_three_records`.
+The obvious in-module guard was checked and does not work: a real page carries
+`Pending` three times, once per genuine record, at one x and one width, so a
+repeated VALUE and a repeated OBSERVATION are identical in everything the action
+stream holds. Direction 3a is the separation, and that test is the standing
+reason to build it.
+
 The original sketch was pure inference: *an element with the same name and width
 at a different y proves the view moved.* Two things came out of scoping it.
 

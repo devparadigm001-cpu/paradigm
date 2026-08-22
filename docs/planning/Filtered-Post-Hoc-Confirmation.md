@@ -146,6 +146,81 @@ difference from every approach that failed above.
   non-spreadsheet surface costs ~432ms and that `page_identity` falls back to a
   window title.
 
+## BUILT 2026-08-22, and measured on real data
+
+Shipped as `detect::candidates`, a pure function of `&[CapturedAction]`, wired
+into `stop_record_session` beside `propose_template`. `CandidateSet` carries the
+funnel out of the same pass that produces the groups, so the reported stage
+counts and the actual filtering cannot drift apart.
+
+### The recording this was waiting for
+
+"The next step" below asked for a real three-record recording with captured
+bounds. Here it is — OrderFlow, three orders, two fields touched in each,
+through `examples/candidates_probe.rs`:
+
+```
+    1 navigate  OrderFlow Export             x2006 y90  w880 h948
+    2 click     Harbor Point Traders         x2063 y256 w138 h22
+    3 click     12                           x2063 y346 w16  h22
+    4 click     Ashgrove Manufacturing       x2063 y465 w165 h22
+    5 click     40                           x2063 y555 w18  h22
+    6 click     Windmere Consulting          x2063 y674 w145 h22
+    7 click     2                            x2063 y764 w10  h22
+
+  stage 0  raw actions                  : 7
+  stage 1  after dropping Navigate      : 6  (-1)
+  stage 2  with a cell ref or a position: 6  (-0)
+  stage 3  distinct field groups        : 2
+  stage 4  surviving the Rule of 3      : 2
+
+  [ ] cand-1  click on the 1st element across, 0px into each record    3 records, 3 actions  steps [2, 4, 6]
+  [ ] cand-2  click on the 1st element across, 100px into each record  3 records, 3 actions  steps [3, 5, 7]
+```
+
+Both candidates are correct: cand-1 is the customer field, cand-2 the quantity,
+each grouped across all three orders. **Positional grouping now has captured
+bounds behind it rather than modelled ones**, which was the open item.
+
+### What changed from the prototype, and why
+
+**Stage 2 got weaker on purpose.** The prototype required a usable *name*,
+because it had no bounds to fall back on. That rule drops exactly the case the
+empty-label defect produces, which is most page-side sources. An action is now
+usable if it has a cell reference **or** a position.
+
+**Stage 3's positional half is the 2-D rule, not the x-band.** Record pitch from
+the modal pairwise y-difference, record index by division, then field = the
+element's **rank** within its row. Absolute x drifts between records; rank does
+not. The 1-D x-band the prototype used is what the 2026-08-20 x-banding fix
+replaced.
+
+**The pitch is validated rather than trusted.** Two elements of one record
+landing at the same band and rank means the pitch is wrong, and the function
+returns nothing instead of a confident mis-grouping.
+
+### The numbers the prototype projected, against the numbers measured
+
+The projection was 13% of raw actions surviving and 3.7% being genuine
+decisions. The real recording gives **2 decisions from 7 raw actions**, but the
+comparison is not meaningful: this recording was driven straight at the fields
+with almost no incidental clicking, while the projection assumed the 14/46/41
+noise ratio of a human session. **The projection is neither confirmed nor
+refuted, and the honest reading is that a clean synthetic run cannot test a
+tedium claim about messy real use.** That still needs a recording of someone
+genuinely working.
+
+### The weakest number in the build
+
+`RECORD_PITCH_FLOOR_PX = 120.0`, the smallest y-difference allowed to be a
+record pitch. It is a calibration on one layout, not a finding, and it is
+labelled as such in the code.
+
+The OrderFlow run came closer to it than is comfortable: the true pitch was
+209px, and the nearest competing difference was **119px** — one pixel below the
+floor. It lost anyway, on support (4 occurrences against 2), so the floor was
+not what saved it. A denser list would defeat this constant, and the validation
+step is what catches that rather than the floor itself.
 ## The next step
 
 **Capture one real three-record recording under the current build** — which now
