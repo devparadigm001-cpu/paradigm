@@ -96,9 +96,26 @@ rows 32px apart — produce a y set that is uniformly 16px and genuinely periodi
 at both 16 and 32. Nothing in y alone can choose, and the offset-cluster rule
 should actively prefer 16, because one cluster is more economical than two.
 
-**That is REASONED, not measured.** A fixture for it was added to the probe and
-the run was blocked by Application Control before it could execute. The 6-of-6
-table above WAS measured; this case was not, and it is the one I expect to fail.
+**Confirmed by execution, in a validated replication.** The Rust probe could not
+be run -- Application Control blocked the rebuilt binary through twenty minutes
+of retries -- so the algorithm was replicated in JavaScript and checked against
+the six cases whose Rust output is already known. It reproduced all six exactly,
+which is what makes its seventh answer worth anything:
+
+```
+  OrderFlow, all elements      truth  209px   got   209px  ok
+  OrderFlow, clicked only      truth  209px   got   209px  ok
+  File Explorer, Projects      truth   32px   got    32px  ok
+  gnu.org directory index      truth   26px   got    26px  ok
+  Wikipedia table rows         truth   33px   got    33px  ok
+  not a repeating list         truth   none   got    None  ok
+  two-line rows (AMBIGUOUS)    truth   32px   got    16px  XX
+```
+
+**16px against a truth of 32px.** The predicted failure, executed rather than
+argued. Note what it is NOT: not a harmonic, and not a confident answer over
+nothing -- it is the smaller of two periods that are both genuinely present. The
+fix is x, and until x is used this case is wrong.
 
 The information needed is **x**: under the true pitch every block shows the same
 field layout across x, and under the half-pitch alternate blocks differ. That
