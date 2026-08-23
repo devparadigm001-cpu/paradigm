@@ -111,11 +111,25 @@ async fn main() -> ExitCode {
     // `capture::grid::read_position` anchors on, so this measures the tree
     // production would actually walk. A `role:Document` anchor was tried first
     // and cannot see a native app: File Explorer has no Document at all.
-    let Ok(anchor) = desktop.focused_element() else {
-        eprintln!("no focused element");
-        return ExitCode::FAILURE;
+    // Focus first -- it is what read_position anchors on, and it is the only
+    // thing that reaches a native app. Browsers sometimes walk up from the
+    // focused element to an unnamed ancestor, so fall back to the Document.
+    let anchor = match desktop.focused_element() {
+        Ok(el) => el,
+        Err(_) => match desktop
+            .locator("role:Document")
+            .first(Some(Duration::from_secs(10)))
+            .await
+        {
+            Ok(el) => el,
+            Err(_) => {
+                eprintln!("no focused element and no Document");
+                return ExitCode::FAILURE;
+            }
+        },
     };
     let mut root = anchor.clone();
+    #[allow(unused_assignments)]
     for _ in 0..12 {
         match root.parent() {
             Ok(Some(parent)) => {
@@ -128,7 +142,32 @@ async fn main() -> ExitCode {
             _ => break,
         }
     }
-    let title = root.name().unwrap_or_default();
+    let mut title = root.name().unwrap_or_default();
+    if !title.to_lowercase().contains(&want.to_lowercase()) {
+        // Second chance through the Document anchor, for pages whose focused
+        // element walks up to an unnamed ancestor -- Gmail does this.
+        if let Ok(doc) = desktop
+            .locator("role:Document")
+            .first(Some(Duration::from_secs(10)))
+            .await
+        {
+            let mut up = doc;
+            for _ in 0..12 {
+                match up.parent() {
+                    Ok(Some(p)) => {
+                        let reached = p.role() == "Window";
+                        up = p;
+                        if reached {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            title = up.name().unwrap_or_default();
+            root = up;
+        }
+    }
     if !title.to_lowercase().contains(&want.to_lowercase()) {
         eprintln!("resolved window is {title:?}, not {want:?} -- refusing to report it as such");
         return ExitCode::FAILURE;
