@@ -124,3 +124,21 @@ source will show roughly 12ms instead.
   breakdown and the lock-contention note.
 * `docs/known-issues/an-element-identity-mark-records-no-field-label.md` — what
   that expensive walk returns, and why it is often unlabelled.
+
+## The scale arrived, 2026-08-22
+
+This doc closed by saying the cost "survives at the scale measured, not that it
+is safe at every scale — and the same census that proves the first cannot prove
+the second."
+
+Both halves were confirmed on the same recording. A Wikipedia article, 3365
+named elements in its tree, produced **1297ms per key-down** — six times the
+202ms recorded here — and slightly over half the session's events were lost.
+
+The second half held too: the census reported 295 lost, and the arithmetic shows
+even that number is a lower bound, because the census itself appears to have
+been starved by the same synchronous blocking. See
+`a-large-page-starves-the-pump-and-loses-half-the-recording.md`.
+
+The "share one traversal" direction proposed above is now the fix for a
+recording that fails outright, not an optimisation.
