@@ -1,6 +1,8 @@
 # A large page starves the pump, and half the recording is lost
 
-**Status:** open, measured 2026-08-22 in session record-36774fe1.
+**Status:** FIXED 2026-08-22, hours after it was found. Kept because the
+wrong diagnosis that preceded the fix is the instructive part, and because the
+fix trades loss for a documented silence rather than removing the cost.
 **Severity: HIGH.** Slightly over half of one recording never reached capture.
 The result was 8 captured actions, 0 source links and 0 candidates from a
 session in which the user transferred several rows. **A whole class of real page
@@ -120,3 +122,90 @@ census down with it.
   — the same read measured at 202ms, with the explicit note that it "survives at
   the scale measured, not that it is safe at every scale". This is that scale
   arriving.
+
+## The first diagnosis was wrong, and measurement is what caught it
+
+This doc originally proposed sharing one traversal instead of three, following
+`position-reads-dominate-an-ordinary-copy-paste-session.md`. That direction was
+read off the code and it does not survive measurement.
+
+`examples/read_cost_probe.rs`, against the real Wikipedia window:
+
+```
+  structure only (children)           3000 nodes   1163ms
+  + name()  (x2: position, page id)     90 nodes     85ms
+  + role() + name()  (no id)          3000 nodes   2450ms
+  + id() + role() + name()  (nodes)   3000 nodes   3828ms
+
+  saving from merging the walks:  169ms  (4%)
+```
+
+**The two "extra" walks visit 90 nodes and cost 85ms.** Both carry a
+`depth > 14` limit and both early-exit as soon as they find what they want, so
+neither was ever the problem. Merging them saves 4%, which would have taken
+1297ms per key-down to roughly 1240ms and lost the recording anyway.
+
+The cost is the third walk, and it is roughly thirds: **1163ms is the bare
+traversal** — `children()` across 3000 nodes with no property reads at all —
+with role+name adding ~1.3s and `id()` another ~1.4s. Three walks was the shape
+of the code, not the shape of the cost.
+
+## The fix: a time bound, not a node bound
+
+`collect_nodes` now stops on **either** 3000 nodes or
+[`WALK_TIME_BUDGET_MS`] = 400ms, and a walk stopped by the clock returns **no
+position at all**.
+
+A partial node list must never be used. `identity::tree` separates structural
+from content by multiplicity, so a tree cut short reports repeated elements as
+occurring once, reclassifies them as content, and yields a position that is
+wrong rather than absent.
+
+The threshold comes from measuring the walk itself on each surface, not from the
+session means:
+
+| window | nodes | full walk |
+|---|---|---|
+| OrderFlow dashboard | 78 | 113ms |
+| Wikipedia article | 3000 (budget spent) | 3828ms |
+
+The page-identity walk was also folded into the position walk, since the URL
+comes from the same element, on the same `text(0)`, that the document id already
+reads. That part is genuinely free — no extra node visited, early-exit condition
+untouched — but it is a tidying, not the fix.
+
+## The evidence, same page, before and after
+
+```
+before   grid sampling: key-down 26 calls, 1297233 us mean
+         event census: 584 emitted, 289 handled, 295 LOST
+
+after    grid sampling: key-down 18 calls,  194657 us mean
+         event census: 101 emitted, 101 handled, 0 LOST
+```
+
+**6.7x faster per key-down, and zero events lost**, on the same Wikipedia
+article. Total time inside position reads fell from 33.8s to 3.5s.
+
+## What was bought, and what was paid
+
+Bought: the recording survives. Paid: on a page this large the source position
+is usually **absent**. Seven of nine copies in the verifying run reported
+`(none -- declined)`.
+
+Two of the nine did resolve, which is worth stating plainly: the walk sometimes
+finishes inside 400ms on the same page, presumably as UI Automation warms. So
+the outcome is **non-deterministic on a page near the threshold** — a link
+sometimes, no link other times. Each individual answer is sound, because a
+timed-out walk returns nothing rather than a partial tree, but the same gesture
+twice may not produce the same record.
+
+That is a real limitation and it is not resolved by tuning the number. It is
+resolved by making the walk cheap enough that large pages finish, which needs an
+API that reads properties in bulk — UI Automation cache requests — and
+`terminator-rs` exposes none.
+
+## Related
+
+* `docs/known-issues/position-reads-dominate-an-ordinary-copy-paste-session.md`
+  — where the "share one traversal" direction came from, now corrected there too.

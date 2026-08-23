@@ -142,3 +142,22 @@ been starved by the same synchronous blocking. See
 
 The "share one traversal" direction proposed above is now the fix for a
 recording that fails outright, not an optimisation.
+
+## The "share one traversal" direction was wrong, measured 2026-08-22
+
+This doc proposed sharing one traversal, on the reasoning that
+`collect_position`, `collect_page_identity` and `collect_nodes` visit the same
+nodes for different reasons. That was read off the code and it is wrong.
+
+Measured with `examples/read_cost_probe.rs`: the two extra walks visit **90
+nodes and cost 85ms**, because both have a `depth > 14` limit and both
+early-exit. Merging them saves **4%**. The cost is `collect_nodes`, and a third
+of that is the bare `children()` traversal with no property reads at all.
+
+The fix that worked was a **time bound** on the walk, returning no position
+rather than a slow one. See
+`a-large-page-starves-the-pump-and-loses-half-the-recording.md`.
+
+The merge was done anyway, because the address bar's URL can be captured on the
+same visit that reads the document id — same element, same `text(0)`. That part
+is free. It is not what made the difference.

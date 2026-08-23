@@ -45,6 +45,7 @@
 //! typed, but nothing here makes that replayable -- there is no element for a
 //! selector to resolve to. See the known-issues doc.
 
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use terminator::{Desktop, UIElement};
@@ -712,6 +713,7 @@ impl GridCellWatcher {
         let mut budget = 3000usize;
         let mut scan = WindowScan::default();
         collect_position(&root, 0, &mut budget, &mut scan);
+        let scan_url = scan.url.clone();
 
         match scan.decide() {
             PositionRead::Spreadsheet { document, cell } => Some((document, cell)),
@@ -724,7 +726,16 @@ impl GridCellWatcher {
             PositionRead::SpreadsheetUnreadable | PositionRead::Inconclusive => None,
             // A page that was never a spreadsheet. Everything above is
             // untouched: this runs only where the Name Box was genuinely absent.
-            PositionRead::NotASpreadsheet => self.read_element_position(&root, timestamp_ms),
+            PositionRead::NotASpreadsheet => {
+                // The page identity comes out of the walk that already
+                // happened, not a second one. Falls back to the window title
+                // exactly as `page_identity` did.
+                let page = scan_url.or_else(|| {
+                    let title = root.name().unwrap_or_default();
+                    (!title.trim().is_empty()).then_some(title)
+                })?;
+                self.read_element_position(&root, timestamp_ms, page)
+            }
         }
     }
 
@@ -781,16 +792,33 @@ impl GridCellWatcher {
         &mut self,
         root: &UIElement,
         timestamp_ms: u64,
+        page: String,
     ) -> Option<(String, String)> {
         // Cases 1 and 2, both before any walk. A copy with nothing recent behind
         // it has no source, and saying so costs one comparison.
         let click_id = self.click_source_id(timestamp_ms)?.to_string();
 
-        let page = page_identity(root)?;
-
         let mut nodes = Vec::new();
         let mut budget = 3000usize;
-        collect_nodes(root, &mut budget, &mut nodes);
+        let mut timed_out = false;
+        let deadline = Instant::now() + Duration::from_millis(WALK_TIME_BUDGET_MS as u64);
+        collect_nodes(root, &mut budget, &deadline, &mut timed_out, &mut nodes);
+
+        // Case 5: the page was too large to read inside the time budget.
+        //
+        // **A partial node list must never be used**, however much of it there
+        // is. `identity::tree` separates structural from content by
+        // multiplicity, so a tree cut short reports elements as occurring once
+        // that occur many times, reclassifies them as content, and yields a
+        // position that is wrong rather than absent.
+        //
+        // Declining here is what stops a large page destroying the whole
+        // recording: the walk gives up after 400ms instead of blocking the pump
+        // for four seconds while the recorder's broadcast channel overflows. See
+        // `docs/known-issues/a-large-page-starves-the-pump-and-loses-half-the-recording.md`.
+        if timed_out {
+            return None;
+        }
 
         // Cases 3 and 4, both of them `locate` declining: an id this window does
         // not contain is not in `nodes`, and a structural element is refused by
@@ -1076,11 +1104,14 @@ pub fn decode_element_ref(reference: &str) -> Option<(usize, String)> {
     Some((ordinal.parse().ok()?, label.to_string()))
 }
 
-/// Something stable that names the page, for a window with no `/d/` document id.
+#[allow(dead_code)]
+/// REPLACED 2026-08-22 by `WindowScan::url`, which the position walk fills in
+/// on the same visit that reads the document id -- same element, same
+/// `text(0)`, one traversal instead of two.
 ///
-/// The address bar is the general answer: every page has a URL, and two pages
-/// in one application are two different surfaces exactly as two spreadsheets
-/// are. Falls back to the window title only when there is no address bar at all.
+/// Kept only because the fallback rule it documents still applies at the call
+/// site: the address bar is the general answer, and the window title is the
+/// fallback when there is no address bar at all.
 fn page_identity(root: &UIElement) -> Option<String> {
     let mut budget = 3000usize;
     let mut url = None;
@@ -1091,6 +1122,7 @@ fn page_identity(root: &UIElement) -> Option<String> {
     })
 }
 
+#[allow(dead_code)]
 fn collect_page_identity(el: &UIElement, depth: usize, budget: &mut usize, url: &mut Option<String>) {
     if depth > 14 || *budget == 0 || url.is_some() {
         return;
@@ -1110,13 +1142,55 @@ fn collect_page_identity(el: &UIElement, depth: usize, budget: &mut usize, url: 
     }
 }
 
+/// How long the node walk may run before it gives up and reports nothing.
+///
+/// **A node budget alone cannot bound this, because the cost per node is a
+/// property of the page and not of paradigm.** Measured 2026-08-22 against a
+/// Wikipedia article with a 3000-node budget: the bare traversal -- `children()`
+/// and no property reads at all -- took **1163ms**, and the full walk 3828ms.
+/// The same walk on OrderFlow's 46-element tree finishes in ~150ms.
+///
+/// The threshold is bounded by direct measurement of the WALK on each surface,
+/// via `examples/read_cost_probe.rs`:
+///
+/// | window | nodes | full walk |
+/// |---|---|---|
+/// | OrderFlow dashboard | 78 | **113ms** |
+/// | Wikipedia article | 3000 (budget spent) | **3828ms** |
+///
+/// 400ms is three times what a page like OrderFlow needs and a tenth of what
+/// Wikipedia would take, so it separates the two cases with room on both sides.
+///
+/// **Not to be confused with the per-key-down means in the session logs** --
+/// 12ms on Sheets, ~150ms on OrderFlow, 202-274ms on the pricing page, 1297ms on
+/// Wikipedia. Those are averages over ALL key-downs, most of which are ordinary
+/// typing that does no walk at all, so they understate the per-walk cost by an
+/// unknown factor. Reading them as walk costs is a mistake this comment made in
+/// its first draft.
+const WALK_TIME_BUDGET_MS: u128 = 400;
+
 /// Flatten a window into the document-order node list the general rule takes.
+///
+/// Stops on **either** budget: 3000 nodes, or [`WALK_TIME_BUDGET_MS`]. Sets
+/// `timed_out` when it is the clock that stopped it, because a partial node list
+/// is not a smaller tree -- it is a tree with the wrong multiplicities, and
+/// `identity::tree` classifies structural against content by multiplicity. Using
+/// half a walk would silently reclassify content as unique and produce a
+/// confident wrong position.
 fn collect_nodes(
     el: &UIElement,
     budget: &mut usize,
+    deadline: &Instant,
+    timed_out: &mut bool,
     out: &mut Vec<crate::identity::tree::TreeNode>,
 ) {
-    if *budget == 0 {
+    if *budget == 0 || *timed_out {
+        return;
+    }
+    // Checked per node rather than per level: the whole problem is a tree deep
+    // and wide enough that a level can take seconds on its own.
+    if Instant::now() >= *deadline {
+        *timed_out = true;
         return;
     }
     *budget -= 1;
@@ -1127,7 +1201,7 @@ fn collect_nodes(
     ));
     if let Ok(children) = el.children() {
         for c in &children {
-            collect_nodes(c, budget, out);
+            collect_nodes(c, budget, deadline, timed_out, out);
         }
     }
 }
@@ -1138,6 +1212,9 @@ fn collect_nodes(
 struct WindowScan {
     /// The Name Box's cell reference, if it read.
     cell: Option<String>,
+    /// The address bar's full URL, captured on the same visit that reads the
+    /// document id. What `page_identity` used to run a second walk to find.
+    url: Option<String>,
     /// The `/d/<id>/` document id from the address bar, if there was one.
     document: Option<String>,
     /// A Name Box group was **present in the tree**, whether or not it read.
@@ -1233,12 +1310,25 @@ fn collect_position(el: &UIElement, depth: usize, budget: &mut usize, scan: &mut
 
     // The address bar carries /d/<id>/, which is the only thing that separates
     // two documents both titled "Untitled spreadsheet".
-    if scan.document.is_none() && trimmed == "Address and search bar" {
+    //
+    // The FULL url is kept at the same time, which is what makes merging the
+    // page-identity walk into this one free: `page_identity` used to run a
+    // second traversal to reach this same element and read this same string.
+    // Same element, same `text(0)`, no extra node visited, and the early-exit
+    // condition below is untouched -- `document` and `url` are found together or
+    // not at all.
+    if trimmed == "Address and search bar" {
         let url = el.text(0).unwrap_or_default();
-        if let Some(rest) = url.split("/d/").nth(1) {
-            if let Some(id) = rest.split('/').next() {
-                if !id.is_empty() {
-                    scan.document = Some(id.to_string());
+        let trimmed_url = url.trim();
+        if scan.url.is_none() && !trimmed_url.is_empty() {
+            scan.url = Some(trimmed_url.to_string());
+        }
+        if scan.document.is_none() {
+            if let Some(rest) = url.split("/d/").nth(1) {
+                if let Some(id) = rest.split('/').next() {
+                    if !id.is_empty() {
+                        scan.document = Some(id.to_string());
+                    }
                 }
             }
         }
@@ -1897,6 +1987,7 @@ mod tests {
             cell: None,
             document: Some("1AbCdEfGhIjK".to_string()),
             name_box_seen: true,
+            url: None,
             truncated: false,
         };
         assert_eq!(
@@ -1914,6 +2005,7 @@ mod tests {
             cell: Some("B7".to_string()),
             document: None,
             name_box_seen: true,
+            url: None,
             truncated: false,
         };
         assert_eq!(scan.decide(), PositionRead::SpreadsheetUnreadable);
@@ -1927,6 +2019,7 @@ mod tests {
             cell: None,
             document: None,
             name_box_seen: false,
+            url: None,
             truncated: false,
         };
         assert_eq!(scan.decide(), PositionRead::NotASpreadsheet);
@@ -1938,6 +2031,7 @@ mod tests {
             cell: Some("Sheet2!B7".to_string()),
             document: Some("1AbCdEfGhIjK".to_string()),
             name_box_seen: true,
+            url: None,
             truncated: false,
         };
         assert_eq!(
@@ -1955,6 +2049,7 @@ mod tests {
         // closed rather than claiming the page is not a spreadsheet.
         let scan = WindowScan {
             cell: None,
+            url: None,
             document: None,
             name_box_seen: false,
             truncated: true,
