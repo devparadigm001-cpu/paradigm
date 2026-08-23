@@ -212,6 +212,12 @@ genuinely working.
 
 ### The weakest number in the build
 
+**Superseded 2026-08-22: it is worse than weak.** On any list denser than the
+floor, `record_pitch` does not decline -- it returns `ceil(120/p)*p`, a harmonic
+of the true pitch, deterministically. Measured on three surfaces, and the
+arithmetic is forced. See
+`docs/known-issues/the-pitch-floor-returns-a-harmonic-instead-of-declining.md`.
+
 `RECORD_PITCH_FLOOR_PX = 120.0`, the smallest y-difference allowed to be a
 record pitch. It is a calibration on one layout, not a finding, and it is
 labelled as such in the code.
