@@ -125,6 +125,7 @@ fn main() {
             c.distinct_records,
             c.occurrences()
         );
+        println!("           steps {:?}", c.action_indices.iter().map(|i| i + 1).collect::<Vec<_>>());
     }
     if f.raw > 0 {
         println!(

@@ -95,3 +95,21 @@ interleaved clicks on genuinely distinct records.
 * `docs/known-issues/gmail-as-a-source-what-the-tree-exposes.md` — the earlier
   Gmail investigation, which found no per-record container. This is a different
   and larger problem: no per-record *position*.
+
+## Reproduced on Amazon the same day
+
+Session record-6ca9bd5a, three products, opened one at a time. The Amazon page's
+own click positions yield **no pitch at all** — same outcome as Gmail, same
+cause: the user opened each record rather than reading a visible list, so the
+fields were captured at whatever position the detail view puts them.
+
+Two surfaces, two different applications, one shape. "Open a record, act, go
+back" is not an edge case; it is how people use an inbox and a search-results
+page alike.
+
+Amazon nonetheless surfaced five candidates where Gmail surfaced none, and the
+difference is **entirely on the destination side**: Amazon's session typed nine
+values (three columns x three rows), while Gmail's typed two (`A2`, `A3`) and so
+fell one short of the Rule of 3. Nothing about Amazon's page structure helped.
+Its two page-side candidates are artifacts of cross-window pooling — see
+`an-action-cannot-say-which-window-it-happened-in.md`.

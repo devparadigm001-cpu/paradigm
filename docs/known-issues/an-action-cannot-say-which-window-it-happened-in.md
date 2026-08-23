@@ -83,3 +83,39 @@ into the largest one.
 * `docs/known-issues/element-bounds-are-viewport-relative-so-scrolling-moves-them.md`
   — the other reason a positional record count can be wrong. This one was
   initially mistaken for that one.
+
+## It manufactures whole candidates, not just an inflated count (2026-08-23)
+
+The Amazon session record-6ca9bd5a produced five candidates. Three are
+spreadsheet columns and correct. **The other two exist only because of this
+defect.**
+
+The Amazon page's own click positions are
+`{-220, -3, 0, 44, 80, 212, 229, 349, 482, 513, 536, 548, 634, 661}`, and
+`record_pitch` over that set returns **`None`** — no period, no records, which
+is right, because the user opened one product at a time and the page positions
+do not repeat.
+
+Pool in the Google Sheets window from the same `msedge.exe` process, adding
+`{310, 312, 342, 372}`, and a period appears: **315px at coverage 0.82**, barely
+over the 0.80 threshold, against the 1.00 a real list scores. Under it:
+
+```
+  y=  -3, 0    record 0, band 220px      <- Amazon
+  y= 310, 312  record 1, band 220px      <- the Sheets GRID CANVAS
+  y= 634       record 2, band 220px      <- Amazon
+```
+
+That band is `cand-4`, 29 actions — and its steps are dominated by clicks at
+`x3002 y310`, which is the spreadsheet canvas. `cand-5` is the same shape: one
+Amazon product title at y661 grouped with three clicks on the browser's **Back**
+button at `x1925 y44`.
+
+**These are not systematic incidentals.** A systematic incidental is a real
+repeated element that the user genuinely touches once per record -- the
+`Pending` status in the OrderFlow recording is one. These are unrelated elements
+from two different windows, grouped by a period that exists only because their
+coordinate systems were mixed.
+
+So the consequence is worse than the four-records-from-three already recorded
+here: on a page with **no** repeating structure, pooling can invent one.
