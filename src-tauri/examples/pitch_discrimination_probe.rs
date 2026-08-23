@@ -34,7 +34,12 @@
 //! is right for all of them. Coverage is a ratio in [0, 1] and is scale-free: it
 //! does not change when the same layout is rendered twice as large.
 
-use paradigm_lib::detect::candidates::{RECORD_PITCH_FLOOR_PX, RECORD_PITCH_TOLERANCE_PX};
+use paradigm_lib::detect::candidates::RECORD_PITCH_TOLERANCE_PX;
+
+/// The magnitude floor as it stood before 2026-08-23, kept LOCAL to this probe
+/// so the comparison against the old behaviour survives its removal from the
+/// library.
+const RECORD_PITCH_FLOOR_PX: f64 = 120.0;
 
 /// Today's rule, mirrored, so both run against the same fixtures.
 fn shipped_pitch(ys: &[f64]) -> Option<f64> {

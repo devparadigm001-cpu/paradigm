@@ -23,7 +23,12 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use paradigm_lib::detect::candidates::{RECORD_PITCH_FLOOR_PX, RECORD_PITCH_TOLERANCE_PX};
+use paradigm_lib::detect::candidates::RECORD_PITCH_TOLERANCE_PX;
+
+/// The magnitude floor as it stood before 2026-08-23, kept LOCAL to this probe
+/// so the comparison against the old behaviour survives its removal from the
+/// library.
+const RECORD_PITCH_FLOOR_PX: f64 = 120.0;
 use terminator::{Desktop, UIElement};
 
 #[cfg(windows)]
@@ -173,6 +178,7 @@ async fn main() -> ExitCode {
     };
 
     println!("\n2. DENSEST REPEATING COLUMN  (x={x}, {} distinct rows)", ys.len());
+    println!("   row y values         {:?}", ys.iter().map(|y| *y as i64).take(12).collect::<Vec<_>>());
     let gaps: Vec<i64> = ys.windows(2).map(|w| (w[1] - w[0]) as i64).collect();
     println!("   consecutive gaps     {:?}", gaps.iter().take(14).collect::<Vec<_>>());
     let true_pitch = record_pitch(&ys, 1.0);

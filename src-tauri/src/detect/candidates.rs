@@ -95,22 +95,35 @@ use crate::source::spreadsheet::parse_cell_ref;
 /// repeated, not three examples.
 pub const RULE_OF_THREE: usize = 3;
 
-/// Pairwise y-differences within this many pixels are the same candidate pitch.
+/// Upper bound on how far two y values may differ and still be "the same".
+///
+/// Only a cap: [`shift_tolerance`] scales the working tolerance to the period
+/// under test, because a flat 10px is a third of a 30px pitch and would let a
+/// small candidate match nearly anything.
 pub const RECORD_PITCH_TOLERANCE_PX: f64 = 10.0;
 
-/// Smallest y-difference allowed to be a record pitch.
+/// How much of the layout a period must explain to be believed.
 ///
-/// **The weakest number in this module, and it is a calibration rather than a
-/// finding.** It exists because on the one real layout measured, the spread
-/// *within* a record (116px) was larger than the gap *between* records (99px),
-/// so the offsets between fields of one record would otherwise win the vote and
-/// be mistaken for the record spacing.
+/// **A ratio, and that is the whole point.** This replaced
+/// `RECORD_PITCH_FLOOR_PX = 120.0` on 2026-08-23, which was a *length* and could
+/// not work: OrderFlow needed a floor above its 135px within-record spread,
+/// File Explorer needed one below its 32px row pitch, and those requirements
+/// overlap. Real page densities differ by more than a factor of ten, so no
+/// length satisfies all of them.
 ///
-/// 120px clears that layout's within-record spread. A denser list would defeat
-/// it. [`candidates`] therefore validates the pitch it finds rather than
-/// trusting it -- see [`assign_records`] -- so a wrong pitch declines instead of
-/// producing confident nonsense.
-pub const RECORD_PITCH_FLOOR_PX: f64 = 120.0;
+/// A ratio in [0, 1] is scale-free -- render the same layout twice as large and
+/// it does not move. The measured separation on real layouts is wide rather than
+/// marginal, so 0.80 sits in an empty gap rather than on a boundary:
+///
+/// | candidate | coverage |
+/// |---|---|
+/// | OrderFlow within-record offsets (15, 21, 24, 30px) | 0.30-0.32 |
+/// | OrderFlow within-record offsets, sparse (90, 119px) | 0.50-0.60 |
+/// | **the true 209px pitch** | **1.00** |
+///
+/// Five real layouts is evidence, not coverage. See
+/// `docs/planning/Pitch-Discrimination-Without-A-Floor.md`.
+pub const COVERAGE_THRESHOLD: f64 = 0.80;
 
 /// Elements whose offset within a record differs by less than this are on the
 /// same visual row, and are ranked left to right against each other.
@@ -260,45 +273,132 @@ struct Positioned {
     y: f64,
 }
 
-/// The record pitch: the most common pairwise y-difference above the floor.
+/// How close two y values must be to count as the same point, for a given
+/// period.
 ///
-/// `None` when no difference recurs, which is the honest answer for a page that
-/// is not a repeating list.
+/// Scaled to `p` and capped, never flat. A fixed tolerance is a fixed magnitude,
+/// which is the mistake this whole rule exists to stop making.
+fn shift_tolerance(p: f64) -> f64 {
+    (0.15 * p).min(RECORD_PITCH_TOLERANCE_PX).max(1.0)
+}
+
+/// Of the points that could map under a shift of `p`, the fraction that do.
 ///
-/// Proximity clustering, **not** fixed-width buckets. Rounding 214 and 215 into
-/// adjacent buckets split the true pitch in half and let its own 2x harmonic tie
-/// with it and win -- measured 2026-08-20, and the reason this reads the way it
-/// does.
+/// The primary discriminator. A repeating list's y values are a union of
+/// arithmetic progressions sharing one common difference, so the SET is periodic
+/// with the record pitch -- while a within-record field offset is not a period
+/// of the set at all. Shifting every y by 90px does not land the set on itself;
+/// shifting by the record pitch does.
+fn coverage(sorted: &[f64], p: f64) -> f64 {
+    let Some(&max) = sorted.last() else {
+        return 0.0;
+    };
+    let t = shift_tolerance(p);
+    let mut eligible = 0usize;
+    let mut mapped = 0usize;
+    for y in sorted {
+        if y + p > max + t {
+            continue;
+        }
+        eligible += 1;
+        if sorted.iter().any(|z| (z - (y + p)).abs() <= t) {
+            mapped += 1;
+        }
+    }
+    if eligible == 0 {
+        0.0
+    } else {
+        mapped as f64 / eligible as f64
+    }
+}
+
+/// How many distinct within-record offsets a period implies.
+///
+/// The secondary discriminator, and it earns its place on a measured failure:
+/// coverage alone accepted 185px on OrderFlow, because 185 = 209 - 24 and that
+/// layout contains 24px offsets, so a shift of 185 lands most elements on the
+/// *neighbouring* field of the next record.
+///
+/// Under the true period every record shows the same field offsets, so
+/// `(y - y_min) mod p` collapses to one cluster per field. Under a near-miss the
+/// offsets drift by the error on every record and smear into many more. Fewer
+/// clusters means the period explains the layout more economically.
+fn offset_clusters(sorted: &[f64], p: f64) -> usize {
+    let Some(&y_min) = sorted.first() else {
+        return 0;
+    };
+    let mut offs: Vec<f64> = sorted.iter().map(|y| (y - y_min) % p).collect();
+    offs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let t = shift_tolerance(p);
+    let mut n = 0usize;
+    let mut last: Option<f64> = None;
+    for o in offs {
+        if last.is_none_or(|l| o - l > t) {
+            n += 1;
+        }
+        last = Some(o);
+    }
+    n
+}
+
+/// The record pitch: the period that explains the layout most economically.
+///
+/// `None` when nothing does, which is the honest answer for a page that is not a
+/// repeating list.
+///
+/// **Replaced the magnitude floor on 2026-08-23.** The old rule voted on the
+/// most common pairwise difference above 120px, and was proven to return
+/// `ceil(120/p)*p` -- a harmonic -- on any list denser than that: measured at 4x,
+/// 5x, 5x and 4x on File Explorer, ftp.gnu.org and the Wikipedia table. It could
+/// not simply be lowered, because the floor existed to stop OrderFlow's 135px
+/// within-record offsets winning. Those two requirements overlap, so no length
+/// works. See `docs/known-issues/the-pitch-floor-returns-a-harmonic-instead-of-declining.md`.
+///
+/// Three filters, each earned by a failure that was measured rather than
+/// anticipated:
+///
+/// 1. **coverage** at least [`COVERAGE_THRESHOLD`], which rejects within-record
+///    offsets (0.30-0.60 against 1.00);
+/// 2. **at least three blocks**, which rejects a large period over a few
+///    scattered points -- those "cover" trivially because almost nothing is
+///    eligible to map, and a non-list fixture returned a confident 1190px
+///    without this. The Rule of 3 wants three records anyway;
+/// 3. **fewest offset clusters, then smallest period.** Smallest is what makes a
+///    harmonic unreachable: coverage is monotone, `coverage(p) >= coverage(k*p)`,
+///    so a fundamental that passes always beats its own multiples. The proven
+///    defect is gone by construction rather than by tuning.
+///
+/// **Known limit.** A set that is genuinely periodic at two scales -- two-line
+/// rows 16px apart forming records 32px apart -- is ambiguous in y alone, and
+/// this returns the smaller. Confirmed by execution, not argued. Separating them
+/// needs x, which this does not use.
 fn record_pitch(ys: &[f64]) -> Option<f64> {
-    let mut diffs: Vec<f64> = Vec::new();
-    for (i, a) in ys.iter().enumerate() {
-        for b in ys.iter().skip(i + 1) {
-            let d = (b - a).abs();
-            if d >= RECORD_PITCH_FLOOR_PX {
-                diffs.push(d);
-            }
+    let mut sorted = ys.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.dedup();
+    if sorted.len() < RULE_OF_THREE {
+        return None;
+    }
+    let span = sorted[sorted.len() - 1] - sorted[0];
+
+    // Only an observed difference can be a period; nothing else need be tried.
+    let mut candidates: Vec<f64> = Vec::new();
+    for (i, a) in sorted.iter().enumerate() {
+        for b in sorted.iter().skip(i + 1) {
+            candidates.push(b - a);
         }
     }
-    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    candidates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    candidates.dedup_by(|a, b| (*a - *b).abs() <= 1.0);
 
-    let mut clusters: Vec<Vec<f64>> = Vec::new();
-    for d in diffs {
-        match clusters.last_mut() {
-            Some(c) if d - c[c.len() - 1] <= RECORD_PITCH_TOLERANCE_PX => c.push(d),
-            _ => clusters.push(vec![d]),
-        }
-    }
-
-    let best = clusters.iter().filter(|c| c.len() >= 2).map(|c| c.len()).max()?;
-    // Among equally-supported clusters take the SMALLEST. A repeating list
-    // always produces harmonics -- with N records the pitch appears N-1 times
-    // and twice the pitch N-2 times -- and the fundamental is the actual record
-    // spacing.
-    clusters
-        .iter()
-        .filter(|c| c.len() == best)
-        .map(|c| c.iter().sum::<f64>() / c.len() as f64)
-        .min_by(|a, b| a.partial_cmp(b).unwrap())
+    let mut viable: Vec<(usize, f64)> = candidates
+        .into_iter()
+        .filter(|&p| p > 0.0 && p <= span / 2.0)
+        .filter(|&p| coverage(&sorted, p) >= COVERAGE_THRESHOLD)
+        .map(|p| (offset_clusters(&sorted, p), p))
+        .collect();
+    viable.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap()));
+    viable.first().map(|&(_, p)| p)
 }
 
 /// Assign page elements to records and fields, or decline.
@@ -724,6 +824,138 @@ mod tests {
             total,
             "every click is still accounted for as an occurrence"
         );
+    }
+
+    /// The four surfaces the floor was replaced on, as a pitch table.
+    ///
+    /// Every y set here is MEASURED, by `page_bounds_probe` or
+    /// `pitch_candidate_probe`, against a real window. The old rule got two of
+    /// these right; the shipped rule gets all of them.
+    ///
+    /// | layout | truth | old rule | this rule |
+    /// |---|---|---|---|
+    /// | OrderFlow, all elements | 209px | 150px | 209px |
+    /// | OrderFlow, clicked only | 209px | 209px | 209px |
+    /// | File Explorer, Projects | 32px | 128px (4x) | 32px |
+    /// | ftp.gnu.org index | 26px | 130px (5x) | 26px |
+    /// | Wikipedia table | 33px | 133px (4x) | 33px |
+    #[test]
+    fn the_record_pitch_matches_four_real_layouts() {
+        // OrderFlow: the layout the floor existed for. Its within-record spread
+        // is 135px, which the 120px floor did NOT exclude.
+        let orderflow = vec![
+            211.0, 235.0, 256.0, 286.0, 301.0, 331.0, 346.0, 420.0, 444.0, 465.0, 495.0, 510.0,
+            540.0, 555.0, 629.0, 653.0, 674.0, 704.0, 719.0, 749.0, 764.0,
+        ];
+        assert_eq!(record_pitch(&orderflow).map(|p| p.round()), Some(209.0));
+
+        // The same layout, only the two fields a user actually clicked.
+        let sparse = vec![256.0, 346.0, 465.0, 555.0, 674.0, 764.0];
+        assert_eq!(record_pitch(&sparse).map(|p| p.round()), Some(209.0));
+
+        // Dense lists. Each of these returned a harmonic under the floor.
+        let explorer: Vec<f64> = (0..12).map(|i| 300.0 + 32.0 * i as f64).collect();
+        assert_eq!(record_pitch(&explorer).map(|p| p.round()), Some(32.0));
+
+        let gnu: Vec<f64> = (0..20).map(|i| 250.0 + 26.0 * i as f64).collect();
+        assert_eq!(record_pitch(&gnu).map(|p| p.round()), Some(26.0));
+
+        let wikipedia = vec![315.0, 349.0, 382.0, 415.0, 449.0, 482.0, 515.0];
+        let wiki = record_pitch(&wikipedia).expect("a real table has a pitch");
+        assert!(
+            (wiki - 33.0).abs() <= 1.0,
+            "Wikipedia rows step 33-34px; got {wiki}"
+        );
+    }
+
+    /// **The known-correct surface must not move.**
+    ///
+    /// This is the OrderFlow run recorded in
+    /// `docs/planning/Filtered-Post-Hoc-Confirmation.md`, replayed through the
+    /// pipeline: a Navigate, then the customer and quantity fields clicked in
+    /// each of three orders, at the y values `page_bounds_probe` measured.
+    ///
+    /// The output it is pinned to is what the OLD floor produced, verbatim:
+    ///
+    /// ```text
+    /// [ ] cand-1  ... 0px into each record    3 records, 3 actions  steps [2, 4, 6]
+    /// [ ] cand-2  ... 100px into each record  3 records, 3 actions  steps [3, 5, 7]
+    /// ```
+    ///
+    /// Replacing the pitch rule changes what `assign_records` returns on every
+    /// page, so the surface that already worked is the one most worth guarding.
+    #[test]
+    fn the_orderflow_result_is_unchanged_by_the_new_pitch_rule() {
+        let mut specs = vec![(ActionKind::Navigate, Some("OrderFlow Export"), None)];
+        for (customer_y, quantity_y) in [(256.0, 346.0), (465.0, 555.0), (674.0, 764.0)] {
+            specs.push((ActionKind::Click, None, Some((2063.0, customer_y, 138.0, 22.0))));
+            specs.push((ActionKind::Click, None, Some((2063.0, quantity_y, 16.0, 22.0))));
+        }
+        let set = candidates(&actions(specs));
+
+        assert_eq!(set.groups.len(), 2, "two fields, as before");
+        assert_eq!(set.groups[0].distinct_records, 3);
+        assert_eq!(set.groups[1].distinct_records, 3);
+        assert_eq!(set.groups[0].occurrences(), 3);
+        assert_eq!(set.groups[1].occurrences(), 3);
+
+        // Step numbers are 1-based and must land on the same actions as before:
+        // the customer clicks and the quantity clicks, kept apart.
+        let steps: Vec<Vec<usize>> = set
+            .groups
+            .iter()
+            .map(|g| g.action_indices.iter().map(|i| i + 1).collect())
+            .collect();
+        assert!(
+            steps.contains(&vec![2, 4, 6]) && steps.contains(&vec![3, 5, 7]),
+            "the two fields must group exactly as they did before: {steps:?}"
+        );
+        assert!(
+            set.groups.iter().any(|g| g.detail.contains("0px into each record"))
+                && set
+                    .groups
+                    .iter()
+                    .any(|g| g.detail.contains("100px into each record")),
+            "the row bands must be unchanged: {:?}",
+            set.groups.iter().map(|g| &g.detail).collect::<Vec<_>>()
+        );
+    }
+
+    /// Coverage is what separates a period from a field offset, and the gap is
+    /// wide rather than marginal. Pinned so a future tolerance change that
+    /// narrows it fails here rather than silently.
+    #[test]
+    fn a_within_record_offset_scores_far_below_a_real_period() {
+        let mut sorted = vec![256.0, 346.0, 465.0, 555.0, 674.0, 764.0];
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let real = coverage(&sorted, 209.0);
+        assert!(real >= 0.99, "the true pitch should map the set onto itself: {real}");
+
+        for offset in [90.0, 119.0] {
+            let c = coverage(&sorted, offset);
+            assert!(
+                c <= 0.65,
+                "a within-record offset of {offset} scored {c}, which is too \
+                 close to a real period"
+            );
+        }
+    }
+
+    /// The proven defect, as a test: a dense list must not yield a multiple of
+    /// its own pitch. Structural, not a threshold -- coverage is monotone, so a
+    /// fundamental that passes always beats its harmonics.
+    #[test]
+    fn a_dense_list_never_returns_a_harmonic() {
+        for pitch in [16.0, 26.0, 32.0, 33.0, 48.0] {
+            let ys: Vec<f64> = (0..15).map(|i| 200.0 + pitch * i as f64).collect();
+            let found = record_pitch(&ys).expect("a uniform list has a pitch");
+            assert!(
+                (found - pitch).abs() <= 1.0,
+                "pitch {pitch} resolved as {found}, a {:.1}x harmonic",
+                found / pitch
+            );
+        }
     }
 
     /// A page that is not a repeating list has no pitch, and the honest answer

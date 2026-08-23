@@ -1,6 +1,10 @@
 # The pitch floor returns a harmonic instead of declining
 
-**Status:** open, measured 2026-08-22 on three independent surfaces.
+**Status:** FIXED 2026-08-23. Measured 2026-08-22 on three independent
+surfaces, and replaced by periodicity detection rather than a smaller number --
+see `docs/planning/Pitch-Discrimination-Without-A-Floor.md`. Kept because the
+derivation below is why no floor could have worked, and that reasoning outlives
+the constant.
 **Severity: HIGH.** `detect::candidates` was expected to produce *nothing* on a
 dense list. It produces **confident wrong records** instead, grouping N rows into
 one. Silent-wrong-target, which is the failure class this project keeps finding.
@@ -83,3 +87,20 @@ pitch numbers differ by an integer factor is this issue.
 * `docs/planning/Filtered-Post-Hoc-Confirmation.md` — where the floor is
   described as "the weakest number in the build". It is weaker than that
   described: it does not merely fail on dense lists, it corrupts them.
+
+## Fixed 2026-08-23
+
+`RECORD_PITCH_FLOOR_PX` is gone. `record_pitch` now takes the period that
+explains the layout most economically: coverage at or above `COVERAGE_THRESHOLD`
+(0.80), at least three blocks, then fewest offset clusters and smallest period.
+
+**The defect is closed structurally, not by tuning.** Coverage is monotone --
+`coverage(p) >= coverage(k*p)` -- so a fundamental that passes always beats its
+own multiples, and no harmonic can be returned while its fundamental qualifies.
+`a_dense_list_never_returns_a_harmonic` pins it across five pitches.
+
+The four layouts in the table above now resolve to their true pitch, pinned in
+`the_record_pitch_matches_four_real_layouts`. The threshold that replaced the
+floor is a **ratio**, which is the actual fix: a length cannot serve page
+densities that differ by more than a factor of ten, and a ratio is unchanged by
+scale.

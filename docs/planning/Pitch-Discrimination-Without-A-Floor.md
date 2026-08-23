@@ -1,7 +1,8 @@
 # Pitch discrimination without a floor
 
-**Status:** designed and prototyped 2026-08-22, scored against real layouts.
-Not built into the product.
+**Status:** BUILT 2026-08-23. Designed and prototyped 2026-08-22, scored
+against real layouts, then landed in `detect::candidates::record_pitch` with the
+four measured layouts pinned as tests.
 **Prototype:** `src-tauri/examples/pitch_discrimination_probe.rs`.
 **Replaces:** `detect::candidates::RECORD_PITCH_FLOOR_PX`, proven defective in
 `docs/known-issues/the-pitch-floor-returns-a-harmonic-instead-of-declining.md`.
@@ -130,10 +131,61 @@ Five real layouts is evidence, not coverage.
 the input is clicked positions, tens rather than thousands — but it should be
 measured before shipping, not assumed, given how the last cost assumption went.
 
-## Why this is not built yet
+## Landed 2026-08-23
 
-The rule is testable in isolation and correct on everything measured, but it
-changes which records `assign_records` produces on **every** page, including the
-ones already working. Landing it wants the same treatment the last two fixes got:
-a real recording before and after, on a surface where the answer is known
-independently.
+`RECORD_PITCH_FLOOR_PX` is gone from the library. `COVERAGE_THRESHOLD = 0.80`
+replaces it -- a ratio rather than a length, which is the structural point.
+
+The four measured layouts are pinned in `the_record_pitch_matches_four_real_layouts`,
+the coverage separation in `a_within_record_offset_scores_far_below_a_real_period`,
+and the proven defect in `a_dense_list_never_returns_a_harmonic`. That last one
+is structural rather than a threshold check: coverage is monotone, so a
+fundamental that passes always beats its own multiples.
+
+The old floor survives only inside `pitch_discrimination_probe.rs` and
+`pitch_candidate_probe.rs`, as a local constant, so the before-and-after
+comparison outlives its removal.
+
+## Landing evidence, 2026-08-23
+
+### OrderFlow, the known-correct surface: byte-for-byte identical
+
+Live, through `candidates_probe`, three orders with the customer and quantity
+fields clicked in each:
+
+```
+[ ] cand-1  ... 0px into each record    3 record(s), 3 action(s)  steps [2, 4, 6]
+[ ] cand-2  ... 100px into each record  3 record(s), 3 action(s)  steps [3, 5, 7]
+```
+
+The same two candidates, the same record counts, the same bands, the same step
+numbers as the run recorded before the change. Pinned as
+`the_orderflow_result_is_unchanged_by_the_new_pitch_rule` so it cannot drift
+silently.
+
+### File Explorer, a dense list: from nothing to correct
+
+Live, five consecutive rows of a 32px list clicked:
+
+```
+[ ] cand-1  ... 0px into each record, in explorer.exe  5 record(s), 5 action(s)
+```
+
+**Five rows, five records.** And the before-state is worse than the 4:1 collapse
+predicted: those five y values (232 to 360, span 128) contain exactly ONE
+difference at or above the old 120px floor, which is below its minimum support
+of two — so the old rule returned `None`, `assign_records` declined, and the
+surface produced **no candidates at all**.
+
+### ftp.gnu.org and the Wikipedia table: pitch confirmed, end-to-end NOT possible
+
+Both resolve to their true pitch (26px and 33px) in
+`the_record_pitch_matches_four_real_layouts`, from y values measured against the
+real pages.
+
+Neither can be confirmed end-to-end, and not because of this rule: their trees
+are over 3000 nodes, so `WALK_TIME_BUDGET_MS` declines the position read before
+a pitch is ever needed. See
+`a-large-page-starves-the-pump-and-loses-half-the-recording.md`. **Two of the
+four surfaces are confirmed at the pitch level only**, and that gap belongs to
+the walk cost, not to pitch discrimination.
