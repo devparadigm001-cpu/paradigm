@@ -370,6 +370,7 @@ mod tests {
         );
         stream.admit(crate::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
             kind: crate::capture::ActionKind::Click,
             identifiers: vec!["app.exe".into()],
             process_name: None,

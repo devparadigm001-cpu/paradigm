@@ -479,6 +479,9 @@ impl TextFieldWatcher {
             // the edit ends costs one call per action instead of one per
             // keystroke.
             element_bounds: super::bounds_of(Some(&watched.element)),
+            // Same element, same moment: one walk up to the window, paid once
+            // per finished edit rather than per keystroke.
+            window: super::window_key(Some(&watched.element), None),
             kind: ActionKind::Type,
             identifiers: watched.identifiers,
             process_name: watched.process_name,

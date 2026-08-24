@@ -280,6 +280,7 @@ mod tests {
         for (kind, role, name, payload) in items {
             s.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
                 kind,
                 identifiers: vec!["app.exe".into()],
                 process_name: None,

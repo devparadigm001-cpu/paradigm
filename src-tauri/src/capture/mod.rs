@@ -625,6 +625,7 @@ fn observe_grid(
             // this needs was being discarded here.
             let started = std::time::Instant::now();
             let clicked_id = e.metadata.ui_element.as_ref().and_then(|u| u.id());
+            let clicked_window = window_key(e.metadata.ui_element.as_ref(), e.page_url.as_ref());
             if e.metadata.ui_element.is_some() {
                 grid::note_click_id_cost(started.elapsed().as_micros() as u64);
             }
@@ -694,6 +695,7 @@ fn to_candidate(event: &WorkflowEvent) -> Option<ActionCandidate> {
                 element_name: non_empty(&e.element_text),
                 payload: None,
                 detail: Some(format!("{:?}", e.interaction_type)),
+                window: window_key(e.metadata.ui_element.as_ref(), e.page_url.as_ref()),
                 // One UI Automation call, on an element the event already
                 // resolved. `click_position` is also on the event and is
                 // cheaper still, but it records where the user clicked rather
@@ -749,6 +751,8 @@ fn to_candidate(event: &WorkflowEvent) -> Option<ActionCandidate> {
                 // element's -- two windows of one application often coincide --
                 // but it costs the same one call and a window switch is rare.
                 element_bounds: bounds_of(e.metadata.ui_element.as_ref()),
+                // A window switch IS the window, so it identifies itself.
+                window: window_key(e.metadata.ui_element.as_ref(), None),
                 timestamp_ms: e.metadata.timestamp.unwrap_or_else(now_ms),
             })
         }
@@ -793,4 +797,39 @@ fn app_identifiers(element: Option<&terminator::UIElement>) -> Vec<String> {
 fn non_empty(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Which window an element sits in, as a string two elements can be compared on.
+///
+/// **Not the window title.** A title changes as the user works --
+/// `two-documents-in-one-window-cannot-both-resolve.md` and
+/// `two-open-spreadsheets-kill-the-formula-bar.md` both record what happens when
+/// titles are trusted -- and a discriminator that changes mid-recording splits
+/// one window into several, which is the same error it exists to prevent.
+///
+/// The page URL when the recorder supplies one, and otherwise the window's
+/// RECTANGLE, which is stable while the window is not moved and differs between
+/// any two windows on screen. `None` when neither can be had, and a `None` must
+/// make its action decline to group rather than join the largest group.
+fn window_key(
+    element: Option<&terminator::UIElement>,
+    page_url: Option<&String>,
+) -> Option<String> {
+    if let Some(url) = page_url {
+        if !url.trim().is_empty() {
+            return Some(url.trim().to_string());
+        }
+    }
+    let mut node = element?.clone();
+    for _ in 0..12 {
+        if node.role() == "Window" {
+            let (x, y, w, h) = node.bounds().ok()?;
+            return Some(format!("win/{x:.0}/{y:.0}/{w:.0}/{h:.0}"));
+        }
+        match node.parent() {
+            Ok(Some(parent)) => node = parent,
+            _ => return None,
+        }
+    }
+    None
 }

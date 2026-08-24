@@ -38,6 +38,7 @@ fn a_playbook(conn: &mut rusqlite::Connection, name: &str) -> String {
     let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never!"]));
     stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: ActionKind::Click,
         identifiers: vec!["app.exe".into()],
         process_name: None,

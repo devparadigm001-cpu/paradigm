@@ -86,6 +86,7 @@ fn main() {
             payload: None,
             detail: None,
             element_bounds: bounds,
+            window: None,
             timestamp_ms: s.step_order as u64,
         });
     }
@@ -181,6 +182,7 @@ fn page_half(actions: &[paradigm_lib::capture::stream::CapturedAction]) {
             payload: None,
             detail: None,
             element_bounds: a.element_bounds,
+            window: a.window.clone(),
             timestamp_ms: a.timestamp_ms,
         });
     }

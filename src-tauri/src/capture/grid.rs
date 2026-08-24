@@ -1066,6 +1066,7 @@ impl GridCellWatcher {
                 None => edit.cell,
             }),
             payload: Some(edit.text),
+            window: None,
             detail: Some(format!(
                 "grid cell editor, {} keystroke(s) over {}ms",
                 edit.keystrokes,

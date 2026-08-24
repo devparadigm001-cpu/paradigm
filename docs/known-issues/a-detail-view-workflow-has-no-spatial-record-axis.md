@@ -1,6 +1,8 @@
 # A detail-view workflow has no spatial record axis
 
-**Status:** open, found 2026-08-23 in session record-6db50bd4 (Gmail).
+**Status:** FIXED 2026-08-23 by a temporal record axis. Found the same day in
+session record-6db50bd4 (Gmail) and reproduced on Amazon. Kept because the
+measurement below is why one axis cannot serve both shapes.
 **Severity: HIGH for generality.** `detect::candidates` is built entirely on
 positional identity, and there is a whole class of real workflow where the
 position of the field being copied is **constant by construction**. On those,
@@ -113,3 +115,43 @@ values (three columns x three rows), while Gmail's typed two (`A2`, `A3`) and so
 fell one short of the Rule of 3. Nothing about Amazon's page structure helped.
 Its two page-side candidates are artifacts of cross-window pooling — see
 `an-action-cannot-say-which-window-it-happened-in.md`.
+
+## Fixed 2026-08-23: the axes swap
+
+> When positions repeat across records, **position is the record axis** and
+> rank-within-record is the field axis. When positions are constant across
+> records, **position is the FIELD axis** and step order is the record axis.
+
+`assign_records_by_time` runs only when `record_pitch` declines, and a period
+exists if and only if records occupy different places — so the discriminator is
+not a heuristic, it is the definition.
+
+The walk collapses consecutive actions at one position (a triple-click is one
+act) and starts a new record when a position repeats within the current one.
+Gmail's real sequence, collapsed to `A` = the list row and `B` = the subject:
+
+```
+A B C | A B | A B D     -> 3 records, B in all three
+```
+
+### The signal that looks right and is measurably wrong
+
+Position **reuse** seems like the discriminator — detail views revisit
+coordinates, lists spread out. The ratio of distinct positions to page clicks:
+
+| recording | distinct | clicks | ratio |
+|---|---|---|---|
+| OrderFlow (natural) | 24 | 179 | **0.13** |
+| Gmail | 6 | 22 | 0.27 |
+| Amazon | 20 | 77 | 0.26 |
+
+**The positional case has the lowest ratio**, because real users click the same
+thing repeatedly — one OrderFlow position was hit 59 times. Any threshold on
+reuse puts OrderFlow on the wrong axis. Whether `record_pitch` finds a period
+separates all three cleanly.
+
+### Why it must be a fallback and not a choice
+
+OrderFlow through the temporal walk collapses to a **single** record: every
+field there has its own position, so nothing ever repeats and no boundary is
+ever drawn. Pinned by `orderflow_still_groups_by_position_not_time`.

@@ -84,6 +84,18 @@ pub struct ActionCandidate {
     /// `None` whenever the element could not be resolved or would not report
     /// bounds, which is a real and ordinary outcome rather than an error.
     pub element_bounds: Option<(f64, f64, f64, f64)>,
+    /// Which WINDOW `element_bounds` is measured in.
+    ///
+    /// `source_app` cannot answer this: it is the process name, so a browser
+    /// page and a browser-hosted spreadsheet are both `msedge.exe`. Pooling
+    /// their coordinates invented a record on one recording and two whole
+    /// candidates on another -- see
+    /// `docs/known-issues/an-action-cannot-say-which-window-it-happened-in.md`.
+    ///
+    /// `None` means the window could not be established, and a consumer must
+    /// then DECLINE to group positionally rather than default into the largest
+    /// group.
+    pub window: Option<String>,
     pub timestamp_ms: u64,
 }
 
@@ -108,6 +120,8 @@ pub struct CapturedAction {
     /// See [`ActionCandidate::element_bounds`]. Positional identity, kept
     /// because names and platform element ids both collapse on equal text.
     pub element_bounds: Option<(f64, f64, f64, f64)>,
+    /// See [`ActionCandidate::window`]. Which window the bounds belong to.
+    pub window: Option<String>,
     pub timestamp_ms: u64,
     _gated: Gated,
 }
@@ -219,6 +233,7 @@ impl CapturedStream {
             payload: candidate.payload,
             detail: candidate.detail,
             element_bounds: candidate.element_bounds,
+            window: candidate.window,
             timestamp_ms: candidate.timestamp_ms,
             _gated: Gated,
         });
@@ -250,6 +265,7 @@ mod tests {
     fn candidate(app: &str, payload: &str) -> ActionCandidate {
         ActionCandidate {
             element_bounds: None,
+            window: None,
             kind: ActionKind::Type,
             identifiers: vec![app.to_string()],
             process_name: None,

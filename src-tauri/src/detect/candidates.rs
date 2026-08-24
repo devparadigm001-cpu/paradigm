@@ -480,6 +480,67 @@ fn assign_records(items: &[Positioned]) -> Option<Vec<(FieldKey, String)>> {
     Some(out)
 }
 
+/// Assign records by TIME, for a surface whose positions do not vary.
+///
+/// The other half of the rule, and the axes are swapped:
+///
+/// > When positions repeat across records, **position is the record axis** and
+/// > rank-within-record is the field axis. When positions are constant across
+/// > records, **position is the FIELD axis** and step order is the record axis.
+///
+/// Detail-view navigation -- open a record, act, go back, open the next -- puts
+/// every record's fields at the same coordinates, because the detail view is one
+/// place. Two independent surfaces confirmed it on 2026-08-23: Gmail captured
+/// three different subjects at `(2324, 212)`, and Amazon's own positions yielded
+/// no period at all. That is not an edge case; it is how an inbox and a
+/// search-results page are both used.
+///
+/// The walk:
+///
+/// 1. **Collapse consecutive actions at one position.** A triple-click to select
+///    a value is one act, not three, and without this every repeat would start a
+///    record.
+/// 2. **Start a new record when a position repeats within the current one.**
+///    Returning to a field you have already filled means you have moved on.
+///
+/// Step 2 is why this must run only when [`record_pitch`] has already declined.
+/// OrderFlow through the same walk collapses to a SINGLE record -- every field
+/// there has its own position, so nothing ever repeats and no boundary is ever
+/// drawn. The two rules are not interchangeable and neither generalises.
+fn assign_records_by_time(items: &[Positioned]) -> Vec<(FieldKey, String)> {
+    let mut out = Vec::with_capacity(items.len());
+    let mut record = 0usize;
+    let mut seen_here: BTreeSet<(i64, i64)> = BTreeSet::new();
+    let mut previous: Option<(i64, i64)> = None;
+
+    for p in items {
+        let here = (p.x.round() as i64, p.y.round() as i64);
+        // 1. A run of clicks on one spot is one act.
+        if previous != Some(here) {
+            // 2. Back to a position this record already used: a new record.
+            if !seen_here.insert(here) {
+                record += 1;
+                seen_here.clear();
+                seen_here.insert(here);
+            }
+        }
+        previous = Some(here);
+        out.push((
+            FieldKey::Position {
+                kind: p.kind,
+                app: p.app.clone(),
+                // The position IS the field here, so there is no row band and no
+                // rank to take. Encoded as the y, which is what distinguishes one
+                // field from another on a detail view.
+                band: (p.y / ROW_BAND_PX).round() as i64,
+                rank: 0,
+            },
+            format!("t{record}"),
+        ));
+    }
+    out
+}
+
 /// Run [`assign_records`] once per application, and keep what succeeds.
 ///
 /// **A pitch across two windows is arithmetic on unrelated coordinate
@@ -522,10 +583,24 @@ fn assign_records_per_app(items: &[Positioned]) -> Vec<(usize, FieldKey, String)
                 y: p.y,
             })
             .collect();
-        if let Some(assigned) = assign_records(&owned) {
-            for (p, (key, record)) in group.iter().zip(assigned) {
-                out.push((p.index, key, record));
-            }
+        // Position first. It is the stronger signal when it exists, and its
+        // absence is exactly what says the other axis applies: a period exists
+        // if and only if records occupy different places.
+        //
+        // Falling back on decline rather than choosing up front was checked
+        // against the obvious alternative and the alternative is measurably
+        // wrong. Position REUSE looks like the discriminator -- detail views
+        // revisit coordinates, lists spread out -- but the ratio of distinct
+        // positions to clicks is 0.13 on OrderFlow, 0.27 on Gmail and 0.26 on
+        // Amazon. The positional case has the LOWEST ratio, because real users
+        // click the same thing repeatedly; one OrderFlow position was hit 59
+        // times. Any threshold on reuse puts OrderFlow on the wrong axis.
+        let assigned = match assign_records(&owned) {
+            Some(by_position) => by_position,
+            None => assign_records_by_time(&owned),
+        };
+        for (p, (key, record)) in group.iter().zip(assigned) {
+            out.push((p.index, key, record));
         }
     }
     out
@@ -572,11 +647,24 @@ pub fn candidates(actions: &[CapturedAction]) -> CandidateSet {
         }
 
         if let Some((x, y, _w, _h)) = action.element_bounds {
+            // The WINDOW, not the process. Two windows of one browser share a
+            // process name, and pooling their coordinates invented a fourth
+            // record on one recording and two entire candidates on another.
+            //
+            // An action that cannot say which window it belongs to declines to
+            // group positionally rather than joining the largest group -- the
+            // rule `an-action-cannot-say-which-window-it-happened-in.md` asks
+            // for. Counted as WITHOUT identity, because a position nobody can
+            // place is not one, and leaving it in stage 2 would put an
+            // unexplained gap between stages 2 and 3.
+            let Some(window) = action.window.clone() else {
+                continue;
+            };
             funnel.with_identity += 1;
             positioned.push(Positioned {
                 index,
                 kind,
-                app: action.source_app.clone(),
+                app: window,
                 x,
                 y,
             });
@@ -650,6 +738,10 @@ mod tests {
                 payload: None,
                 detail: None,
                 element_bounds: bounds,
+                // One window, because these fixtures exercise grouping rather
+                // than the window discriminator. An action with no window
+                // declines to group at all, which is pinned separately.
+                window: Some("win/test".into()),
                 timestamp_ms: 0,
             });
         }
@@ -919,6 +1011,146 @@ mod tests {
             "the row bands must be unchanged: {:?}",
             set.groups.iter().map(|g| &g.detail).collect::<Vec<_>>()
         );
+    }
+
+    /// A click with a window, for the two-axis fixtures.
+    fn win(
+        x: f64,
+        y: f64,
+        window: &str,
+    ) -> (ActionKind, Option<&'static str>, Option<(f64, f64, f64, f64)>, Option<String>) {
+        (
+            ActionKind::Click,
+            None,
+            Some((x, y, 50.0, 20.0)),
+            Some(window.to_string()),
+        )
+    }
+
+    fn actions_with_window(
+        specs: Vec<(ActionKind, Option<&str>, Option<(f64, f64, f64, f64)>, Option<String>)>,
+    ) -> Vec<CapturedAction> {
+        let mut stream = CapturedStream::new(ExclusionList::from_patterns(Vec::<String>::new()));
+        for (kind, name, bounds, window) in specs {
+            stream.admit(ActionCandidate {
+                kind,
+                identifiers: vec!["msedge.exe".into()],
+                process_name: Some("msedge.exe".into()),
+                element_role: Some("Text".into()),
+                element_name: name.map(str::to_string),
+                payload: None,
+                detail: None,
+                element_bounds: bounds,
+                window,
+                timestamp_ms: 0,
+            });
+        }
+        stream.actions().to_vec()
+    }
+
+    /// **GMAIL, the real recording.** Session record-6db50bd4, page-side clicks
+    /// in step order, at the coordinates `axis_from_recording` dumped.
+    ///
+    /// Three emails opened one at a time. Every subject was captured at
+    /// `(2324, 212)` -- the reading pane puts them all in one place, and the
+    /// widths differed (552, 378, 321) because it is the subject text sized to
+    /// its content. Position says one record. Time says three.
+    ///
+    /// Before the temporal axis this recording produced ZERO candidates.
+    #[test]
+    fn gmail_subjects_group_across_three_records_by_time() {
+        const W: &str = "win/1990/180/1010/900";
+        let subject = (2324.0, 212.0);
+        let row = (2252.0, 192.0);
+        let mut specs = Vec::new();
+        // 1: a click in the list header area, 2-4: triple-click the subject.
+        specs.push(win(row.0, row.1, W));
+        for _ in 0..3 {
+            specs.push(win(subject.0, subject.1, W));
+        }
+        // 8, 9: labels and back to the list. 10, 13, 14: the second subject.
+        specs.push(win(1996.0, 200.0, W));
+        specs.push(win(row.0, row.1, W));
+        for _ in 0..3 {
+            specs.push(win(subject.0, subject.1, W));
+        }
+        // 21: back to the list. 22, 23: the third subject.
+        specs.push(win(row.0, row.1, W));
+        for _ in 0..2 {
+            specs.push(win(subject.0, subject.1, W));
+        }
+
+        let set = candidates(&actions_with_window(specs));
+        let subject_group = set
+            .groups
+            .iter()
+            .find(|g| g.occurrences() == 8)
+            .expect("the subject was clicked eight times across three emails");
+        assert_eq!(
+            subject_group.distinct_records, 3,
+            "three emails are three records, however constant the position"
+        );
+    }
+
+    /// **ORDERFLOW MUST NOT MOVE.** The same walk that rescues Gmail would
+    /// collapse this to one record, because every field here has its own
+    /// position and nothing ever repeats. It is only reached when
+    /// `record_pitch` declines, and here it does not.
+    #[test]
+    fn orderflow_still_groups_by_position_not_time() {
+        const W: &str = "win/2000/90/880/948";
+        let mut specs = Vec::new();
+        for (customer_y, quantity_y) in [(256.0, 346.0), (465.0, 555.0), (674.0, 764.0)] {
+            specs.push(win(2063.0, customer_y, W));
+            specs.push(win(2063.0, quantity_y, W));
+        }
+        let set = candidates(&actions_with_window(specs));
+        assert_eq!(set.groups.len(), 2, "customer and quantity");
+        for g in &set.groups {
+            assert_eq!(g.distinct_records, 3, "three orders, by position");
+            assert_eq!(g.occurrences(), 3);
+        }
+        assert!(
+            set.groups.iter().all(|g| g.detail.contains("into each record")),
+            "still the positional description"
+        );
+    }
+
+    /// **AMAZON's artifact must disappear.** Its page positions and the
+    /// spreadsheet's were pooled because both windows are `msedge.exe`, and a
+    /// spurious 315px period grouped the Sheets grid canvas with Amazon
+    /// elements into two whole candidates.
+    ///
+    /// With a window discriminator the two sets never meet.
+    #[test]
+    fn amazon_page_and_spreadsheet_are_never_pooled() {
+        const PAGE: &str = "win/1990/70/900/1000";
+        const SHEET: &str = "win/2990/70/900/1000";
+        // The real y values, page and sheet, from session record-6ca9bd5a.
+        let mut specs = Vec::new();
+        for y in [-220.0, -3.0, 0.0, 44.0, 80.0, 212.0, 229.0, 349.0, 482.0, 513.0, 536.0, 634.0] {
+            specs.push(win(2100.0, y, PAGE));
+        }
+        for y in [310.0, 312.0, 342.0, 372.0] {
+            specs.push(win(3002.0, y, SHEET));
+        }
+
+        let set = candidates(&actions_with_window(specs));
+        for g in &set.groups {
+            assert!(
+                !g.detail.contains("220px into each record"),
+                "the 315px pooling artifact is back: {}",
+                g.detail
+            );
+        }
+        // Whatever survives must come from ONE window, never a mixture.
+        for g in &set.groups {
+            assert!(
+                g.detail.contains(PAGE) || g.detail.contains(SHEET),
+                "a candidate must name the window it belongs to: {}",
+                g.detail
+            );
+        }
     }
 
     /// Coverage is what separates a period from a field offset, and the gap is

@@ -27,6 +27,7 @@ fn actions_with_leading_secret() -> Vec<CapturedAction> {
 
     stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: ActionKind::Type,
         identifiers: vec!["msedge.exe".into()],
         process_name: Some("msedge.exe".into()),
@@ -40,6 +41,7 @@ fn actions_with_leading_secret() -> Vec<CapturedAction> {
     // A second step that must NOT be attempted once the first halts.
     stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: Some("msedge.exe".into()),
@@ -116,6 +118,7 @@ async fn a_genuine_failure_is_still_recorded_as_failed() {
     let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
     stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: ActionKind::Click,
         identifiers: vec!["nosuchapp.exe".into()],
         process_name: Some("nosuchapp.exe".into()),

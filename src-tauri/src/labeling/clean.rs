@@ -142,6 +142,7 @@ mod tests {
         for (kind, role, name, payload) in items {
             stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
                 kind,
                 identifiers: vec!["notepad.exe".into()],
                 process_name: None,

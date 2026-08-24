@@ -2906,6 +2906,7 @@ async fn skiprun_mode() -> ExitCode {
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -3163,6 +3164,7 @@ async fn skiptest_mode() -> ExitCode {
         );
         stream.admit(paradigm_lib::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
             kind: paradigm_lib::capture::ActionKind::Click,
             identifiers: vec!["probe".into()],
             process_name: None,
@@ -5923,6 +5925,7 @@ async fn ambigreplay_mode() -> ExitCode {
     ] {
         stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
             kind,
             identifiers: vec![recorded_window.clone()],
             process_name: Some(format!("{browser}.exe")),
@@ -6218,6 +6221,7 @@ async fn resolveorder_mode() -> ExitCode {
     ] {
         stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
             kind,
             identifiers: vec![recorded_window.clone()],
             process_name: Some(format!("{browser}.exe")),
@@ -11017,6 +11021,7 @@ async fn sheetsqualified_mode() -> ExitCode {
         let mut s = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
         s.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
             kind: ActionKind::Type,
             identifiers: vec!["msedge.exe".into()],
             process_name: Some("msedge.exe".into()),
@@ -11856,6 +11861,7 @@ async fn sheetsscopefix_mode() -> ExitCode {
     let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
     stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: ActionKind::Navigate,
         identifiers: vec![title_a.clone()],
         process_name: Some("msedge.exe".into()),
@@ -11867,6 +11873,7 @@ async fn sheetsscopefix_mode() -> ExitCode {
     });
     stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: ActionKind::Click,
         identifiers: vec![title_a.clone()],
         process_name: Some("msedge.exe".into()),
@@ -12161,6 +12168,7 @@ async fn sheetsreplaytab_mode() -> ExitCode {
     let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
     stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: Some("msedge.exe".into()),
@@ -13850,6 +13858,7 @@ async fn seedplaybooks_mode() -> ExitCode {
     let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
     stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: ActionKind::Click,
         identifiers: vec!["probe.exe".into()],
         process_name: Some("probe.exe".into()),
@@ -15020,6 +15029,7 @@ async fn templatedrun_mode() -> ExitCode {
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -15442,6 +15452,7 @@ async fn templatedpreview_mode() -> ExitCode {
     for name in ["Next", "Back"] {
         stream.admit(paradigm_lib::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
             kind: paradigm_lib::capture::ActionKind::Click,
             identifiers: vec!["msedge.exe".into()],
             process_name: None,
@@ -15916,6 +15927,7 @@ async fn templateddrift_mode() -> ExitCode {
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -16375,6 +16387,7 @@ async fn templatedbatch_mode() -> ExitCode {
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -16934,6 +16947,7 @@ async fn uiflow_mode() -> ExitCode {
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -17432,6 +17446,7 @@ async fn templatedcorrection_mode() -> ExitCode {
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -17772,6 +17787,7 @@ async fn uicorrection_mode() -> ExitCode {
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,
@@ -20698,6 +20714,7 @@ async fn overwritecheck_mode() -> ExitCode {
         );
         stream.admit(paradigm_lib::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
             kind: paradigm_lib::capture::ActionKind::Click,
             identifiers: vec!["msedge.exe".into()],
             process_name: None,
@@ -22300,6 +22317,7 @@ async fn tworundoc_mode() -> ExitCode {
     );
     stream.admit(paradigm_lib::capture::ActionCandidate {
             element_bounds: None,
+            window: None,
         kind: paradigm_lib::capture::ActionKind::Click,
         identifiers: vec!["msedge.exe".into()],
         process_name: None,

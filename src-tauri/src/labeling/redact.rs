@@ -128,6 +128,7 @@ mod tests {
         let mut stream = CapturedStream::new(ExclusionList::from_patterns(["!never-matches!"]));
         stream.admit(ActionCandidate {
             element_bounds: None,
+            window: None,
             kind,
             identifiers: vec!["notepad.exe".into()],
             process_name: None,

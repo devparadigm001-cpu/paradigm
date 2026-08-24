@@ -1,6 +1,8 @@
 # An action cannot say which window it happened in
 
-**Status:** open, found 2026-08-22 in session record-1a2123c0.
+**Status:** FIXED 2026-08-23. `CapturedAction::window` now carries a per-window
+discriminator and `detect::candidates` partitions on it, declining to group an
+action that has none.
 **Severity: MEDIUM.** It makes positional record detection wrong whenever a
 recording touches two windows of one application, which is the ordinary shape of
 browser work: a page in one tab, a spreadsheet in another.
@@ -119,3 +121,26 @@ coordinate systems were mixed.
 
 So the consequence is worse than the four-records-from-three already recorded
 here: on a page with **no** repeating structure, pooling can invent one.
+
+## Fixed 2026-08-23
+
+`CapturedAction` gained a `window` field, set on the click path, the text-input
+path and the window-switch path. It is **not the window title** — titles change
+as the user works, and the doc above says why that disqualifies them. It is the
+page URL when the recorder supplies one, and otherwise the window's
+**rectangle**, which is stable while the window is not moved and differs between
+any two windows on screen.
+
+An action with no window **declines to group positionally** rather than joining
+the largest group, and is counted as lacking identity so the funnel shows no
+unexplained gap between stages 2 and 3.
+
+Pinned by `amazon_page_and_spreadsheet_are_never_pooled`, using the real y values
+from session record-6ca9bd5a: the 315px period that grouped the Sheets grid
+canvas with Amazon elements cannot form, because the two sets are never in the
+same partition.
+
+**Residual limit:** two documents in ONE window — two browser tabs — still share
+a rectangle and are still pooled when the recorder supplies no URL. A tab switch
+produces a `Navigate`, so the information to separate them exists in the stream;
+using it is not done here.
